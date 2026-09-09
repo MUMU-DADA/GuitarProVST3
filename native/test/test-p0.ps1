@@ -60,7 +60,9 @@ try {
         if ($variant -eq 'shortcut') { $launch.FilePath = $shortcutPath }
         $process = Start-Process @launch
         try {
-            $deadline = [DateTime]::UtcNow.AddSeconds(20)
+            # P7 scans all standard VST3 bundles once on first launch; large
+            # installations can take longer than the P0 three-plugin probe.
+            $deadline = [DateTime]::UtcNow.AddSeconds(90)
             do {
                 Start-Sleep -Milliseconds 200
                 $process.Refresh()

@@ -35,6 +35,21 @@ QJsonObject emptyChain() {
                        {"bus", bus}, {"effects", QJsonArray{}}};
 }
 
+void normalizeEffects(QJsonObject &chain) {
+    auto effects = chain.value("effects").toArray();
+    for (int index = 0; index < effects.size(); ++index) {
+        auto effect = effects.at(index).toObject();
+        // P5 stored the inverse flag. Keep it for older readers, but expose
+        // the P7 two-state meaning to the UI and runtime.
+        if (!effect.contains("enabled"))
+            effect.insert("enabled", !effect.value("bypass").toBool());
+        if (!effect.contains("bypass"))
+            effect.insert("bypass", !effect.value("enabled").toBool());
+        effects.replace(index, effect);
+    }
+    chain.insert("effects", effects);
+}
+
 }
 
 QString dataDirectory() {
@@ -66,6 +81,7 @@ bool loadChain(QJsonObject &chain, QString *error) {
         chain = emptyChain();
         return false;
     }
+    normalizeEffects(chain);
     return true;
 }
 
@@ -73,6 +89,7 @@ bool writeChain(const QJsonObject &input) {
     QJsonObject chain = input;
     chain.insert("schema", kSchema);
     if (!chain.value("effects").isArray()) chain.insert("effects", QJsonArray{});
+    normalizeEffects(chain);
     chain.insert("saved_at", QDateTime::currentDateTimeUtc().toString(Qt::ISODate));
     return writeJson(sidecarPath(), chain);
 }

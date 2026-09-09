@@ -14,7 +14,8 @@ P1 在 P0 自动加载 DLL 内增加了最小 VST3 Host。模块扫描和实例�
   - 对应 `IEditController` 的初始化、参数数量和 bypass 参数探测、controller state 读写回环。
   - 兼容独立 controller class 和 controller 挂在 `IComponent` 上的 single-component 插件。
   - 每个插件释放前调用 `setProcessing(false)`、`setActive(false)` 和 `terminate()`。
-- 默认只探测 `ParametricOD.vst3`、`Gateway.vst3`、`NAM Rig.vst3`；设置 `GPVST3_VST3_PATHS`（分号分隔）或 `GPVST3_VST3_ROOT` 时扫描指定路径，便于开发验证。
+- 默认递归扫描 Windows VST3 标准目录（`ProgramW6432`、`ProgramFiles`、`ProgramFiles(x86)` 和 `LOCALAPPDATA` 对应目录），按规范化模块路径发现 bundle；设置 `GPVST3_VST3_PATHS`（分号分隔）或 `GPVST3_VST3_ROOT` 时使用显式开发/测试目录。
+- 默认标准目录扫描只加载 `GetPluginFactory` 并读取 class 元数据，状态标记为 `metadata_only_scan`，不会为列清单创建 processor；显式开发目录才执行完整生命周期和 process probe。
 - P0 状态文件的 `vst3_host` 字段记录扫描、线程、实例、生命周期、参数、state、尾音和错误信息。
 
 ## 验证
@@ -24,7 +25,7 @@ P1 在 P0 自动加载 DLL 内增加了最小 VST3 Host。模块扫描和实例�
 ./native/test/test-p1.ps1
 ```
 
-在本机 Guitar Pro 8.1.1.17 隔离副本中，直接启动和快捷方式启动均通过。每次均发现并加载 3 个 bundle，枚举 4 个 class，创建 3 个 audio component，3 个生命周期通过；Gateway 和 ParametricOD 的参数/bypass 回环成功，状态记录 `worker_thread=true`、`ready=true`、state round-trip 成功，且退出后释放模块。证据文件由测试脚本写入被忽略的 `artifacts/` 目录。
+显式目录的 P1 生命周期验证仍覆盖 Gateway、ParametricOD 和 NAM Rig；标准目录清单在 P7 中通过真实宿主隔离启动验证。第三方 bundle 的完整生命周期探测不在默认宿主进程内执行，以避免不兼容插件破坏宿主启动。
 
 ## 边界
 

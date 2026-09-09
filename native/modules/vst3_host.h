@@ -37,6 +37,18 @@ struct ClassState {
     std::string error;
 };
 
+// The UI only receives identity and compatibility results from the worker
+// scan. It never owns a module handle or creates a processor while listing.
+struct CatalogEntry {
+    std::string module;
+    std::string classId;
+    std::string name;
+    std::string vendor;
+    std::string category;
+    bool compatible = false;
+    std::string error;
+};
+
 struct State {
     std::string status = "pending_p1";
     bool ready = false;
@@ -55,5 +67,7 @@ struct State {
 // hostSupported gates all module loading. An unverified Guitar Pro build must
 // remain bypassed and must not load third-party code.
 State prepare(bool hostSupported = true) noexcept;
+
+std::vector<CatalogEntry> effectCatalog(const State &state);
 
 }

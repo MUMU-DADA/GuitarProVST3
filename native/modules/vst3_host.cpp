@@ -150,25 +150,22 @@ std::vector<fs::path> configuredRoots(bool &explicitConfiguration) {
     }
 
     explicitConfiguration = false;
-    const char *programFiles = std::getenv("ProgramW6432");
-    if (!programFiles || !*programFiles) programFiles = std::getenv("ProgramFiles");
-    if (programFiles && *programFiles)
-        roots.emplace_back(fs::u8path(std::string(programFiles) + "\\Common Files\\VST3"));
+    const auto addRoot = [&roots](const char *base, const char *suffix) {
+        if (base && *base) roots.emplace_back(fs::u8path(std::string(base) + suffix));
+    };
+    addRoot(std::getenv("ProgramW6432"), "\\Common Files\\VST3");
+    addRoot(std::getenv("ProgramFiles"), "\\Common Files\\VST3");
+    addRoot(std::getenv("ProgramFiles(x86)"), "\\Common Files\\VST3");
+    addRoot(std::getenv("LOCALAPPDATA"), "\\Programs\\Common\\VST3");
     return roots;
 }
 
-bool knownDefaultPlugin(const fs::path &path) {
-    static const std::unordered_set<std::wstring> names{
-        L"ParametricOD.vst3", L"Gateway.vst3", L"NAM Rig.vst3"};
-    return names.find(path.filename().wstring()) != names.end();
-}
-
-void discoverFrom(const fs::path &root, bool filterKnown, std::vector<fs::path> &result,
+void discoverFrom(const fs::path &root, bool, std::vector<fs::path> &result,
                  std::unordered_set<std::wstring> &seen) {
     std::error_code error;
     if (!fs::exists(root, error)) return;
     if (fs::is_regular_file(root, error)) {
-        if (root.extension() == L".vst3" && (!filterKnown || knownDefaultPlugin(root))) {
+        if (root.extension() == L".vst3") {
             const auto key = fs::weakly_canonical(root, error).wstring();
             if (seen.insert(key).second) result.push_back(root);
         }
@@ -176,7 +173,7 @@ void discoverFrom(const fs::path &root, bool filterKnown, std::vector<fs::path> 
     }
     if (!fs::is_directory(root, error)) return;
     if (root.extension() == L".vst3") {
-        if (!filterKnown || knownDefaultPlugin(root)) {
+        {
             const auto key = fs::weakly_canonical(root, error).wstring();
             if (seen.insert(key).second) result.push_back(root);
         }
@@ -185,7 +182,7 @@ void discoverFrom(const fs::path &root, bool filterKnown, std::vector<fs::path> 
     fs::directory_iterator iterator(root, fs::directory_options::skip_permission_denied, error);
     const fs::directory_iterator end;
     while (!error && iterator != end) {
-        discoverFrom(iterator->path(), filterKnown, result, seen);
+        discoverFrom(iterator->path(), false, result, seen);
         iterator.increment(error);
     }
 }
@@ -196,7 +193,7 @@ std::vector<fs::path> discover(State &state) {
     std::vector<fs::path> modules;
     std::unordered_set<std::wstring> seen;
     for (const auto &root : roots)
-        discoverFrom(root, !explicitConfiguration, modules, seen);
+        discoverFrom(root, explicitConfiguration, modules, seen);
     std::sort(modules.begin(), modules.end(), [](const fs::path &a, const fs::path &b) {
         return a.wstring() < b.wstring();
     });
@@ -379,7 +376,11 @@ State scanAndValidate() {
     State result;
     result.workerThread = true;
     const auto modules = discover(result);
+    const char *configuredPaths = std::getenv("GPVST3_VST3_PATHS");
+    if (!configuredPaths || !*configuredPaths) configuredPaths = std::getenv("GPVST3_VST3_ROOT");
+    const bool validateLifecycles = configuredPaths && *configuredPaths;
     auto host = Steinberg::owned(new HostApplication);
+    std::unordered_set<std::string> seenClasses;
     for (const auto &packagePath : modules) {
         const auto binary = moduleBinary(packagePath);
         if (binary.empty()) {
@@ -445,7 +446,24 @@ State scanAndValidate() {
                 continue;
             }
             ++result.classesEnumerated;
-            auto classState = validateClass(packagePath, *factory, info, *host);
+            ClassState classState;
+            if (validateLifecycles) {
+                classState = validateClass(packagePath, *factory, info, *host);
+            } else {
+                classState.module = narrow(packagePath.wstring());
+                classState.classId = uidString(info.cid);
+                classState.name = narrow(info.name, Steinberg::PClassInfo::kNameSize);
+                classState.vendor = narrow(info.vendor, Steinberg::PClassInfo2::kVendorSize);
+                classState.category = ascii(info.category, Steinberg::PClassInfo::kCategorySize);
+                classState.version = narrow(info.version, Steinberg::PClassInfo2::kVersionSize);
+                classState.sdkVersion = narrow(info.sdkVersion, Steinberg::PClassInfo2::kVersionSize);
+                classState.error = classState.category == "Audio Module Class"
+                                       ? "metadata_only_scan"
+                                       : "non_audio_class";
+                classState.processorReady = classState.category == "Audio Module Class";
+            }
+            const auto classKey = classState.module + "\\n" + classState.classId;
+            if (!seenClasses.insert(classKey).second) continue;
             if (classState.componentCreated) ++result.instancesCreated;
             if (classState.processorReady) ++result.processCalls;
             if (classState.processProbePassed) ++result.processProbesPassed;
@@ -455,7 +473,9 @@ State scanAndValidate() {
             result.classes.push_back(std::move(classState));
         }
     }
-    if (result.lifecyclesPassed > 0)
+    if (!validateLifecycles && result.classesEnumerated > 0)
+        result.status = "catalog_ready";
+    else if (result.lifecyclesPassed > 0)
         result.status = "ready";
     else if (result.classesEnumerated > 0)
         result.status = "lifecycle_failed";
@@ -463,7 +483,7 @@ State scanAndValidate() {
         result.status = "no_classes";
     else
         result.status = "no_plugins";
-    result.ready = result.status == "ready";
+    result.ready = result.status == "ready" || result.status == "catalog_ready";
     return result;
 }
 
@@ -489,6 +509,25 @@ State prepare(bool hostSupported) noexcept {
         result.errors.push_back("unknown_exception");
         return result;
     }
+}
+
+std::vector<CatalogEntry> effectCatalog(const State &state) {
+    std::vector<CatalogEntry> result;
+    std::unordered_set<std::string> seen;
+    for (const auto &item : state.classes) {
+        if (item.category != "Audio Module Class") continue;
+        const auto key = item.module + "\n" + item.classId;
+        if (!seen.insert(key).second) continue;
+        result.push_back(CatalogEntry{item.module, item.classId, item.name, item.vendor,
+                                      item.category, item.category == "Audio Module Class" && item.processorReady,
+                                      item.error});
+    }
+    std::sort(result.begin(), result.end(), [](const CatalogEntry &a, const CatalogEntry &b) {
+        if (a.name != b.name) return a.name < b.name;
+        if (a.vendor != b.vendor) return a.vendor < b.vendor;
+        return a.module < b.module;
+    });
+    return result;
 }
 
 } // namespace gpvst3::vst3

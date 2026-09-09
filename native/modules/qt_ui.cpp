@@ -10,6 +10,7 @@
 #include <QtCore/QTimer>
 #include <QtWidgets/QAbstractItemView>
 #include <QtWidgets/QApplication>
+#include <QtWidgets/QCheckBox>
 #include <QtGui/QCloseEvent>
 #include <QtWidgets/QAction>
 #include <QtWidgets/QFileDialog>
@@ -32,6 +33,7 @@ namespace gpvst3::ui {
 namespace {
 
 RealtimeBypassControl g_realtimeBypassControl = nullptr;
+QJsonArray g_vst3Catalog;
 
 constexpr int kPathRole = Qt::UserRole;
 constexpr int kUidRole = Qt::UserRole + 1;
@@ -298,17 +300,164 @@ private:
     QJsonObject sidecar_; bool dirty_ = false;
 };
 
+class P7Panel final : public QWidget {
+public:
+    P7Panel() {
+        setAttribute(Qt::WA_DeleteOnClose);
+        setWindowFlag(Qt::Tool);
+        setWindowTitle(QStringLiteral("音源 · VST3 效果器"));
+        resize(420, 360);
+        auto *root = new QVBoxLayout(this);
+        root->addWidget(new QLabel(QStringLiteral("VST3 效果器"), this));
+        list_ = new QListWidget(this);
+        list_->setSelectionMode(QAbstractItemView::NoSelection);
+        root->addWidget(list_, 1);
+        status_ = new QLabel(this);
+        status_->setWordWrap(true);
+        root->addWidget(status_);
+        loadChain();
+    }
+
+private:
+    static QString key(const QJsonObject &effect) {
+        return effect.value("module").toString() + QStringLiteral("\n") +
+               effect.value("class_id").toString();
+    }
+
+    static QString displayName(const QJsonObject &entry, const QHash<QString, int> &counts) {
+        const auto name = entry.value("name").toString();
+        return counts.value(name) > 1
+                   ? QStringLiteral("%1 (%2)").arg(name, entry.value("vendor").toString())
+                   : name;
+    }
+
+    void loadChain() {
+        QString error;
+        if (!state::loadChain(sidecar_, &error))
+            status_->setText(QStringLiteral("状态恢复失败：%1").arg(error));
+        auto saved = sidecar_.value("effects").toArray();
+        QHash<QString, int> savedRows;
+        for (int index = 0; index < saved.size(); ++index) {
+            const auto effect = saved.at(index).toObject();
+            if (!effect.value("module").toString().isEmpty()) savedRows.insert(key(effect), index);
+        }
+
+        QHash<QString, int> counts;
+        for (const auto &value : g_vst3Catalog) {
+            const auto entry = value.toObject();
+            if (entry.value("compatible").toBool())
+                counts[entry.value("name").toString()]++;
+        }
+        QSet<QString> listed;
+        for (const auto &value : g_vst3Catalog) {
+            const auto entry = value.toObject();
+            if (!entry.value("compatible").toBool()) continue;
+            QJsonObject effect = savedRows.contains(entry.value("module").toString() +
+                                                   QStringLiteral("\n") + entry.value("class_id").toString())
+                                     ? saved.at(savedRows.value(entry.value("module").toString() +
+                                                                QStringLiteral("\n") + entry.value("class_id").toString())).toObject()
+                                     : QJsonObject{};
+            effect.insert("module", entry.value("module"));
+            effect.insert("class_id", entry.value("class_id"));
+            effect.insert("name", entry.value("name"));
+            effect.insert("vendor", entry.value("vendor"));
+            if (!effect.contains("enabled")) effect.insert("enabled", false);
+            appendRow(effect, displayName(entry, counts));
+            listed.insert(entry.value("module").toString() + QStringLiteral("\n") + entry.value("class_id").toString());
+        }
+        // Keep missing or previously discovered entries in the sidecar visible,
+        // but never enable them implicitly after a failed scan.
+        for (const auto &value : saved) {
+            const auto effect = value.toObject();
+            if (effect.value("module").toString().isEmpty() || listed.contains(key(effect))) continue;
+            auto missing = effect;
+            missing.insert("enabled", false);
+            appendRow(missing, effect.value("name").toString(QStringLiteral("缺失插件")));
+        }
+        sidecar_.insert("effects", effects_);
+        if (list_->count() == 0)
+            status_->setText(QStringLiteral("未发现可用的 x64 VST3 audio effect。"));
+    }
+
+    void appendRow(const QJsonObject &effect, const QString &label) {
+        const int index = effects_.size();
+        effects_.append(effect);
+        auto *item = new QListWidgetItem(list_);
+        auto *row = new QWidget(list_);
+        auto *layout = new QHBoxLayout(row);
+        layout->setContentsMargins(2, 2, 2, 2);
+        auto *check = new QCheckBox(row);
+        check->setChecked(effect.value("enabled").toBool());
+        auto *name = new QPushButton(label, row);
+        name->setFlat(true);
+        name->setCursor(Qt::PointingHandCursor);
+        layout->addWidget(check);
+        layout->addWidget(name, 1);
+        item->setSizeHint(row->sizeHint());
+        list_->setItemWidget(item, row);
+        connect(check, &QCheckBox::toggled, this, [this, index](bool enabled) {
+            auto effect = effects_.at(index).toObject();
+            effect.insert("enabled", enabled);
+            effect.insert("bypass", !enabled);
+            effects_.replace(index, effect);
+            sidecar_.insert("effects", effects_);
+            if (!state::writeChain(sidecar_))
+                status_->setText(QStringLiteral("状态保存失败：%1").arg(state::sidecarPath()));
+            else
+                status_->setText(enabled ? QStringLiteral("已启用：点击名称打开原生 GUI")
+                                          : QStringLiteral("已停用：%1").arg(effect.value("name").toString()));
+        });
+        connect(name, &QPushButton::clicked, this, [this, index] { openEditor(index); });
+    }
+
+    void openEditor(int index) {
+        const auto effect = effects_.at(index).toObject();
+        if (!effect.value("enabled").toBool()) {
+            status_->setText(QStringLiteral("请先勾选启用插件，再打开其 GUI。"));
+            return;
+        }
+        // The locked GP build has no verified HWND/IPlugView insertion ABI.
+        // Keep the click target and report the boundary instead of showing a
+        // project-owned parameter editor.
+        status_->setText(QStringLiteral("原生 GUI 暂不可用：Guitar Pro 私有 IPlugView/HWND ABI 未验证（host_limited）。"));
+    }
+
+    void closeEvent(QCloseEvent *event) override {
+        sidecar_.insert("effects", effects_);
+        state::writeChain(sidecar_);
+        QWidget::closeEvent(event);
+    }
+
+    QListWidget *list_ = nullptr;
+    QLabel *status_ = nullptr;
+    QJsonObject sidecar_;
+    QJsonArray effects_;
+};
+
 } // namespace
 
-const char *state() noexcept { return "panel_ready_p5"; }
+const char *state() noexcept { return "panel_ready_p7"; }
 
 void setRealtimeBypassControl(RealtimeBypassControl control) noexcept {
     g_realtimeBypassControl = control;
 }
 
+void setVst3Catalog(const QJsonArray &catalog) { g_vst3Catalog = catalog; }
+
 void showEffectChainPanel() {
     if (!qApp || qApp->property("gpvst3P5Panel").value<QWidget *>()) return;
-    auto *panel = new ChainPanel;
+    QJsonObject chain;
+    state::loadChain(chain);
+    bool legacy = false;
+    for (const auto &value : chain.value("effects").toArray()) {
+        if (value.toObject().contains("plugin_path")) { legacy = true; break; }
+    }
+    // Keep the old isolated P5 fixture readable when no catalog is supplied;
+    // a real P7 host always has a catalog and therefore uses the two-state UI.
+    legacy = legacy && g_vst3Catalog.isEmpty();
+    QWidget *panel = legacy ? static_cast<QWidget *>(new ChainPanel)
+                            : static_cast<QWidget *>(new P7Panel);
+    const bool useP7Panel = !legacy;
     qApp->setProperty("gpvst3P5Panel", QVariant::fromValue(static_cast<QWidget *>(panel)));
     QObject::connect(panel, &QObject::destroyed, qApp, [] { qApp->setProperty("gpvst3P5Panel", QVariant()); });
 
@@ -321,7 +470,7 @@ void showEffectChainPanel() {
         timer->stop();
         timer->deleteLater();
     });
-    QObject::connect(timer, &QTimer::timeout, timer, [timer, panel] {
+    QObject::connect(timer, &QTimer::timeout, timer, [timer, panel, useP7Panel] {
         bool soundEntryReady = timer->property("soundEntryReady").toBool();
         bool dockReady = timer->property("dockReady").toBool();
         for (QWidget *widget : QApplication::allWidgets()) {
@@ -337,33 +486,37 @@ void showEffectChainPanel() {
             }
             break;
         }
-        for (QWidget *widget : QApplication::topLevelWidgets()) {
-            if (QByteArray(widget->metaObject()->className()) != "gp::gui::MainWindow") continue;
-            auto *window = qobject_cast<QMainWindow *>(widget);
-            if (!window) continue;
-            auto *dock = window->findChild<QDockWidget *>("gpvst3EffectChainDock");
-            if (!dock) {
-                dock = new QDockWidget(QStringLiteral("VST3 效果器链"), window);
-                dock->setObjectName(QStringLiteral("gpvst3EffectChainDock"));
-                dock->setAllowedAreas(Qt::LeftDockWidgetArea | Qt::RightDockWidgetArea);
-                dock->setWidget(panel);
-                window->addDockWidget(Qt::RightDockWidgetArea, dock);
-                auto *action = window->menuBar()->addAction(QStringLiteral("VST3 效果器链"));
-                action->setObjectName(QStringLiteral("gpvst3EffectChainAction"));
-                QObject::connect(action, &QAction::triggered, dock, [dock] {
-                    dock->setVisible(!dock->isVisible());
-                });
-                QObject::connect(dock, &QObject::destroyed, qApp, [] { qApp->setProperty("gpvst3P5Panel", QVariant()); });
-                dock->show();
+        if (!useP7Panel) {
+            for (QWidget *widget : QApplication::topLevelWidgets()) {
+                if (QByteArray(widget->metaObject()->className()) != "gp::gui::MainWindow") continue;
+                auto *window = qobject_cast<QMainWindow *>(widget);
+                if (!window) continue;
+                auto *dock = window->findChild<QDockWidget *>("gpvst3EffectChainDock");
+                if (!dock) {
+                    dock = new QDockWidget(QStringLiteral("VST3 效果器链"), window);
+                    dock->setObjectName(QStringLiteral("gpvst3EffectChainDock"));
+                    dock->setAllowedAreas(Qt::LeftDockWidgetArea | Qt::RightDockWidgetArea);
+                    dock->setWidget(panel);
+                    window->addDockWidget(Qt::RightDockWidgetArea, dock);
+                    auto *action = window->menuBar()->addAction(QStringLiteral("VST3 效果器链"));
+                    action->setObjectName(QStringLiteral("gpvst3EffectChainAction"));
+                    QObject::connect(action, &QAction::triggered, dock, [dock] {
+                        dock->setVisible(!dock->isVisible());
+                    });
+                    QObject::connect(dock, &QObject::destroyed, qApp, [] {
+                        qApp->setProperty("gpvst3P5Panel", QVariant());
+                    });
+                    dock->show();
+                }
+                dockReady = true;
             }
-            dockReady = true;
         }
         if (!panel->parentWidget()) {
             panel->show(); panel->raise(); panel->activateWindow();
         }
         timer->setProperty("soundEntryReady", soundEntryReady);
         timer->setProperty("dockReady", dockReady);
-        if (soundEntryReady && dockReady) timer->deleteLater();
+        if (soundEntryReady) timer->deleteLater();
     });
     timer->start();
 }

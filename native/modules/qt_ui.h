@@ -1,5 +1,7 @@
 #pragma once
 
+#include <QtCore/QJsonArray>
+
 namespace gpvst3::ui {
 
 using RealtimeBypassControl = void (*)(bool) noexcept;
@@ -9,6 +11,7 @@ using RealtimeBypassControl = void (*)(bool) noexcept;
 // private widget hierarchy.
 const char *state() noexcept;
 void setRealtimeBypassControl(RealtimeBypassControl control) noexcept;
+void setVst3Catalog(const QJsonArray &catalog);
 void showEffectChainPanel();
 
 }

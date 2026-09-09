@@ -64,6 +64,21 @@ QJsonObject vst3Status(const gpvst3::vst3::State &value) {
     };
 }
 
+QJsonArray vst3Catalog(const gpvst3::vst3::State &value) {
+    QJsonArray result;
+    for (const auto &entry : gpvst3::vst3::effectCatalog(value)) {
+        result.append(QJsonObject{
+            {"module", QString::fromUtf8(entry.module.data())},
+            {"class_id", QString::fromUtf8(entry.classId.data())},
+            {"name", QString::fromUtf8(entry.name.data())},
+            {"vendor", QString::fromUtf8(entry.vendor.data())},
+            {"category", QString::fromUtf8(entry.category.data())},
+            {"compatible", entry.compatible},
+            {"error", QString::fromUtf8(entry.error.data())}});
+    }
+    return result;
+}
+
 QJsonObject hookStatus(const gpvst3::hook::State &value) {
     const auto entryStatus = [](const gpvst3::hook::EntryPointObservation &entry) {
         return QJsonObject{
@@ -186,6 +201,8 @@ QJsonObject initialize() {
     ui::setRealtimeBypassControl(&hook::setTotalBypass);
     const auto hookState = hook::snapshot();
     const auto vst3 = vst3::prepare(host.supported);
+    const auto catalog = vst3Catalog(vst3);
+    ui::setVst3Catalog(catalog);
     effects::Chain chain;
     chain.setBypassed(!hookState.runtimeProcessorReady);
 
@@ -204,6 +221,7 @@ QJsonObject initialize() {
         {"host_supported", host.supported},
         {"host_files", fileResults},
         {"vst3_host", vst3Status(vst3)},
+        {"vst3_catalog", catalog},
         {"audio_adapter", QJsonObject{
             {"status", "planar_float32"},
             {"block_view", "pointer_view"},
@@ -211,7 +229,7 @@ QJsonObject initialize() {
             {"realtime_process", "vst3_process_probe"}}},
         {"gp_hook", hookStatus(hookState)},
         {"qt_ui", ui::state()},
-        {"state_manager", QJsonObject{{"status", "sidecar_json_p5"},
+        {"state_manager", QJsonObject{{"status", "sidecar_json_p7_enabled"},
                                         {"path", state::sidecarPath()}}},
         {"reason", hookState.runtimeProcessorReady
                        ? "P2 runtime VST3 effect processing enabled by environment switch"
