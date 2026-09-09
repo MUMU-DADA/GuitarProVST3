@@ -125,6 +125,16 @@ try {
         $hook.master_process.sample_rate -le 0 -or -not $hook.master_process.buffer_write_observed) {
         throw "P2 block metadata or host buffer mutation was not observed: $($hook | ConvertTo-Json -Depth 8 -Compress)"
     }
+    if (-not $hook.audio_output_callback_installed -or -not $hook.audio_output_observed -or
+        -not $hook.audio_output_writeback_observed -or
+        -not $hook.audio_output_callback.call_observed -or
+        $hook.audio_output_callback.call_count -le 0 -or
+        $hook.audio_output_callback.frame_count -le 0 -or
+        $hook.audio_output_callback.first_buffer_address -eq '0' -or
+        $hook.audio_output_callback.last_buffer_address -eq '0' -or
+        $hook.audio_output_callback.before_hash -eq $hook.audio_output_callback.after_hash) {
+        throw "PortAudio final output callback/writeback was not observed: $($hook | ConvertTo-Json -Depth 8 -Compress)"
+    }
     if ($ExpectMissingPlugin) {
         if (-not $hook.runtime_effect_enabled -or $hook.runtime_processor_ready -or -not $hook.total_bypass -or
             $hook.runtime_effect_error -ne 'runtime_vst3_not_found' -or $hook.chain_bypass_blocks -le 0) {

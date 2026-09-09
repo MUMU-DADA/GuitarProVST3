@@ -75,7 +75,13 @@ QJsonObject hookStatus(const gpvst3::hook::State &value) {
             {"frame_count", static_cast<qint64>(entry.frameCount)},
             {"channel_count", static_cast<qint64>(entry.channelCount)},
             {"sample_rate", entry.sampleRate},
-            {"thread_id", static_cast<qint64>(entry.threadId)}};
+            {"thread_id", static_cast<qint64>(entry.threadId)},
+            {"first_sequence", static_cast<qint64>(entry.firstSequence)},
+            {"last_sequence", static_cast<qint64>(entry.lastSequence)},
+            {"first_buffer_address", QString::number(static_cast<qulonglong>(entry.firstBufferAddress), 16)},
+            {"last_buffer_address", QString::number(static_cast<qulonglong>(entry.lastBufferAddress), 16)},
+            {"before_hash", QString::number(static_cast<qulonglong>(entry.beforeHash), 16)},
+            {"after_hash", QString::number(static_cast<qulonglong>(entry.afterHash), 16)}};
     };
     return QJsonObject{
         {"installed", value.installed},
@@ -83,12 +89,23 @@ QJsonObject hookStatus(const gpvst3::hook::State &value) {
         {"host_supported", value.hostSupported},
         {"observation_only", value.observationOnly},
         {"audio_buffer_accessors_found", value.audioBufferAccessorsFound},
+        {"audio_buffer_lock_accessors_found", value.audioBufferLockAccessorsFound},
+        {"audio_buffer_pointer_observed", value.audioBufferPointerObserved},
+        {"audio_buffer_writeback_observed", value.audioBufferWritebackObserved},
+        {"audio_output_callback_installed", value.audioOutputCallbackInstalled},
+        {"audio_output_observed", value.audioOutputObserved},
+        {"audio_output_writeback_observed", value.audioOutputWritebackObserved},
         {"effects_chain_inside_master", value.effectsChainInsideMaster},
+        {"effects_chain_after_master_observed", value.effectsChainAfterMasterObserved},
+        {"cross_thread_observed", value.crossThreadObserved},
+        {"same_buffer_observed", value.sameBufferObserved},
         {"runtime_effect_enabled", value.runtimeEffectEnabled},
         {"runtime_processor_ready", value.runtimeProcessorReady},
         {"runtime_process_observed", value.runtimeProcessObserved},
         {"runtime_buffer_write_observed", value.runtimeBufferWriteObserved},
         {"runtime_process_count", static_cast<qint64>(value.runtimeProcessCount)},
+        {"runtime_configuration_mismatch_blocks", static_cast<qint64>(value.runtimeConfigurationMismatchBlocks)},
+        {"runtime_configuration_matches", value.runtimeConfigurationMatches},
         {"runtime_effect_name", QString::fromUtf8(value.runtimeEffectName.data())},
         {"runtime_effect_error", QString::fromUtf8(value.runtimeEffectError.data())},
         {"total_bypass", value.totalBypass},
@@ -104,6 +121,7 @@ QJsonObject hookStatus(const gpvst3::hook::State &value) {
         {"max_process_nanoseconds", static_cast<qint64>(value.maxProcessNanoseconds)},
         {"total_process_nanoseconds", static_cast<qint64>(value.totalProcessNanoseconds)},
         {"chain_switch_count", static_cast<qint64>(value.chainSwitchCount)},
+        {"audio_buffer_sequence_count", static_cast<qint64>(value.audioBufferSequenceCount)},
         {"runtime_effect_instances", static_cast<qint64>(value.runtimeEffectInstances)},
         {"reconfiguration_passed", static_cast<qint64>(value.reconfigurationPassed)},
         {"reconfiguration_failed", static_cast<qint64>(value.reconfigurationFailed)},
@@ -132,7 +150,8 @@ QJsonObject hookStatus(const gpvst3::hook::State &value) {
         {"input_last_rms", value.inputLastRms},
         {"reason", QString::fromUtf8(value.reason.data())},
         {"master_process", entryStatus(value.masterProcess)},
-        {"effects_chain_processDSP", entryStatus(value.effectsChainProcessDsp)}};
+        {"effects_chain_processDSP", entryStatus(value.effectsChainProcessDsp)},
+        {"audio_output_callback", entryStatus(value.audioOutputCallback)}};
 }
 
 } // namespace
@@ -142,6 +161,7 @@ namespace gpvst3::bootstrap {
 QJsonObject initialize() {
     const auto host = host::verify();
     hook::prepare(host);
+    ui::setRealtimeBypassControl(&hook::setTotalBypass);
     const auto hookState = hook::snapshot();
     const auto vst3 = vst3::prepare(host.supported);
     effects::Chain chain;

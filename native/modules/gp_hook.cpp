@@ -23,6 +23,10 @@
 #include "pluginterfaces/vst/ivstpluginterfacesupport.h"
 
 namespace gpvst3::hook {
+
+int streamCallbackHook(const void *input, void *output, unsigned long frames,
+                       const void *timeInfo, unsigned long status, void *userData);
+
 namespace {
 
 constexpr char kMasterProcess[] =
@@ -32,6 +36,8 @@ constexpr char kEffectsChainProcessDsp[] =
 constexpr char kRawData[] = "?rawData@AudioBuffer@audio@am@@UEBAAEBV?$array@PEAM$01@std@@XZ";
 constexpr char kFrameCount[] = "?frameCount@AudioBuffer@audio@am@@UEBA_JXZ";
 constexpr char kChannelCount[] = "?channelCount@AudioBuffer@audio@am@@UEBAIXZ";
+constexpr char kLock[] = "?lock@AudioBuffer@audio@am@@UEAAXXZ";
+constexpr char kUnlock[] = "?unlock@AudioBuffer@audio@am@@UEAAXXZ";
 constexpr char kAudioCoreInstance[] = "?Instance@AudioCore@audio@am@@SAAEAV123@XZ";
 constexpr char kSampleRate[] = "?samplingRate@AudioCore@audio@am@@QEBAHXZ";
 constexpr char kAudioLayerInstance[] = "?instance@AudioLayer@audio@am@@SAAEAV123@XZ";
@@ -41,18 +47,26 @@ constexpr char kAudioLayerBufferSize[] = "?bufferSize@AudioLayer@audio@am@@QEBAH
 
 // The locked 8.1.1.17 entry points both begin with three complete, position
 // independent mov instructions. Refuse installation if memory differs.
-constexpr std::size_t kPatchBytes = 15;
-constexpr std::uint8_t kMasterPrologue[kPatchBytes]{
+constexpr std::size_t kMasterPatchBytes = 15;
+constexpr std::size_t kDspPatchBytes = 15;
+constexpr std::size_t kStreamPatchBytes = 16;
+constexpr std::uint8_t kMasterPrologue[kMasterPatchBytes]{
     0x4C, 0x89, 0x44, 0x24, 0x18, 0x48, 0x89, 0x54, 0x24, 0x10, 0x48, 0x89, 0x4C, 0x24, 0x08};
-constexpr std::uint8_t kDspPrologue[kPatchBytes]{
+constexpr std::uint8_t kDspPrologue[kDspPatchBytes]{
     0x48, 0x89, 0x5C, 0x24, 0x20, 0x48, 0x89, 0x54, 0x24, 0x10, 0x48, 0x89, 0x4C, 0x24, 0x08};
+constexpr std::uint8_t kStreamPrologue[kStreamPatchBytes]{
+    0x48, 0x89, 0x5C, 0x24, 0x20, 0x55, 0x56, 0x57,
+    0x41, 0x54, 0x41, 0x55, 0x41, 0x56, 0x41, 0x57};
+constexpr std::uintptr_t kStreamCallbackRva = 0xABE0;
 
 struct RawData { float *channels[2]; };
 using MasterProcess = void (*)(void *, void *, void *, void *, void *);
 using DspProcess = void (*)(void *, void *, void *, void *);
+using StreamCallback = int (*)(const void *, void *, unsigned long, const void *, unsigned long, void *);
 using RawDataFn = const RawData &(*)(const void *);
 using FrameCountFn = std::size_t (*)(const void *);
 using ChannelCountFn = unsigned (*)(const void *);
+using BufferAccessFn = void (*)(void *);
 using AudioCoreInstanceFn = void *(*)();
 using SampleRateFn = int (*)(const void *);
 using AudioLayerInstanceFn = void *(*)();
@@ -127,6 +141,10 @@ struct RuntimeEffect {
     std::string name;
     std::string error;
     std::atomic<bool> ready{false};
+    std::atomic<bool> outputWritten{false};
+    std::atomic<bool> ownerObserved{false};
+    std::atomic<int> configuredRate{0};
+    std::atomic<std::size_t> configuredBlock{0};
     bool forceError = false;
     std::atomic_flag processing = ATOMIC_FLAG_INIT;
 
@@ -134,6 +152,10 @@ struct RuntimeEffect {
 
     void shutdown() noexcept {
         ready.store(false, std::memory_order_release);
+        outputWritten.store(false, std::memory_order_release);
+        ownerObserved.store(false, std::memory_order_release);
+        configuredRate.store(0, std::memory_order_release);
+        configuredBlock.store(0, std::memory_order_release);
         if (processor) processor->setProcessing(false);
         if (component) {
             component->setActive(false);
@@ -238,6 +260,8 @@ struct RuntimeEffect {
             return false;
         }
         ready.store(true, std::memory_order_release);
+        configuredRate.store(static_cast<int>(sampleRate), std::memory_order_release);
+        configuredBlock.store(maxSamplesPerBlock, std::memory_order_release);
         error.clear();
         return true;
     }
@@ -259,6 +283,8 @@ struct RuntimeEffect {
             return false;
         }
         error.clear();
+        configuredRate.store(static_cast<int>(sampleRate), std::memory_order_release);
+        configuredBlock.store(maxSamplesPerBlock, std::memory_order_release);
         ready.store(true, std::memory_order_release);
         return true;
     }
@@ -278,6 +304,8 @@ struct RuntimeEffect {
         if (processing.test_and_set(std::memory_order_acquire)) return false;
         const auto result = audio::process(*processor, block, scratch, false);
         processing.clear(std::memory_order_release);
+        if (result.outputWritten) outputWritten.store(true, std::memory_order_release);
+        if (result.ownerPointerObserved) ownerObserved.store(true, std::memory_order_release);
         return result.processed;
     }
 
@@ -289,20 +317,45 @@ struct RuntimeEffect {
 struct Patch {
     void *target = nullptr;
     void *trampoline = nullptr;
-    std::uint8_t original[kPatchBytes]{};
+    std::uint8_t original[32]{};
+    std::size_t size = 0;
     bool installed = false;
 };
 
 struct Runtime {
     Patch master;
     Patch dsp;
+    Patch stream;
     RawDataFn rawData = nullptr;
     FrameCountFn frameCount = nullptr;
     ChannelCountFn channelCount = nullptr;
+    BufferAccessFn lock = nullptr;
+    BufferAccessFn unlock = nullptr;
     SampleRateFn sampleRate = nullptr;
     void *audioCore = nullptr;
     std::atomic<std::size_t> masterCalls{0};
     std::atomic<std::size_t> dspCalls{0};
+    std::atomic<std::uint64_t> callbackSequence{0};
+    std::atomic<std::uint64_t> masterFirstSequence{0};
+    std::atomic<std::uint64_t> masterLastSequence{0};
+    std::atomic<std::uint64_t> dspFirstSequence{0};
+    std::atomic<std::uint64_t> dspLastSequence{0};
+    std::atomic<std::uintptr_t> masterFirstBuffer{0};
+    std::atomic<std::uintptr_t> masterLastBuffer{0};
+    std::atomic<std::uintptr_t> dspFirstBuffer{0};
+    std::atomic<std::uintptr_t> dspLastBuffer{0};
+    std::atomic<bool> sameBufferObserved{false};
+    std::atomic<bool> dspAfterMasterObserved{false};
+    std::atomic<bool> outputObserved{false};
+    std::atomic<bool> outputWriteObserved{false};
+    std::atomic<bool> outputEvidenceClaimed{false};
+    std::atomic<std::size_t> outputCalls{0};
+    std::atomic<std::uint64_t> outputBeforeHash{0};
+    std::atomic<std::uint64_t> outputAfterHash{0};
+    std::atomic<std::size_t> outputFrames{0};
+    std::atomic<unsigned long> outputThread{0};
+    std::atomic<std::uintptr_t> outputFirstBuffer{0};
+    std::atomic<std::uintptr_t> outputLastBuffer{0};
     std::atomic<bool> bufferWriteObserved{false};
     std::atomic<bool> dspInsideMaster{false};
     std::atomic<std::size_t> frames{0};
@@ -315,6 +368,7 @@ struct Runtime {
     std::atomic<std::size_t> effectCalls{0};
     std::atomic<bool> effectProcessed{false};
     std::atomic<bool> effectWriteObserved{false};
+    std::atomic<std::size_t> configurationMismatchBlocks{0};
     std::atomic<std::size_t> reconfigurationPassed{0};
     std::atomic<std::size_t> reconfigurationFailed{0};
     std::atomic<bool> reconfigurationValidated{false};
@@ -363,14 +417,26 @@ void masterProcessHook(void *self, void *buffer, void *ticks, void *musicians,
         return;
     }
     g_inMasterHook = true;
+    const auto sequence = g_runtime.callbackSequence.fetch_add(1, std::memory_order_relaxed) + 1;
+    const auto bufferAddress = reinterpret_cast<std::uintptr_t>(buffer);
+    auto firstSequence = g_runtime.masterFirstSequence.load(std::memory_order_relaxed);
+    if (firstSequence == 0)
+        g_runtime.masterFirstSequence.compare_exchange_strong(firstSequence, sequence,
+                                                               std::memory_order_relaxed);
+    auto firstBuffer = g_runtime.masterFirstBuffer.load(std::memory_order_relaxed);
+    if (firstBuffer == 0)
+        g_runtime.masterFirstBuffer.compare_exchange_strong(firstBuffer, bufferAddress,
+                                                             std::memory_order_relaxed);
+    g_runtime.masterLastSequence.store(sequence, std::memory_order_relaxed);
+    g_runtime.masterLastBuffer.store(bufferAddress, std::memory_order_relaxed);
     const auto before = bufferHash(buffer);
     if (g_runtime.masterCalls.fetch_add(1, std::memory_order_relaxed) == 0) {
         g_runtime.masterThread.store(GetCurrentThreadId(), std::memory_order_relaxed);
-        g_runtime.frames.store(g_runtime.frameCount(buffer), std::memory_order_relaxed);
-        g_runtime.channels.store(g_runtime.channelCount(buffer), std::memory_order_relaxed);
-        if (g_runtime.sampleRate && g_runtime.audioCore)
-            g_runtime.rate.store(g_runtime.sampleRate(g_runtime.audioCore), std::memory_order_relaxed);
     }
+    g_runtime.frames.store(g_runtime.frameCount(buffer), std::memory_order_relaxed);
+    g_runtime.channels.store(g_runtime.channelCount(buffer), std::memory_order_relaxed);
+    if (g_runtime.sampleRate && g_runtime.audioCore)
+        g_runtime.rate.store(g_runtime.sampleRate(g_runtime.audioCore), std::memory_order_relaxed);
     original(self, buffer, ticks, musicians, backingTrack);
     updateAudioLayerState();
     if (g_runtime.rawData && g_runtime.frameCount && g_runtime.channelCount) {
@@ -381,9 +447,19 @@ void masterProcessHook(void *self, void *buffer, void *ticks, void *musicians,
         const float *inputs[2]{raw.channels[0], raw.channels[1]};
         float *outputs[2]{raw.channels[0], raw.channels[1]};
         const audio::BlockView block{inputs, nullptr, outputs, nullptr, channels, frames,
-                                     rate > 0 ? rate : 44100.0, frames};
+                                     rate > 0 ? rate : 44100.0, frames, buffer, sequence, true};
         const auto effectBefore = bufferHash(buffer);
-        const auto chainResult = g_runtime.chain.process(block);
+        const auto active = g_runtime.chain.snapshot().activeSlot;
+        const bool configurationMatches = active < 0 ||
+            (g_runtime.effects[active].configuredRate.load(std::memory_order_acquire) == rate &&
+             frames <= g_runtime.effects[active].configuredBlock.load(std::memory_order_acquire));
+        effects::Chain::ProcessResult chainResult;
+        if (configurationMatches)
+            chainResult = g_runtime.chain.process(block);
+        else {
+            g_runtime.configurationMismatchBlocks.fetch_add(1, std::memory_order_relaxed);
+            chainResult.bypassed = true;
+        }
         if (chainResult.error || chainResult.bypassed || !chainResult.completed)
             audio::bypass(block);
         if (chainResult.completed && !chainResult.bypassed && !chainResult.error) {
@@ -516,6 +592,24 @@ bool validateReconfiguration() noexcept {
 }
 
 void dspProcessHook(void *self, void *buffer, void *scratch, void *ticks) {
+    const auto sequence = g_runtime.callbackSequence.fetch_add(1, std::memory_order_relaxed) + 1;
+    const auto bufferAddress = reinterpret_cast<std::uintptr_t>(buffer);
+    auto firstSequence = g_runtime.dspFirstSequence.load(std::memory_order_relaxed);
+    if (firstSequence == 0)
+        g_runtime.dspFirstSequence.compare_exchange_strong(firstSequence, sequence,
+                                                            std::memory_order_relaxed);
+    auto firstBuffer = g_runtime.dspFirstBuffer.load(std::memory_order_relaxed);
+    if (firstBuffer == 0)
+        g_runtime.dspFirstBuffer.compare_exchange_strong(firstBuffer, bufferAddress,
+                                                          std::memory_order_relaxed);
+    g_runtime.dspLastSequence.store(sequence, std::memory_order_relaxed);
+    g_runtime.dspLastBuffer.store(bufferAddress, std::memory_order_relaxed);
+    const auto masterSequence = g_runtime.masterLastSequence.load(std::memory_order_relaxed);
+    const auto masterBuffer = g_runtime.masterLastBuffer.load(std::memory_order_relaxed);
+    if (masterSequence != 0 && sequence > masterSequence)
+        g_runtime.dspAfterMasterObserved.store(true, std::memory_order_relaxed);
+    if (masterBuffer != 0 && masterBuffer == bufferAddress)
+        g_runtime.sameBufferObserved.store(true, std::memory_order_relaxed);
     if (g_runtime.dspCalls.fetch_add(1, std::memory_order_relaxed) == 0)
         g_runtime.dspThread.store(GetCurrentThreadId(), std::memory_order_relaxed);
     if (g_inMasterHook) g_runtime.dspInsideMaster.store(true, std::memory_order_relaxed);
@@ -531,28 +625,32 @@ void writeJump(std::uint8_t *bytes, const void *destination) noexcept {
     bytes[11] = 0xE0;
 }
 
-bool install(Patch &patch, void *target, void *detour, const std::uint8_t *expected) noexcept {
-    if (!target || patch.installed || std::memcmp(target, expected, kPatchBytes) != 0) return false;
-    auto *trampoline = static_cast<std::uint8_t *>(VirtualAlloc(nullptr, kPatchBytes + 12,
+bool install(Patch &patch, void *target, void *detour, const std::uint8_t *expected,
+             std::size_t size) noexcept {
+    if (!target || !detour || !expected || patch.installed || size < 12 ||
+        size > sizeof(patch.original) ||
+        std::memcmp(target, expected, size) != 0) return false;
+    auto *trampoline = static_cast<std::uint8_t *>(VirtualAlloc(nullptr, size + 12,
         MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE));
     if (!trampoline) return false;
-    std::memcpy(patch.original, target, kPatchBytes);
-    std::memcpy(trampoline, target, kPatchBytes);
-    writeJump(trampoline + kPatchBytes, static_cast<std::uint8_t *>(target) + kPatchBytes);
-    FlushInstructionCache(GetCurrentProcess(), trampoline, kPatchBytes + 12);
+    std::memcpy(patch.original, target, size);
+    std::memcpy(trampoline, target, size);
+    writeJump(trampoline + size, static_cast<std::uint8_t *>(target) + size);
+    FlushInstructionCache(GetCurrentProcess(), trampoline, size + 12);
     DWORD protection = 0;
-    if (!VirtualProtect(target, kPatchBytes, PAGE_EXECUTE_READWRITE, &protection)) {
+    if (!VirtualProtect(target, size, PAGE_EXECUTE_READWRITE, &protection)) {
         VirtualFree(trampoline, 0, MEM_RELEASE);
         return false;
     }
     // Publish the original destination before making the entry point callable.
     patch.target = target;
     patch.trampoline = trampoline;
+    patch.size = size;
     writeJump(static_cast<std::uint8_t *>(target), detour);
-    std::memset(static_cast<std::uint8_t *>(target) + 12, 0x90, kPatchBytes - 12);
-    FlushInstructionCache(GetCurrentProcess(), target, kPatchBytes);
+    std::memset(static_cast<std::uint8_t *>(target) + 12, 0x90, size - 12);
+    FlushInstructionCache(GetCurrentProcess(), target, size);
     DWORD unused = 0;
-    VirtualProtect(target, kPatchBytes, protection, &unused);
+    VirtualProtect(target, size, protection, &unused);
     patch.installed = true;
     return true;
 }
@@ -560,12 +658,13 @@ bool install(Patch &patch, void *target, void *detour, const std::uint8_t *expec
 void remove(Patch &patch) noexcept {
     if (!patch.installed) return;
     DWORD protection = 0;
-    if (!VirtualProtect(patch.target, kPatchBytes, PAGE_EXECUTE_READWRITE, &protection)) return;
-    std::memcpy(patch.target, patch.original, kPatchBytes);
-    FlushInstructionCache(GetCurrentProcess(), patch.target, kPatchBytes);
+    if (!VirtualProtect(patch.target, patch.size, PAGE_EXECUTE_READWRITE, &protection)) return;
+    std::memcpy(patch.target, patch.original, patch.size);
+    FlushInstructionCache(GetCurrentProcess(), patch.target, patch.size);
     DWORD unused = 0;
-    VirtualProtect(patch.target, kPatchBytes, protection, &unused);
+    VirtualProtect(patch.target, patch.size, protection, &unused);
     patch.installed = false;
+    patch.size = 0;
     // An audio call may still be returning through this trampoline. Its tiny
     // allocation is retained until process exit instead of freeing live code.
 }
@@ -594,9 +693,12 @@ State prepare(const host::Verification &verification) noexcept {
     result.audioBufferAccessorsFound =
         observe(amaudio, kRawData).exportFound && observe(amaudio, kFrameCount).exportFound &&
         observe(amaudio, kChannelCount).exportFound;
+    result.audioBufferLockAccessorsFound =
+        observe(amaudio, kLock).exportFound && observe(amaudio, kUnlock).exportFound;
     result.audioLayerInputLevelAccessorFound =
         observe(amaudio, kAudioLayerInstance).exportFound &&
         observe(amaudio, kAudioLayerInputLevel).exportFound;
+    result.audioOutputCallback.moduleLoaded = amaudio != nullptr;
     g_runtime.audioLayerInputLevel =
         reinterpret_cast<AudioLayerInputLevelFn>(GetProcAddress(amaudio, kAudioLayerInputLevel));
     g_runtime.audioLayerIsRunning =
@@ -620,17 +722,29 @@ State prepare(const host::Verification &verification) noexcept {
         g_runtime.rawData = reinterpret_cast<RawDataFn>(GetProcAddress(amaudio, kRawData));
         g_runtime.frameCount = reinterpret_cast<FrameCountFn>(GetProcAddress(amaudio, kFrameCount));
         g_runtime.channelCount = reinterpret_cast<ChannelCountFn>(GetProcAddress(amaudio, kChannelCount));
+        g_runtime.lock = reinterpret_cast<BufferAccessFn>(GetProcAddress(amaudio, kLock));
+        g_runtime.unlock = reinterpret_cast<BufferAccessFn>(GetProcAddress(amaudio, kUnlock));
         g_runtime.sampleRate = reinterpret_cast<SampleRateFn>(GetProcAddress(amaudio, kSampleRate));
         const auto coreInstance = reinterpret_cast<AudioCoreInstanceFn>(GetProcAddress(amaudio, kAudioCoreInstance));
         if (coreInstance) g_runtime.audioCore = coreInstance();
         const bool master = install(g_runtime.master, GetProcAddress(gprse, kMasterProcess),
-                                    reinterpret_cast<void *>(&masterProcessHook), kMasterPrologue);
+                                    reinterpret_cast<void *>(&masterProcessHook), kMasterPrologue,
+                                    kMasterPatchBytes);
         const bool dsp = master && install(g_runtime.dsp, GetProcAddress(gprse, kEffectsChainProcessDsp),
-                                          reinterpret_cast<void *>(&dspProcessHook), kDspPrologue);
+                                          reinterpret_cast<void *>(&dspProcessHook), kDspPrologue,
+                                          kDspPatchBytes);
+        auto *streamTarget = amaudio
+            ? reinterpret_cast<std::uint8_t *>(amaudio) + kStreamCallbackRva
+            : nullptr;
+        result.audioOutputCallback.exportFound = streamTarget != nullptr;
+        install(
+            g_runtime.stream, streamTarget, reinterpret_cast<void *>(&streamCallbackHook),
+            kStreamPrologue, kStreamPatchBytes);
         result.installed = master && dsp;
         if (!result.installed) {
             remove(g_runtime.master);
             remove(g_runtime.dsp);
+            remove(g_runtime.stream);
         }
         if (result.installed && result.runtimeEffectEnabled) {
             result.runtimeProcessorReady = configureRuntimeChain();
@@ -663,6 +777,35 @@ State snapshot() noexcept {
     const auto chain = g_runtime.chain.snapshot();
     const auto input = g_runtime.inputRouter.snapshot();
     result.installed = g_runtime.master.installed && g_runtime.dsp.installed;
+    result.audioOutputCallbackInstalled = g_runtime.stream.installed;
+    result.audioOutputObserved = g_runtime.outputObserved.load(std::memory_order_acquire);
+    result.audioOutputWritebackObserved =
+        g_runtime.outputWriteObserved.load(std::memory_order_acquire);
+    result.audioOutputCallback.callObserved =
+        g_runtime.outputCalls.load(std::memory_order_relaxed) != 0;
+    result.audioOutputCallback.bufferWriteObserved = result.audioOutputWritebackObserved;
+    result.audioOutputCallback.callCount =
+        g_runtime.outputCalls.load(std::memory_order_relaxed);
+    result.audioOutputCallback.frameCount =
+        g_runtime.outputFrames.load(std::memory_order_relaxed);
+    result.audioOutputCallback.threadId =
+        g_runtime.outputThread.load(std::memory_order_relaxed);
+    result.audioOutputCallback.firstBufferAddress =
+        g_runtime.outputFirstBuffer.load(std::memory_order_relaxed);
+    result.audioOutputCallback.lastBufferAddress =
+        g_runtime.outputLastBuffer.load(std::memory_order_relaxed);
+    result.audioOutputCallback.beforeHash =
+        g_runtime.outputBeforeHash.load(std::memory_order_relaxed);
+    result.audioOutputCallback.afterHash =
+        g_runtime.outputAfterHash.load(std::memory_order_relaxed);
+    result.audioBufferPointerObserved =
+        g_runtime.effects[0].ownerObserved.load(std::memory_order_acquire) ||
+        g_runtime.effects[1].ownerObserved.load(std::memory_order_acquire);
+    result.audioBufferWritebackObserved =
+        g_runtime.effects[0].outputWritten.load(std::memory_order_acquire) ||
+        g_runtime.effects[1].outputWritten.load(std::memory_order_acquire);
+    result.audioBufferSequenceCount =
+        static_cast<std::size_t>(g_runtime.callbackSequence.load(std::memory_order_relaxed));
     result.masterProcess.callCount = g_runtime.masterCalls.load(std::memory_order_relaxed);
     result.masterProcess.callObserved = result.masterProcess.callCount != 0;
     result.masterProcess.bufferWriteObserved = g_runtime.bufferWriteObserved.load(std::memory_order_relaxed);
@@ -670,13 +813,34 @@ State snapshot() noexcept {
     result.masterProcess.channelCount = g_runtime.channels.load(std::memory_order_relaxed);
     result.masterProcess.sampleRate = g_runtime.rate.load(std::memory_order_relaxed);
     result.masterProcess.threadId = g_runtime.masterThread.load(std::memory_order_relaxed);
+    result.masterProcess.firstSequence = g_runtime.masterFirstSequence.load(std::memory_order_relaxed);
+    result.masterProcess.lastSequence = g_runtime.masterLastSequence.load(std::memory_order_relaxed);
+    result.masterProcess.firstBufferAddress = g_runtime.masterFirstBuffer.load(std::memory_order_relaxed);
+    result.masterProcess.lastBufferAddress = g_runtime.masterLastBuffer.load(std::memory_order_relaxed);
     result.effectsChainProcessDsp.callCount = g_runtime.dspCalls.load(std::memory_order_relaxed);
     result.effectsChainProcessDsp.callObserved = result.effectsChainProcessDsp.callCount != 0;
     result.effectsChainProcessDsp.threadId = g_runtime.dspThread.load(std::memory_order_relaxed);
+    result.effectsChainProcessDsp.firstSequence = g_runtime.dspFirstSequence.load(std::memory_order_relaxed);
+    result.effectsChainProcessDsp.lastSequence = g_runtime.dspLastSequence.load(std::memory_order_relaxed);
+    result.effectsChainProcessDsp.firstBufferAddress = g_runtime.dspFirstBuffer.load(std::memory_order_relaxed);
+    result.effectsChainProcessDsp.lastBufferAddress = g_runtime.dspLastBuffer.load(std::memory_order_relaxed);
     result.effectsChainInsideMaster = g_runtime.dspInsideMaster.load(std::memory_order_relaxed);
+    result.effectsChainAfterMasterObserved =
+        g_runtime.dspAfterMasterObserved.load(std::memory_order_relaxed);
+    result.sameBufferObserved = g_runtime.sameBufferObserved.load(std::memory_order_relaxed);
+    result.crossThreadObserved = result.masterProcess.threadId != 0 &&
+        result.effectsChainProcessDsp.threadId != 0 &&
+        result.masterProcess.threadId != result.effectsChainProcessDsp.threadId;
     result.runtimeProcessorReady = chain.activeSlot >= 0 && chain.activeSlot < 2 &&
         g_runtime.effects[chain.activeSlot].ready.load(std::memory_order_acquire);
     result.runtimeProcessCount = g_runtime.effectCalls.load(std::memory_order_relaxed);
+    result.runtimeConfigurationMismatchBlocks =
+        g_runtime.configurationMismatchBlocks.load(std::memory_order_relaxed);
+    result.runtimeConfigurationMatches = chain.activeSlot >= 0 && chain.activeSlot < 2 &&
+        g_runtime.effects[chain.activeSlot].configuredRate.load(std::memory_order_acquire) ==
+            g_runtime.rate.load(std::memory_order_relaxed) &&
+        g_runtime.frames.load(std::memory_order_relaxed) <=
+            g_runtime.effects[chain.activeSlot].configuredBlock.load(std::memory_order_acquire);
     result.runtimeProcessObserved = g_runtime.effectProcessed.load(std::memory_order_relaxed);
     result.runtimeBufferWriteObserved = g_runtime.effectWriteObserved.load(std::memory_order_relaxed);
     const auto active = chain.activeSlot >= 0 && chain.activeSlot < 2 ? chain.activeSlot : 0;
@@ -742,10 +906,73 @@ void shutdown() noexcept {
     g_runtime.inputRouter.setEnabled(false);
     g_runtime.inputRouter.setRoute(input::Route::Disabled);
     g_runtime.inputEffect.shutdown();
+    g_runtime.outputEvidenceClaimed.store(false, std::memory_order_release);
+    g_runtime.outputBeforeHash.store(0, std::memory_order_relaxed);
+    g_runtime.outputAfterHash.store(0, std::memory_order_relaxed);
+    g_runtime.outputWriteObserved.store(false, std::memory_order_release);
+    g_runtime.outputObserved.store(false, std::memory_order_release);
+    g_runtime.outputCalls.store(0, std::memory_order_relaxed);
+    g_runtime.outputFrames.store(0, std::memory_order_relaxed);
+    g_runtime.outputThread.store(0, std::memory_order_relaxed);
+    g_runtime.outputFirstBuffer.store(0, std::memory_order_relaxed);
+    g_runtime.outputLastBuffer.store(0, std::memory_order_relaxed);
+    remove(g_runtime.stream);
     remove(g_runtime.dsp);
     remove(g_runtime.master);
     g_runtime.effects[0].shutdown();
     g_runtime.effects[1].shutdown();
+}
+
+std::uint64_t outputHash(const void *output, unsigned long frames) noexcept {
+    if (!output || frames == 0) return 0;
+    // The PortAudio callback ABI does not expose channel count here. Hash only
+    // one frame-sized span, which is valid for both mono and interleaved output
+    // without assuming a stereo layout.
+    const auto samples = (std::min)(static_cast<std::size_t>(frames),
+                                    static_cast<std::size_t>(8192));
+    const auto *values = static_cast<const float *>(output);
+    std::uint64_t hash = 1469598103934665603ULL;
+    for (std::size_t index = 0; index < samples; ++index) {
+        std::uint32_t bits = 0;
+        std::memcpy(&bits, values + index, sizeof(bits));
+        hash ^= bits;
+        hash *= 1099511628211ULL;
+    }
+    return hash;
+}
+
+int streamCallbackHook(const void *input, void *output, unsigned long frames,
+                       const void *timeInfo, unsigned long status, void *userData) {
+    const auto original = reinterpret_cast<StreamCallback>(g_runtime.stream.trampoline);
+    const auto outputAddress = reinterpret_cast<std::uintptr_t>(output);
+    auto firstBuffer = g_runtime.outputFirstBuffer.load(std::memory_order_relaxed);
+    if (firstBuffer == 0)
+        g_runtime.outputFirstBuffer.compare_exchange_strong(firstBuffer, outputAddress,
+                                                              std::memory_order_relaxed);
+    g_runtime.outputLastBuffer.store(outputAddress, std::memory_order_relaxed);
+    g_runtime.outputCalls.fetch_add(1, std::memory_order_relaxed);
+    const auto before = outputHash(output, frames);
+    const auto result = original(input, output, frames, timeInfo, status, userData);
+    const auto after = outputHash(output, frames);
+    g_runtime.outputObserved.store(output != nullptr && frames != 0, std::memory_order_release);
+    if (before != after) {
+        bool expected = false;
+        if (g_runtime.outputEvidenceClaimed.compare_exchange_strong(
+                expected, true, std::memory_order_acq_rel)) {
+        // Keep the first changed pair so a later silent block cannot overwrite
+        // the evidence that the device callback actually wrote its output.
+            g_runtime.outputBeforeHash.store(before, std::memory_order_relaxed);
+            g_runtime.outputAfterHash.store(after, std::memory_order_relaxed);
+            g_runtime.outputWriteObserved.store(true, std::memory_order_release);
+        }
+    }
+    g_runtime.outputFrames.store(frames, std::memory_order_relaxed);
+    g_runtime.outputThread.store(GetCurrentThreadId(), std::memory_order_relaxed);
+    return result;
+}
+
+void setTotalBypass(bool bypassed) noexcept {
+    g_runtime.chain.setBypassed(bypassed);
 }
 
 bool processExternalInput(const input::CaptureView &capture,

@@ -41,15 +41,16 @@ GP 继续负责音频设备、输入输出、采样率和流生命周期。插�
 
 ### P2：GP 音频适配和实时接入
 
-**状态：已完成适配器、VST3 实际 process 探针和哈希门控的真实播放处理路径（2026-09-09）**。最终设备回调、跨线程 ABI 关系和听感仍为宿主受限项；实现与验证证据见 [P2 实现记录](P2_IMPLEMENTATION.md)。
+**状态：已完成适配器、VST3 实际 process 探针、哈希门控和锁定宿主版本的最终输出回调观测（2026-09-09）**。`IAudioBuffer` 跨线程 ABI、capture 所有权和听感仍为宿主受限项；实现与验证证据见 [P2 实现记录](P2_IMPLEMENTATION.md)。
 
 - [x] 定义内部音频块结构，包含输入/生成/输出缓冲、帧数、采样率、通道数和 block size。
 - [x] 提供 GP 通道指针到 VST3 planar `float32` 的复制适配，以及处理后的输出写回。
 - [x] 对 `GPRSE::Master::process` 和 `EffectsChain::processDSP` 做宿主哈希/prologue 门控的运行时观测。
 - [x] 在原始 `Master::process` 调用后将 GP 双声道缓冲转换为 planar `float32`，调用预创建的 `ParametricOD` 并写回原缓冲；真实播放已观测到 49 个处理块。
-- [ ] 真实宿主中的 `IAudioBuffer` 所有权、两个入口的跨线程处理顺序和后续 `AudioLayer` 最终设备写回：当前证据不足。
+- [x] 锁定宿主版本中的 `PortAudioAudioLayerImpl::Impl::streamCallback` 已按 RVA/prologue 门控安装并观测到最终输出缓冲写回。
+- [ ] 真实宿主中的 `IAudioBuffer` 完整所有权和跨线程同步协议仍未确认；扬声器听感与声学结果仍属于宿主受限验证。
 - [x] 在已安装的 `ParametricOD.vst3`、`Gateway.vst3`、`NAM Rig.vst3` 上完成实际 `IAudioProcessor::process()` 块探针。
-- [ ] GP 播放 RSE/MIDI 的最终听感和产品 UI 旁路/启用切换：当前运行时开关仅用于隔离验证，属于宿主受限项。
+- [ ] GP 播放 RSE/MIDI 的最终听感仍未完成；P5 面板的旁路动作已连接到实时链，但完整插件启用/重建流程仍属于宿主受限项。
 
 ### P3：实时线程安全和链管理
 
@@ -67,7 +68,8 @@ GP 继续负责音频设备、输入输出、采样率和流生命周期。插�
 - [x] 新增固定预分配 capture tap，读取 `AudioLayer::inputLevel/isRunning/bufferSize` 并输出原子输入电平快照。
 - [x] 实现外部吉他 `input_insert`，处理失败时直通并记录旁路/错误计数。
 - [x] 实现 GP 回放与外部输入分别处理，以及混合后进入 `bus_mix` 总线效果器。
-- [ ] `PortAudioAudioLayerImpl::Impl::streamCallback` 的真实 capture buffer 所有权和最终设备写回：当前只有字符串/调用证据，待宿主 ABI 证据补齐。
+- [x] `PortAudioAudioLayerImpl::Impl::streamCallback` 的最终输出缓冲写回已在锁定宿主版本中观测。
+- [ ] 该回调中的真实 capture buffer 所有权和输入通道布局仍待宿主 ABI 证据补齐。
 - [ ] 真实宿主中的输入监听稳定性、反馈、设备切换、暂停/恢复听感：当前未运行，标记为宿主受限。
 
 ### P5：Qt 界面和状态保存

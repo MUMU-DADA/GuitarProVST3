@@ -28,7 +28,7 @@ P4 已完成最小可交付的输入适配层和隔离验证。插件不创建�
 
 本次已通过 MSVC x64 插件构建和独立路由夹具。夹具确认三种路由的样本结果、输入电平统计和错误安全回退均符合预期。
 
-在真实 Guitar Pro 8.1.1.17 中，`AMAudio` 导出的 `AudioLayer::inputLevel`/流状态访问器可用于监控；预研中发现的 `PortAudioAudioLayerImpl::Impl::streamCallback` 只存在于字符串和调用证据，没有稳定导出或可校验的函数 prologue。因此真实 capture 指针尚未宣称已定位，必须由后续宿主适配器在确认该回调 ABI 后调用 `processExternalInput()`。真实输入监听、反馈、设备切换和暂停/恢复听感仍属于宿主受限验证项。
+在真实 Guitar Pro 8.1.1.17 中，`AMAudio` 导出的 `AudioLayer::inputLevel`/流状态访问器可用于监控；当前已根据锁定 RVA 和函数 prologue 观测到 `PortAudioAudioLayerImpl::Impl::streamCallback` 的最终输出回调及输出写回，但该回调中的 capture 指针所有权和输入通道布局仍未确认。真实 capture 指针必须由后续宿主适配器在确认 ABI 后调用 `processExternalInput()`。真实输入监听、反馈、设备切换和暂停/恢复听感仍属于宿主受限验证项。
 
 ## 运行开关
 

@@ -11,6 +11,10 @@
 #include <iostream>
 
 namespace {
+bool realtimeBypassed = false;
+
+void captureBypass(bool bypassed) noexcept { realtimeBypassed = bypassed; }
+
 bool check(bool value, const char *message) {
     if (!value) std::cerr << "FAIL: " << message << '\n';
     return value;
@@ -29,6 +33,7 @@ int main(int argc, char **argv) {
     const QJsonObject chain{{"score_id", "ui-score.gp"}, {"track", 2}, {"bus", "master"},
                             {"effects", QJsonArray{effect}}};
     if (!check(gpvst3::state::writeChain(chain), "write UI sidecar")) return 1;
+    gpvst3::ui::setRealtimeBypassControl(&captureBypass);
     gpvst3::ui::showEffectChainPanel();
     QCoreApplication::processEvents();
     auto *panel = qApp->property("gpvst3P5Panel").value<QWidget *>();
@@ -44,6 +49,14 @@ int main(int argc, char **argv) {
         hasSave |= button->text() == QStringLiteral("保存");
     }
     if (!check(hasBypass && hasSave, "chain controls")) return 1;
+    if (!check(realtimeBypassed, "missing effect starts realtime bypassed")) return 1;
+    for (auto *button : panel->findChildren<QPushButton *>()) {
+        if (button->text().contains(QStringLiteral("旁路"))) {
+            button->click();
+            break;
+        }
+    }
+    if (!check(!realtimeBypassed, "bypass action reaches realtime control")) return 1;
     panel->close();
     QCoreApplication::processEvents();
     std::cout << "PASS: P5 Qt chain panel creation and sidecar restoration.\n";

@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstddef>
+#include <cstdint>
 #include <vector>
 
 namespace Steinberg::Vst {
@@ -22,6 +23,11 @@ struct BlockView {
     std::size_t frameCount = 0;
     double sampleRate = 0.0;
     std::size_t blockSize = 0;
+    // Optional evidence supplied by a host adapter. The pointers remain
+    // borrowed for the duration of the call; no buffer ownership is retained.
+    const void *owner = nullptr;
+    std::uint64_t sequence = 0;
+    bool outputWritable = true;
 };
 
 // Storage is prepared on a control/worker thread and then reused by process()
@@ -65,7 +71,10 @@ bool bypass(const BlockView &block) noexcept;
 struct ProcessResult {
     bool processed = false;
     bool bypassed = false;
+    bool outputWritten = false;
+    bool ownerPointerObserved = false;
     std::size_t frames = 0;
+    std::size_t channels = 0;
     const char *error = "none";
 };
 

@@ -31,6 +31,8 @@
 namespace gpvst3::ui {
 namespace {
 
+RealtimeBypassControl g_realtimeBypassControl = nullptr;
+
 constexpr int kPathRole = Qt::UserRole;
 constexpr int kUidRole = Qt::UserRole + 1;
 
@@ -164,9 +166,16 @@ private:
         dirty_ = false;
         status_->setText(valid ? QStringLiteral("状态已恢复：%1").arg(state::sidecarPath())
                                : QStringLiteral("状态恢复失败，已使用空链：%1").arg(error));
-        if (list_->count()) {
-            list_->setCurrentRow(0);
-        }
+        if (list_->count()) list_->setCurrentRow(0);
+        syncRealtimeBypass();
+    }
+
+    void syncRealtimeBypass() {
+        if (!g_realtimeBypassControl || list_->count() == 0) return;
+        bool allBypassed = true;
+        for (int row = 0; row < list_->count(); ++row)
+            allBypassed = allBypassed && list_->item(row)->checkState() == Qt::Checked;
+        g_realtimeBypassControl(allBypassed);
     }
 
     void filterItems() {
@@ -219,7 +228,7 @@ private:
         auto *item = new QListWidgetItem(path, list_);
         item->setData(kPathRole, path); item->setData(kUidRole, QString()); item->setCheckState(Qt::Unchecked);
         QJsonArray effects = sidecar_.value("effects").toArray(); effects.append(effectObject(item)); sidecar_.insert("effects", effects);
-        list_->setCurrentItem(item); dirty_ = true;
+        list_->setCurrentItem(item); syncRealtimeBypass(); dirty_ = true;
     }
 
     void removeEffect() {
@@ -227,6 +236,8 @@ private:
         delete list_->takeItem(row);
         QJsonArray effects = sidecar_.value("effects").toArray(); effects.removeAt(row); sidecar_.insert("effects", effects);
         dirty_ = true; if (list_->count()) list_->setCurrentRow((std::min)(row, list_->count() - 1));
+        if (list_->count()) syncRealtimeBypass();
+        else if (g_realtimeBypassControl) g_realtimeBypassControl(true);
     }
 
     void moveEffect(int delta) {
@@ -241,6 +252,7 @@ private:
         const int row = list_->currentRow(); if (row < 0) return;
         auto *item = list_->item(row); const bool bypass = item->checkState() != Qt::Checked; item->setCheckState(bypass ? Qt::Checked : Qt::Unchecked);
         QJsonArray effects = sidecar_.value("effects").toArray(); auto object = effects.at(row).toObject(); object.insert("bypass", bypass); effects.replace(row, object); sidecar_.insert("effects", effects);
+        syncRealtimeBypass();
         dirty_ = true;
     }
 
@@ -289,6 +301,10 @@ private:
 } // namespace
 
 const char *state() noexcept { return "panel_ready_p5"; }
+
+void setRealtimeBypassControl(RealtimeBypassControl control) noexcept {
+    g_realtimeBypassControl = control;
+}
 
 void showEffectChainPanel() {
     if (!qApp || qApp->property("gpvst3P5Panel").value<QWidget *>()) return;

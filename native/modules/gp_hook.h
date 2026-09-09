@@ -19,6 +19,12 @@ struct EntryPointObservation {
     std::size_t channelCount = 0;
     double sampleRate = 0.0;
     unsigned long threadId = 0;
+    std::uint64_t firstSequence = 0;
+    std::uint64_t lastSequence = 0;
+    std::uintptr_t firstBufferAddress = 0;
+    std::uintptr_t lastBufferAddress = 0;
+    std::uint64_t beforeHash = 0;
+    std::uint64_t afterHash = 0;
 };
 
 struct State {
@@ -27,12 +33,23 @@ struct State {
     bool hostSupported = false;
     bool observationOnly = true;
     bool audioBufferAccessorsFound = false;
+    bool audioBufferLockAccessorsFound = false;
+    bool audioBufferPointerObserved = false;
+    bool audioBufferWritebackObserved = false;
+    bool audioOutputCallbackInstalled = false;
+    bool audioOutputObserved = false;
+    bool audioOutputWritebackObserved = false;
     bool effectsChainInsideMaster = false;
+    bool effectsChainAfterMasterObserved = false;
+    bool crossThreadObserved = false;
+    bool sameBufferObserved = false;
     bool runtimeEffectEnabled = false;
     bool runtimeProcessorReady = false;
     bool runtimeProcessObserved = false;
     bool runtimeBufferWriteObserved = false;
     std::size_t runtimeProcessCount = 0;
+    std::size_t runtimeConfigurationMismatchBlocks = 0;
+    bool runtimeConfigurationMatches = false;
     std::string runtimeEffectName;
     std::string runtimeEffectError;
     bool totalBypass = true;
@@ -48,6 +65,7 @@ struct State {
     std::uint64_t maxProcessNanoseconds = 0;
     std::uint64_t totalProcessNanoseconds = 0;
     std::size_t chainSwitchCount = 0;
+    std::size_t audioBufferSequenceCount = 0;
     std::size_t runtimeEffectInstances = 0;
     std::size_t reconfigurationPassed = 0;
     std::size_t reconfigurationFailed = 0;
@@ -77,6 +95,7 @@ struct State {
     std::string reason = "p2_observation_only";
     EntryPointObservation masterProcess;
     EntryPointObservation effectsChainProcessDsp;
+    EntryPointObservation audioOutputCallback;
 };
 
 // Entry-point patching is enabled only by the explicit environment switch and
@@ -85,6 +104,10 @@ struct State {
 State prepare(const host::Verification &verification) noexcept;
 State snapshot() noexcept;
 void shutdown() noexcept;
+
+// Thread-safe control used by the Qt panel. It only changes an atomic bypass
+// flag; processor creation and destruction remain on the worker thread.
+void setTotalBypass(bool bypassed) noexcept;
 
 // Called by the eventual AudioLayer/PortAudio capture adapter. The function
 // owns no buffers and is safe to call from the audio callback after prepare().

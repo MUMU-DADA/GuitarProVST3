@@ -83,7 +83,8 @@ void Chain::deactivate() noexcept {
 
 void Chain::setBypassed(bool value) noexcept {
     requestedBypass_.store(value, std::memory_order_release);
-    bypassed_.store(value || faulted(), std::memory_order_release);
+    bypassed_.store(value || faulted(),
+                    std::memory_order_release);
 }
 
 void Chain::clearFault() noexcept {

@@ -9,12 +9,14 @@ namespace gpvst3::audio {
 namespace {
 
 const float *sourceChannel(const BlockView &block, std::size_t channel) noexcept {
+    if (channel >= block.channelCount) return nullptr;
     const auto channels = block.generatedChannels ? block.generatedChannels : block.inputChannels;
     if (channels) return channels[channel];
     return block.channels ? block.channels[channel] : nullptr;
 }
 
 float *targetChannel(const BlockView &block, std::size_t channel) noexcept {
+    if (channel >= block.channelCount) return nullptr;
     const auto channels = block.outputChannels ? block.outputChannels : block.channels;
     return channels ? channels[channel] : nullptr;
 }
@@ -22,6 +24,9 @@ float *targetChannel(const BlockView &block, std::size_t channel) noexcept {
 } // namespace
 
 bool PlanarBuffer::prepare(std::size_t channelCount, std::size_t frameCapacity) noexcept {
+    if (channelCount == 0 || frameCapacity == 0 ||
+        channelCount > (static_cast<std::size_t>(-1) / frameCapacity))
+        return false;
     try {
         channelCount_ = channelCount;
         frameCapacity_ = frameCapacity;
@@ -116,6 +121,12 @@ ProcessResult process(Steinberg::Vst::IAudioProcessor &processor,
                       const BlockView &block, PlanarBuffer &scratch, bool bypassed) noexcept {
     ProcessResult result;
     result.frames = block.frameCount;
+    result.channels = block.channelCount;
+    result.ownerPointerObserved = block.owner != nullptr;
+    if (!block.outputWritable) {
+        result.error = "output_not_writable";
+        return result;
+    }
     if (bypassed) {
         result.bypassed = true;
         const auto copied = copyToPlanar(block, scratch);
@@ -128,6 +139,7 @@ ProcessResult process(Steinberg::Vst::IAudioProcessor &processor,
                         block.frameCount * sizeof(float));
         const auto written = copyFromPlanar(scratch, block);
         result.processed = written.valid;
+        result.outputWritten = written.valid;
         result.error = written.valid ? "none" : "output_buffer";
         return result;
     }
@@ -161,6 +173,7 @@ ProcessResult process(Steinberg::Vst::IAudioProcessor &processor,
     }
     const auto written = copyFromPlanar(scratch, block);
     result.processed = written.valid;
+    result.outputWritten = written.valid;
     result.error = written.valid ? "none" : "output_buffer";
     return result;
 }
