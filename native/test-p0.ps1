@@ -4,7 +4,9 @@ param(
     [switch]$KeepHost,
     [switch]$RequireP1,
     [switch]$RequireP2,
-    [switch]$RequireP2Hook
+    [switch]$RequireP2Hook,
+    [ValidateSet('', 'GuitarPro.exe', 'GPCore.dll', 'GPRSE.dll', 'AMAudio.dll', 'AMOverloud.dll')]
+    [string]$TamperHostFile = ''
 )
 
 $ErrorActionPreference = 'Stop'
@@ -19,6 +21,14 @@ New-Item -ItemType Directory -Force -Path $run,$hostCopy | Out-Null
 Get-ChildItem -LiteralPath $HostDirectory -File | Where-Object { $_.Extension -in '.dll','.conf' -or $_.Name -eq 'GuitarPro.exe' } | Copy-Item -Destination $hostCopy
 Copy-Item -LiteralPath (Join-Path $HostDirectory 'Plugins') -Destination $hostCopy -Recurse
 if (Test-Path -LiteralPath (Join-Path $HostDirectory 'translations')) { Copy-Item -LiteralPath (Join-Path $HostDirectory 'translations') -Destination $hostCopy -Recurse }
+if ($TamperHostFile) {
+    $tampered = Join-Path $hostCopy $TamperHostFile
+    if (-not (Test-Path -LiteralPath $tampered -PathType Leaf)) { throw "Cannot tamper missing host file: $tampered" }
+    # Appending bytes to a copied PE/DLL changes its SHA-256 while leaving the
+    # executable image loadable, which gives the gate a real negative test.
+    $stream = [IO.File]::Open($tampered, [IO.FileMode]::Append, [IO.FileAccess]::Write, [IO.FileShare]::Read)
+    try { $stream.WriteByte(0x50); $stream.WriteByte(0x36) } finally { $stream.Dispose() }
+}
 $imageDir = Join-Path $hostCopy 'Plugins/imageformats'
 Remove-Item -LiteralPath (Join-Path $imageDir 'guitarpro_mcp_autoload.dll') -Force -ErrorAction SilentlyContinue
 $installedPlugin = Join-Path $imageDir 'guitarpro_vst3_autoload.dll'
@@ -38,8 +48,10 @@ $results = @()
 try {
     Remove-Item Env:QT_PLUGIN_PATH,Env:QT_QPA_GENERIC_PLUGINS -ErrorAction SilentlyContinue
     $env:GPVST3_DATA_DIR = $run
-    if ($RequireP2Hook) { $env:GPVST3_ENABLE_P2_HOOK = '1' } else { Remove-Item Env:GPVST3_ENABLE_P2_HOOK -ErrorAction SilentlyContinue }
-    Remove-Item Env:GPVST3_ENABLE_P2_EFFECT,Env:GPVST3_RUNTIME_VST3,Env:GPVST3_TOTAL_BYPASS,Env:GPVST3_FORCE_P3_ERROR,Env:GPVST3_ENABLE_P4_INPUT,Env:GPVST3_P4_ROUTE -ErrorAction SilentlyContinue
+    if ($RequireP2Hook -or $TamperHostFile) { $env:GPVST3_ENABLE_P2_HOOK = '1' } else { Remove-Item Env:GPVST3_ENABLE_P2_HOOK -ErrorAction SilentlyContinue }
+    if ($TamperHostFile) { $env:GPVST3_ENABLE_P2_EFFECT = '1'; $env:GPVST3_ENABLE_P4_INPUT = '1'; $env:GPVST3_P4_ROUTE = 'bus_mix' }
+    else { Remove-Item Env:GPVST3_ENABLE_P2_EFFECT,Env:GPVST3_ENABLE_P4_INPUT,Env:GPVST3_P4_ROUTE -ErrorAction SilentlyContinue }
+    Remove-Item Env:GPVST3_RUNTIME_VST3,Env:GPVST3_TOTAL_BYPASS,Env:GPVST3_FORCE_P3_ERROR -ErrorAction SilentlyContinue
     $env:TEMP = $run
     $env:TMP = $run
     foreach ($variant in @('direct','shortcut')) {
@@ -55,7 +67,15 @@ try {
             } while (-not (Test-Path -LiteralPath $statusPath) -and -not $process.HasExited -and [DateTime]::UtcNow -lt $deadline)
             if (-not (Test-Path -LiteralPath $statusPath)) { throw "P0 automatic loading failed for $variant." }
             $status = Get-Content -LiteralPath $statusPath -Raw | ConvertFrom-Json
-            if (-not $status.loaded -or -not $status.bypassed -or -not $status.host_supported) { throw "Unexpected P0 status for $variant." }
+            if (-not $status.loaded -or -not $status.bypassed -or $process.HasExited -or $status.pid -ne $process.Id) { throw "Unexpected P0 status for $variant." }
+            if ($TamperHostFile) {
+                if ($status.host_supported -or $status.status -ne 'host_unsupported' -or
+                    $status.gp_hook.installed -or $status.gp_hook.enabled -or $status.gp_hook.runtime_processor_ready -or
+                    $status.gp_hook.runtime_effect_enabled -or $status.gp_hook.input_route_enabled -or
+                    $status.vst3_host.ready -or -not $status.gp_hook.total_bypass) {
+                    throw "Host hash gate did not disable realtime mode for $variant."
+                }
+            } elseif (-not $status.host_supported) { throw "Unexpected unsupported host status for $variant." }
             if ($RequireP1) {
                 if (-not $status.vst3_host -or -not $status.vst3_host.worker_thread -or -not $status.vst3_host.ready) {
                     throw "Unexpected P1 VST3 host status for $variant."
@@ -97,16 +117,23 @@ try {
     Remove-Item -LiteralPath $statusPath -Force -ErrorAction SilentlyContinue
     $process = Start-Process -FilePath $exe -WorkingDirectory $hostCopy -WindowStyle Hidden -PassThru
     Start-Sleep -Seconds 3
-    if (Test-Path -LiteralPath $statusPath) { throw 'Removing the plugin did not restore normal startup.' }
+    if ((Test-Path -LiteralPath $statusPath) -or $process.HasExited) { throw 'Removing the plugin did not restore normal startup.' }
     if (-not $process.HasExited) { Stop-Process -Id $process.Id -Force; $process.WaitForExit(5000) | Out-Null }
     $results += [pscustomobject]@{variant='uninstalled';pid=$process.Id;status='not_loaded';host_supported=$false;bypassed=$true}
 } finally {
     foreach ($name in $saved.Keys) { [Environment]::SetEnvironmentVariable($name, $saved[$name], 'Process') }
     [pscustomobject]@{host_directory=$hostCopy;plugin_sha256=(Get-FileHash -LiteralPath $PluginPath).Hash;results=$results} |
         ConvertTo-Json -Depth 8 | Set-Content -LiteralPath (Join-Path $run 'verification.json')
-    if (-not $KeepHost) { Remove-Item -LiteralPath $hostCopy -Recurse -Force -ErrorAction SilentlyContinue }
+    if (-not $KeepHost) {
+        $full = (Resolve-Path -LiteralPath $hostCopy).Path
+        $toolsRoot = (Resolve-Path -LiteralPath (Join-Path $root '.tools')).Path.TrimEnd('\') + '\'
+        if (-not $full.StartsWith($toolsRoot, [StringComparison]::OrdinalIgnoreCase)) { throw "Refusing to remove host outside .tools: $full" }
+        Remove-Item -LiteralPath $full -Recurse -Force -ErrorAction SilentlyContinue
+    }
 }
-if ($RequireP2) {
+if ($TamperHostFile) {
+    Write-Output "PASS: P0 host hash mismatch disabled hook and realtime mode. Evidence: $run"
+} elseif ($RequireP2) {
     Write-Output "PASS: P0/P1 plus P2 planar adapter, process probe and GP observation status. Evidence: $run"
 } elseif ($RequireP1) {
     Write-Output "PASS: P0 automatic load plus P1 VST3 host lifecycle. Evidence: $run"

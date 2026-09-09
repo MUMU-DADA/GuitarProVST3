@@ -5,7 +5,9 @@ param(
     [switch]$KeepHost,
     [switch]$ExpectP3Fallback,
     [switch]$ExpectP3TotalBypass,
+    [switch]$ExpectMissingPlugin,
     [switch]$EnableP4,
+    [switch]$P6Workflow,
     [ValidateSet('input_insert','bus_mix')]
     [string]$P4Route = 'bus_mix'
 )
@@ -74,7 +76,8 @@ try {
     if ($ExpectP3TotalBypass) { $env:GPVST3_TOTAL_BYPASS = '1' }
     else { Remove-Item Env:GPVST3_TOTAL_BYPASS -ErrorAction SilentlyContinue }
     $programFiles = if ($env:ProgramW6432) { $env:ProgramW6432 } else { $env:ProgramFiles }
-    $env:GPVST3_RUNTIME_VST3 = Join-Path $programFiles 'Common Files/VST3/ParametricOD.vst3'
+    if ($ExpectMissingPlugin) { $env:GPVST3_RUNTIME_VST3 = Join-Path $run 'missing/NoSuchEffect.vst3' }
+    else { $env:GPVST3_RUNTIME_VST3 = Join-Path $programFiles 'Common Files/VST3/ParametricOD.vst3' }
     $env:GPMCP_DATA_DIR = Join-Path $run 'mcp'
     $env:GPMCP_SESSION_FILE = Join-Path $run 'mcp/native-session.json'
     $env:GPMCP_BACKGROUND = '1'
@@ -122,7 +125,12 @@ try {
         $hook.master_process.sample_rate -le 0 -or -not $hook.master_process.buffer_write_observed) {
         throw "P2 block metadata or host buffer mutation was not observed: $($hook | ConvertTo-Json -Depth 8 -Compress)"
     }
-    if (-not $hook.runtime_effect_enabled -or -not $hook.runtime_processor_ready) {
+    if ($ExpectMissingPlugin) {
+        if (-not $hook.runtime_effect_enabled -or $hook.runtime_processor_ready -or -not $hook.total_bypass -or
+            $hook.runtime_effect_error -ne 'runtime_vst3_not_found' -or $hook.chain_bypass_blocks -le 0) {
+            throw "Missing VST3 did not fail closed into bypass: $($hook | ConvertTo-Json -Depth 8 -Compress)"
+        }
+    } elseif (-not $hook.runtime_effect_enabled -or -not $hook.runtime_processor_ready) {
         throw "P2 runtime VST3 processor was not ready: $($hook | ConvertTo-Json -Depth 8 -Compress)"
     }
     if ($EnableP4) {
@@ -141,21 +149,30 @@ try {
             $hook.chain_bypass_blocks -le 0 -or $hook.chain_processed_blocks -ne 0) {
             throw "P3 total bypass did not pass through without processing: $($hook | ConvertTo-Json -Depth 8 -Compress)"
         }
-    } elseif (-not $hook.runtime_process_observed -or -not $hook.runtime_buffer_write_observed) {
+    } elseif (-not $ExpectMissingPlugin -and (-not $hook.runtime_process_observed -or -not $hook.runtime_buffer_write_observed)) {
         throw "P2 runtime VST3 effect processing was not observed: $($hook | ConvertTo-Json -Depth 8 -Compress)"
     }
-    if ((-not $ExpectP3Fallback -and -not $ExpectP3TotalBypass -and ($hook.total_bypass -or $hook.chain_faulted)) -or
-        $hook.chain_prepared_slots -lt 2 -or
-        $hook.chain_process_blocks -le 0 -or
-        ((-not $ExpectP3Fallback -and -not $ExpectP3TotalBypass) -and $hook.chain_processed_blocks -le 0) -or
-        ((-not $ExpectP3Fallback -and -not $ExpectP3TotalBypass) -and $hook.chain_switch_count -lt 2) -or
-        -not $hook.reconfiguration_validated -or
-        $hook.reconfiguration_passed -ne 10 -or $hook.reconfiguration_failed -ne 0) {
+    $matrixFailed = if ($ExpectMissingPlugin) {
+        $hook.chain_process_blocks -le 0 -or $hook.chain_bypass_blocks -le 0
+    } else {
+        (-not $ExpectP3Fallback -and -not $ExpectP3TotalBypass -and ($hook.total_bypass -or $hook.chain_faulted)) -or
+            $hook.chain_prepared_slots -lt 2 -or $hook.chain_process_blocks -le 0 -or
+            ((-not $ExpectP3Fallback -and -not $ExpectP3TotalBypass) -and $hook.chain_processed_blocks -le 0) -or
+            ((-not $ExpectP3Fallback -and -not $ExpectP3TotalBypass) -and $hook.chain_switch_count -lt 2) -or
+            -not $hook.reconfiguration_validated -or $hook.reconfiguration_passed -ne 10 -or $hook.reconfiguration_failed -ne 0
+    }
+    if ($matrixFailed) {
         throw "P3 chain safety/reconfiguration validation failed: $($hook | ConvertTo-Json -Depth 8 -Compress)"
     }
-    @{status='passed';playback=$playback;gp_hook=$hook;host_sha256=(Get-FileHash -LiteralPath (Join-Path $hostCopy 'GuitarPro.exe')).Hash} |
-        ConvertTo-Json -Depth 12 | Set-Content -LiteralPath (Join-Path $run 'verification.json')
-    Write-Output "PASS: P2 runtime Master/processDSP and VST3 effect processing. Evidence: $run"
+    $workflow = $null
+    if ($P6Workflow) {
+        . (Join-Path $root 'native/tests/p6_workflow.ps1')
+        $workflow = Invoke-P6Workflow -Session $session -Document $document -FixturePath $fixture -RunDirectory $run -Process $process
+    }
+    @{status='passed';playback=$playback;gp_hook=$hook;p6_workflow=$workflow;host_sha256=(Get-FileHash -LiteralPath (Join-Path $hostCopy 'GuitarPro.exe')).Hash;plugin_sha256=(Get-FileHash -LiteralPath $PluginPath).Hash} |
+        ConvertTo-Json -Depth 20 | Set-Content -LiteralPath (Join-Path $run 'verification.json')
+    $scope = if ($P6Workflow) { 'P6 VST3 processing and host workflow' } elseif ($ExpectMissingPlugin) { 'missing VST3 bypass fallback' } elseif ($ExpectP3Fallback) { 'detectable processing error fallback' } else { 'P2/P3 realtime VST3 processing' }
+    Write-Output "PASS: $scope. Evidence: $run"
 } finally {
     if ($session) { try { Invoke-McpTool $session gp_playback @{operation='stop'} -AllowError | Out-Null } catch {} ; try { Close-McpSession $session } catch {} }
     if ($process) {
