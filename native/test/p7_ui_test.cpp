@@ -9,6 +9,8 @@
 #include <QtWidgets/QCheckBox>
 #include <QtWidgets/QLabel>
 #include <QtWidgets/QPushButton>
+#include <QtWidgets/QVBoxLayout>
+#include <QtCore/QTimer>
 
 #include <iostream>
 
@@ -38,6 +40,7 @@ int main(int argc, char **argv) {
     QCoreApplication::processEvents();
     auto *panel = qApp->property("gpvst3P5Panel").value<QWidget *>();
     if (!check(panel != nullptr, "P7 panel created")) return 1;
+    if (!check(!panel->isVisible(), "P7 panel does not pop up at startup")) return 1;
     if (!check(panel->findChildren<QCheckBox *>().size() == 2, "catalog rows created")) return 1;
     for (auto *button : panel->findChildren<QPushButton *>()) {
         if (!check(button->text() != QStringLiteral("添加") &&
@@ -60,6 +63,19 @@ int main(int argc, char **argv) {
     for (auto *label : panel->findChildren<QLabel *>())
         hostLimited |= label->text().contains(QStringLiteral("host_limited"));
     if (!check(hostLimited, "native editor boundary is explicit")) return 1;
+
+    QWidget soundHost;
+    soundHost.setObjectName(QStringLiteral("soundsContainer"));
+    soundHost.setLayout(new QVBoxLayout);
+    soundHost.show();
+    for (auto *timer : qApp->findChildren<QTimer *>()) timer->setInterval(0);
+    QCoreApplication::processEvents(QEventLoop::AllEvents, 50);
+    if (!check(soundHost.findChild<QPushButton *>("gpvst3SoundEffectChainButton") != nullptr,
+               "persistent sound-section entry")) return 1;
+    delete soundHost.findChild<QPushButton *>("gpvst3SoundEffectChainButton");
+    QCoreApplication::processEvents(QEventLoop::AllEvents, 50);
+    if (!check(soundHost.findChild<QPushButton *>("gpvst3SoundEffectChainButton") != nullptr,
+               "entry returns after sidebar rebuild")) return 1;
     panel->close();
     std::cout << "PASS: P7 catalog UI, enabled semantics and host-limited editor evidence.\n";
     return 0;

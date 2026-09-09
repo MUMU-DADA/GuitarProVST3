@@ -9,6 +9,7 @@
 #include <QtCore/QVariant>
 #include <QtCore/QTimer>
 #include <QtWidgets/QAbstractItemView>
+#include <QtWidgets/QAbstractButton>
 #include <QtWidgets/QApplication>
 #include <QtWidgets/QCheckBox>
 #include <QtGui/QCloseEvent>
@@ -434,6 +435,34 @@ private:
     QJsonArray effects_;
 };
 
+QWidget *findSoundHost() {
+    QWidget *named = nullptr;
+    for (QWidget *widget : QApplication::allWidgets()) {
+        if (widget->objectName() == QStringLiteral("soundsContainer") && widget->layout()) {
+            named = widget;
+            break;
+        }
+    }
+    if (named) return named;
+
+    // Some GP builds do not keep the old objectName. The visible RSE/MIDI
+    // controls are more stable and identify the same audio section.
+    for (QWidget *widget : QApplication::allWidgets()) {
+        auto *control = qobject_cast<QAbstractButton *>(widget);
+        if (!control || control->text().compare(QStringLiteral("RSE"), Qt::CaseInsensitive) != 0)
+            continue;
+        for (QWidget *candidate = control->parentWidget(); candidate;
+             candidate = candidate->parentWidget()) {
+            if (!candidate->layout()) continue;
+            bool hasMidi = false;
+            for (QAbstractButton *button : candidate->findChildren<QAbstractButton *>())
+                hasMidi |= button->text().compare(QStringLiteral("MIDI"), Qt::CaseInsensitive) == 0;
+            if (hasMidi) return candidate;
+        }
+    }
+    return nullptr;
+}
+
 } // namespace
 
 const char *state() noexcept { return "panel_ready_p7"; }
@@ -461,31 +490,28 @@ void showEffectChainPanel() {
     qApp->setProperty("gpvst3P5Panel", QVariant::fromValue(static_cast<QWidget *>(panel)));
     QObject::connect(panel, &QObject::destroyed, qApp, [] { qApp->setProperty("gpvst3P5Panel", QVariant()); });
 
-    // GP exposes no supported insertion ABI for the Sound inspector. When
-    // its main window is available, host the same editor in a right-side dock
-    // and add a menu entry; otherwise keep the tool window usable standalone.
+    // Keep the entry alive for the lifetime of the host. GP rebuilds this
+    // sidebar when the score or selected track changes, so a one-shot timer
+    // would leave the button missing after that rebuild.
     auto *timer = new QTimer(qApp);
-    timer->setInterval(200);
+    timer->setInterval(500);
     QObject::connect(panel, &QObject::destroyed, timer, [timer] {
         timer->stop();
         timer->deleteLater();
     });
     QObject::connect(timer, &QTimer::timeout, timer, [timer, panel, useP7Panel] {
-        bool soundEntryReady = timer->property("soundEntryReady").toBool();
-        bool dockReady = timer->property("dockReady").toBool();
-        for (QWidget *widget : QApplication::allWidgets()) {
-            if (widget->objectName() != QStringLiteral("soundsContainer") || !widget->layout()) continue;
-            if (!widget->findChild<QPushButton *>("gpvst3SoundEffectChainButton")) {
-                auto *button = new QPushButton(QStringLiteral("VST3 效果器链"), widget);
-                button->setObjectName(QStringLiteral("gpvst3SoundEffectChainButton"));
-                widget->layout()->addWidget(button);
-                QObject::connect(button, &QPushButton::clicked, button, [panel] {
-                    panel->show(); panel->raise(); panel->activateWindow();
-                });
-                soundEntryReady = true;
-            }
-            break;
+        auto *soundHost = findSoundHost();
+        bool soundEntryReady = soundHost != nullptr;
+        if (soundHost && !soundHost->findChild<QPushButton *>("gpvst3SoundEffectChainButton")) {
+            auto *button = new QPushButton(QStringLiteral("VST3"), soundHost);
+            button->setObjectName(QStringLiteral("gpvst3SoundEffectChainButton"));
+            button->setToolTip(QStringLiteral("VST3 效果器"));
+            soundHost->layout()->addWidget(button);
+            QObject::connect(button, &QPushButton::clicked, button, [panel] {
+                panel->show(); panel->raise(); panel->activateWindow();
+            });
         }
+        bool dockReady = timer->property("dockReady").toBool();
         if (!useP7Panel) {
             for (QWidget *widget : QApplication::topLevelWidgets()) {
                 if (QByteArray(widget->metaObject()->className()) != "gp::gui::MainWindow") continue;
@@ -510,13 +536,28 @@ void showEffectChainPanel() {
                 }
                 dockReady = true;
             }
+        } else if (!soundEntryReady) {
+            // Fallback for GP builds that expose no stable audio-section
+            // object. This keeps a visible, repeatable entry without opening
+            // a dock or showing the editor automatically at startup.
+            for (QWidget *widget : QApplication::topLevelWidgets()) {
+                if (QByteArray(widget->metaObject()->className()) != "gp::gui::MainWindow") continue;
+                auto *window = qobject_cast<QMainWindow *>(widget);
+                if (!window || !window->menuBar()) continue;
+                auto *action = window->findChild<QAction *>("gpvst3P7EffectChainAction");
+                if (!action) {
+                    action = window->menuBar()->addAction(QStringLiteral("VST3 效果器"));
+                    action->setObjectName(QStringLiteral("gpvst3P7EffectChainAction"));
+                    QObject::connect(action, &QAction::triggered, action, [panel] {
+                        panel->show(); panel->raise(); panel->activateWindow();
+                    });
+                }
+            }
         }
-        if (!panel->parentWidget()) {
+        if (!useP7Panel && !panel->parentWidget()) {
             panel->show(); panel->raise(); panel->activateWindow();
         }
-        timer->setProperty("soundEntryReady", soundEntryReady);
         timer->setProperty("dockReady", dockReady);
-        if (soundEntryReady) timer->deleteLater();
     });
     timer->start();
 }
