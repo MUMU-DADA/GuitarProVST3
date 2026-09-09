@@ -58,6 +58,10 @@ struct ConversionResult {
 ConversionResult copyToPlanar(const BlockView &source, PlanarBuffer &target) noexcept;
 ConversionResult copyFromPlanar(const PlanarBuffer &source, const BlockView &target) noexcept;
 
+// Copy one block directly through when the chain is bypassed or has entered
+// its error fallback. This path uses only caller-owned channel pointers.
+bool bypass(const BlockView &block) noexcept;
+
 struct ProcessResult {
     bool processed = false;
     bool bypassed = false;

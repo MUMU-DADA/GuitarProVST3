@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstddef>
+#include <cstdint>
 #include <string>
 
 #include "host_lock.h"
@@ -33,6 +34,23 @@ struct State {
     std::size_t runtimeProcessCount = 0;
     std::string runtimeEffectName;
     std::string runtimeEffectError;
+    bool totalBypass = true;
+    bool chainFaulted = false;
+    int chainActiveSlot = -1;
+    std::size_t chainPreparedSlots = 0;
+    std::size_t chainProcessBlocks = 0;
+    std::size_t chainProcessedBlocks = 0;
+    std::size_t chainBypassBlocks = 0;
+    std::size_t chainErrorBlocks = 0;
+    std::size_t chainFallbackBlocks = 0;
+    std::uint64_t lastProcessNanoseconds = 0;
+    std::uint64_t maxProcessNanoseconds = 0;
+    std::uint64_t totalProcessNanoseconds = 0;
+    std::size_t chainSwitchCount = 0;
+    std::size_t runtimeEffectInstances = 0;
+    std::size_t reconfigurationPassed = 0;
+    std::size_t reconfigurationFailed = 0;
+    bool reconfigurationValidated = false;
     std::string reason = "p2_observation_only";
     EntryPointObservation masterProcess;
     EntryPointObservation effectsChainProcessDsp;

@@ -13,6 +13,7 @@
 #include <filesystem>
 
 #include "audio_adapter.h"
+#include "effect_chain.h"
 #include "pluginterfaces/base/funknownimpl.h"
 #include "pluginterfaces/base/ipluginbase.h"
 #include "pluginterfaces/vst/ivstaudioprocessor.h"
@@ -116,13 +117,14 @@ struct RuntimeEffect {
     audio::PlanarBuffer scratch;
     std::string name;
     std::string error;
-    bool ready = false;
+    std::atomic<bool> ready{false};
+    bool forceError = false;
     std::atomic_flag processing = ATOMIC_FLAG_INIT;
 
     ~RuntimeEffect() { shutdown(); }
 
     void shutdown() noexcept {
-        ready = false;
+        ready.store(false, std::memory_order_release);
         if (processor) processor->setProcessing(false);
         if (component) {
             component->setActive(false);
@@ -141,8 +143,12 @@ struct RuntimeEffect {
         }
     }
 
-    bool initialize() noexcept {
+    bool initialize(double sampleRate = 44100.0, std::size_t maxSamplesPerBlock = 16384) noexcept {
         shutdown();
+        forceError = false;
+        if (const char *forced = std::getenv("GPVST3_FORCE_P3_ERROR");
+            forced && std::strcmp(forced, "1") == 0)
+            forceError = true;
         const auto path = runtimeBinary(runtimeModulePath());
         std::error_code errorCode;
         if (path.empty() || !fs::is_regular_file(path, errorCode)) {
@@ -215,32 +221,59 @@ struct RuntimeEffect {
         Steinberg::Vst::ProcessSetup setup{};
         setup.processMode = Steinberg::Vst::kRealtime;
         setup.symbolicSampleSize = Steinberg::Vst::kSample32;
-        setup.maxSamplesPerBlock = 16384;
-        setup.sampleRate = 44100.0;
+        setup.maxSamplesPerBlock = static_cast<Steinberg::int32>(maxSamplesPerBlock);
+        setup.sampleRate = sampleRate;
         if (!succeeded(processor->setupProcessing(setup)) || !succeeded(component->setActive(true)) ||
-            !succeeded(processor->setProcessing(true)) || !scratch.prepare(2, 16384)) {
+            !succeeded(processor->setProcessing(true)) || !scratch.prepare(2, maxSamplesPerBlock)) {
             error = "runtime_vst3_processing_setup_failed";
             return false;
         }
-        ready = true;
+        ready.store(true, std::memory_order_release);
         error.clear();
         return true;
     }
 
-    bool process(const RawData &raw, std::size_t frames, std::size_t channels,
-                 double sampleRate) noexcept {
-        if (!ready || !processor || frames == 0 || frames > scratch.frameCapacity() ||
-            channels == 0 || channels > scratch.channelCount()) return false;
-        for (std::size_t channel = 0; channel < channels; ++channel)
-            if (!raw.channels[channel]) return false;
+    bool reconfigure(double sampleRate, std::size_t maxSamplesPerBlock) noexcept {
+        if (!ready.load(std::memory_order_acquire) || !processor || maxSamplesPerBlock == 0)
+            return false;
+        processor->setProcessing(false);
+        component->setActive(false);
+        Steinberg::Vst::ProcessSetup setup{};
+        setup.processMode = Steinberg::Vst::kRealtime;
+        setup.symbolicSampleSize = Steinberg::Vst::kSample32;
+        setup.maxSamplesPerBlock = static_cast<Steinberg::int32>(maxSamplesPerBlock);
+        setup.sampleRate = sampleRate;
+        if (!succeeded(processor->setupProcessing(setup)) || !scratch.prepare(2, maxSamplesPerBlock) ||
+            !succeeded(component->setActive(true)) || !succeeded(processor->setProcessing(true))) {
+            error = "runtime_vst3_reconfigure_failed";
+            ready.store(false, std::memory_order_release);
+            return false;
+        }
+        error.clear();
+        ready.store(true, std::memory_order_release);
+        return true;
+    }
+
+    bool processBlock(const audio::BlockView &block) noexcept {
+        if (!ready.load(std::memory_order_acquire) || !processor || forceError ||
+            block.frameCount == 0 || block.frameCount > scratch.frameCapacity() ||
+            block.channelCount == 0 || block.channelCount > scratch.channelCount()) return false;
+        const auto channels = block.channelCount;
+        for (std::size_t channel = 0; channel < channels; ++channel) {
+            const auto *input = block.generatedChannels ? block.generatedChannels[channel]
+                                                        : (block.inputChannels ? block.inputChannels[channel]
+                                                                                : (block.channels ? block.channels[channel]
+                                                                                                   : nullptr));
+            if (!input) return false;
+        }
         if (processing.test_and_set(std::memory_order_acquire)) return false;
-        const float *inputs[2]{raw.channels[0], raw.channels[1]};
-        float *outputs[2]{raw.channels[0], raw.channels[1]};
-        const audio::BlockView block{inputs, nullptr, outputs, nullptr, channels, frames,
-                                     sampleRate, frames};
         const auto result = audio::process(*processor, block, scratch, false);
         processing.clear(std::memory_order_release);
         return result.processed;
+    }
+
+    static bool processCallback(void *context, const audio::BlockView &block) noexcept {
+        return static_cast<RuntimeEffect *>(context)->processBlock(block);
     }
 };
 
@@ -268,10 +301,14 @@ struct Runtime {
     std::atomic<int> rate{0};
     std::atomic<unsigned long> masterThread{0};
     std::atomic<unsigned long> dspThread{0};
-    RuntimeEffect effect;
+    RuntimeEffect effects[2];
+    effects::Chain chain;
     std::atomic<std::size_t> effectCalls{0};
     std::atomic<bool> effectProcessed{false};
     std::atomic<bool> effectWriteObserved{false};
+    std::atomic<std::size_t> reconfigurationPassed{0};
+    std::atomic<std::size_t> reconfigurationFailed{0};
+    std::atomic<bool> reconfigurationValidated{false};
 };
 
 Runtime g_runtime;
@@ -313,21 +350,90 @@ void masterProcessHook(void *self, void *buffer, void *ticks, void *musicians,
             g_runtime.rate.store(g_runtime.sampleRate(g_runtime.audioCore), std::memory_order_relaxed);
     }
     original(self, buffer, ticks, musicians, backingTrack);
-    if (g_runtime.effect.ready && g_runtime.rawData && g_runtime.frameCount && g_runtime.channelCount) {
+    if (g_runtime.rawData && g_runtime.frameCount && g_runtime.channelCount) {
         const auto &raw = g_runtime.rawData(buffer);
         const auto frames = g_runtime.frameCount(buffer);
         const auto channels = (std::min)(g_runtime.channelCount(buffer), 2U);
-        const auto effectBefore = bufferHash(buffer);
         const auto rate = g_runtime.rate.load(std::memory_order_relaxed);
-        if (g_runtime.effect.process(raw, frames, channels, rate > 0 ? rate : 44100.0)) {
+        const float *inputs[2]{raw.channels[0], raw.channels[1]};
+        float *outputs[2]{raw.channels[0], raw.channels[1]};
+        const audio::BlockView block{inputs, nullptr, outputs, nullptr, channels, frames,
+                                     rate > 0 ? rate : 44100.0, frames};
+        const auto effectBefore = bufferHash(buffer);
+        const auto chainResult = g_runtime.chain.process(block);
+        if (chainResult.error || chainResult.bypassed || !chainResult.completed)
+            audio::bypass(block);
+        if (chainResult.completed && !chainResult.bypassed && !chainResult.error) {
             g_runtime.effectCalls.fetch_add(1, std::memory_order_relaxed);
             g_runtime.effectProcessed.store(true, std::memory_order_relaxed);
-            if (effectBefore != bufferHash(buffer))
-                g_runtime.effectWriteObserved.store(true, std::memory_order_relaxed);
         }
+        if (effectBefore != bufferHash(buffer) && !chainResult.bypassed)
+            g_runtime.effectWriteObserved.store(true, std::memory_order_relaxed);
     }
     if (before != bufferHash(buffer)) g_runtime.bufferWriteObserved.store(true, std::memory_order_relaxed);
     g_inMasterHook = false;
+}
+
+bool configureRuntimeChain() noexcept {
+    const bool first = g_runtime.effects[0].initialize();
+    const bool second = first && g_runtime.effects[1].initialize();
+    if (!first) {
+        g_runtime.chain.deactivate();
+        g_runtime.chain.setBypassed(true);
+        return false;
+    }
+    if (!g_runtime.chain.prepareSlot(0, {&g_runtime.effects[0], &RuntimeEffect::processCallback}) ||
+        !g_runtime.chain.activate(0)) {
+        g_runtime.effects[0].shutdown();
+        g_runtime.chain.deactivate();
+        g_runtime.chain.setBypassed(true);
+        return false;
+    }
+    if (second && g_runtime.chain.prepareSlot(1, {&g_runtime.effects[1], &RuntimeEffect::processCallback})) {
+        g_runtime.chain.activate(1);
+        g_runtime.chain.activate(0);
+    }
+    const char *bypass = std::getenv("GPVST3_TOTAL_BYPASS");
+    g_runtime.chain.setBypassed(bypass && std::strcmp(bypass, "1") == 0);
+    return true;
+}
+
+bool validateReconfiguration() noexcept {
+    constexpr double rates[] = {44100.0, 48000.0, 96000.0};
+    constexpr std::size_t blocks[] = {64, 128, 256};
+    std::size_t passed = 0;
+    std::size_t failed = 0;
+    for (const auto rate : rates) {
+        for (const auto block : blocks) {
+            const auto active = g_runtime.chain.snapshot().activeSlot;
+            const auto target = active == 0 ? 1U : 0U;
+            if (!g_runtime.effects[target].ready.load(std::memory_order_acquire) ||
+                !g_runtime.effects[target].reconfigure(rate, block) ||
+                !g_runtime.chain.prepareSlot(target,
+                    {&g_runtime.effects[target], &RuntimeEffect::processCallback}) ||
+                !g_runtime.chain.activate(target)) {
+                ++failed;
+                continue;
+            }
+            ++passed;
+        }
+    }
+    const auto active = g_runtime.chain.snapshot().activeSlot;
+    const auto restore = active == 0 ? 1U : 0U;
+    if (g_runtime.effects[restore].ready.load(std::memory_order_acquire) &&
+        g_runtime.effects[restore].reconfigure(44100.0, 16384) &&
+        g_runtime.chain.prepareSlot(restore,
+            {&g_runtime.effects[restore], &RuntimeEffect::processCallback}) &&
+        g_runtime.chain.activate(restore)) {
+        ++passed;
+    } else {
+        ++failed;
+    }
+    g_runtime.reconfigurationPassed.store(passed, std::memory_order_release);
+    g_runtime.reconfigurationFailed.store(failed, std::memory_order_release);
+    g_runtime.reconfigurationValidated.store(failed == 0 && passed == 10,
+                                              std::memory_order_release);
+    return failed == 0 && passed == 10;
 }
 
 void dspProcessHook(void *self, void *buffer, void *scratch, void *ticks) {
@@ -435,12 +541,17 @@ State prepare(const host::Verification &verification) noexcept {
             remove(g_runtime.dsp);
         }
         if (result.installed && result.runtimeEffectEnabled) {
-            result.runtimeProcessorReady = g_runtime.effect.initialize();
-            result.runtimeEffectError = g_runtime.effect.error;
-            result.runtimeEffectName = g_runtime.effect.name;
+            result.runtimeProcessorReady = configureRuntimeChain();
+            result.runtimeEffectError = g_runtime.effects[0].error;
+            result.runtimeEffectName = g_runtime.effects[0].name;
             result.observationOnly = !result.runtimeProcessorReady;
+            if (result.runtimeProcessorReady)
+                result.reconfigurationValidated = validateReconfiguration();
         } else {
-            g_runtime.effect.shutdown();
+            g_runtime.chain.deactivate();
+            g_runtime.chain.setBypassed(true);
+            g_runtime.effects[0].shutdown();
+            g_runtime.effects[1].shutdown();
         }
         result.reason = result.installed ? "runtime_observation_active" : "hook_install_failed";
     }
@@ -450,6 +561,7 @@ State prepare(const host::Verification &verification) noexcept {
 
 State snapshot() noexcept {
     State result = g_initial;
+    const auto chain = g_runtime.chain.snapshot();
     result.installed = g_runtime.master.installed && g_runtime.dsp.installed;
     result.masterProcess.callCount = g_runtime.masterCalls.load(std::memory_order_relaxed);
     result.masterProcess.callObserved = result.masterProcess.callCount != 0;
@@ -462,19 +574,43 @@ State snapshot() noexcept {
     result.effectsChainProcessDsp.callObserved = result.effectsChainProcessDsp.callCount != 0;
     result.effectsChainProcessDsp.threadId = g_runtime.dspThread.load(std::memory_order_relaxed);
     result.effectsChainInsideMaster = g_runtime.dspInsideMaster.load(std::memory_order_relaxed);
-    result.runtimeProcessorReady = g_runtime.effect.ready;
+    result.runtimeProcessorReady = chain.activeSlot >= 0 && chain.activeSlot < 2 &&
+        g_runtime.effects[chain.activeSlot].ready.load(std::memory_order_acquire);
     result.runtimeProcessCount = g_runtime.effectCalls.load(std::memory_order_relaxed);
     result.runtimeProcessObserved = g_runtime.effectProcessed.load(std::memory_order_relaxed);
     result.runtimeBufferWriteObserved = g_runtime.effectWriteObserved.load(std::memory_order_relaxed);
-    result.runtimeEffectName = g_runtime.effect.name;
-    result.runtimeEffectError = g_runtime.effect.error;
+    const auto active = chain.activeSlot >= 0 && chain.activeSlot < 2 ? chain.activeSlot : 0;
+    result.runtimeEffectName = g_runtime.effects[active].name;
+    result.runtimeEffectError = g_runtime.effects[active].error;
+    result.totalBypass = chain.bypassed;
+    result.chainFaulted = chain.faulted;
+    result.chainActiveSlot = chain.activeSlot;
+    result.chainPreparedSlots = chain.preparedSlots;
+    result.chainProcessBlocks = chain.processBlocks;
+    result.chainProcessedBlocks = chain.processedBlocks;
+    result.chainBypassBlocks = chain.bypassBlocks;
+    result.chainErrorBlocks = chain.errorBlocks;
+    result.chainFallbackBlocks = chain.fallbackBlocks;
+    result.lastProcessNanoseconds = chain.lastProcessNanoseconds;
+    result.maxProcessNanoseconds = chain.maxProcessNanoseconds;
+    result.totalProcessNanoseconds = chain.totalProcessNanoseconds;
+    result.chainSwitchCount = chain.switchCount;
+    result.runtimeEffectInstances = 0;
+    for (const auto &effect : g_runtime.effects)
+        if (effect.ready.load(std::memory_order_acquire)) ++result.runtimeEffectInstances;
+    result.reconfigurationPassed = g_runtime.reconfigurationPassed.load(std::memory_order_acquire);
+    result.reconfigurationFailed = g_runtime.reconfigurationFailed.load(std::memory_order_acquire);
+    result.reconfigurationValidated = g_runtime.reconfigurationValidated.load(std::memory_order_acquire);
     return result;
 }
 
 void shutdown() noexcept {
+    g_runtime.chain.setBypassed(true);
+    g_runtime.chain.deactivate();
     remove(g_runtime.dsp);
     remove(g_runtime.master);
-    g_runtime.effect.shutdown();
+    g_runtime.effects[0].shutdown();
+    g_runtime.effects[1].shutdown();
 }
 
 } // namespace gpvst3::hook

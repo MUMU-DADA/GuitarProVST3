@@ -90,6 +90,23 @@ QJsonObject hookStatus(const gpvst3::hook::State &value) {
         {"runtime_process_count", static_cast<qint64>(value.runtimeProcessCount)},
         {"runtime_effect_name", QString::fromUtf8(value.runtimeEffectName.data())},
         {"runtime_effect_error", QString::fromUtf8(value.runtimeEffectError.data())},
+        {"total_bypass", value.totalBypass},
+        {"chain_faulted", value.chainFaulted},
+        {"chain_active_slot", value.chainActiveSlot},
+        {"chain_prepared_slots", static_cast<qint64>(value.chainPreparedSlots)},
+        {"chain_process_blocks", static_cast<qint64>(value.chainProcessBlocks)},
+        {"chain_processed_blocks", static_cast<qint64>(value.chainProcessedBlocks)},
+        {"chain_bypass_blocks", static_cast<qint64>(value.chainBypassBlocks)},
+        {"chain_error_blocks", static_cast<qint64>(value.chainErrorBlocks)},
+        {"chain_fallback_blocks", static_cast<qint64>(value.chainFallbackBlocks)},
+        {"last_process_nanoseconds", static_cast<qint64>(value.lastProcessNanoseconds)},
+        {"max_process_nanoseconds", static_cast<qint64>(value.maxProcessNanoseconds)},
+        {"total_process_nanoseconds", static_cast<qint64>(value.totalProcessNanoseconds)},
+        {"chain_switch_count", static_cast<qint64>(value.chainSwitchCount)},
+        {"runtime_effect_instances", static_cast<qint64>(value.runtimeEffectInstances)},
+        {"reconfiguration_passed", static_cast<qint64>(value.reconfigurationPassed)},
+        {"reconfiguration_failed", static_cast<qint64>(value.reconfigurationFailed)},
+        {"reconfiguration_validated", value.reconfigurationValidated},
         {"reason", QString::fromUtf8(value.reason.data())},
         {"master_process", entryStatus(value.masterProcess)},
         {"effects_chain_processDSP", entryStatus(value.effectsChainProcessDsp)}};
@@ -101,10 +118,11 @@ namespace gpvst3::bootstrap {
 
 QJsonObject initialize() {
     const auto host = host::verify();
-    const auto hook = hook::prepare(host);
+    hook::prepare(host);
+    const auto hookState = hook::snapshot();
     const auto vst3 = vst3::prepare(host.supported);
     effects::Chain chain;
-    chain.setBypassed(!hook.runtimeProcessorReady);
+    chain.setBypassed(!hookState.runtimeProcessorReady);
 
     QJsonObject fileResults;
     for (auto it = host.files.cbegin(); it != host.files.cend(); ++it)
@@ -126,10 +144,10 @@ QJsonObject initialize() {
             {"block_view", "pointer_view"},
             {"scratch_prepared_off_thread", true},
             {"realtime_process", "vst3_process_probe"}}},
-        {"gp_hook", hookStatus(hook)},
+        {"gp_hook", hookStatus(hookState)},
         {"qt_ui", ui::state()},
         {"state_manager", "status_only_p0"},
-        {"reason", hook.runtimeProcessorReady
+        {"reason", hookState.runtimeProcessorReady
                        ? "P2 runtime VST3 effect processing enabled by environment switch"
                        : (host.supported ? "P0 bootstrap complete; processing remains bypassed"
                                           : "Host files do not match the P0 lock")}

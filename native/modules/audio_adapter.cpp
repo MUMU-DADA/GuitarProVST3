@@ -94,6 +94,24 @@ ConversionResult copyFromPlanar(const PlanarBuffer &source, const BlockView &tar
     return result;
 }
 
+bool bypass(const BlockView &block) noexcept {
+    if (block.frameCount == 0 || block.channelCount == 0) return true;
+    bool valid = true;
+    for (std::size_t channel = 0; channel < block.channelCount; ++channel) {
+        const auto *input = sourceChannel(block, channel);
+        auto *output = targetChannel(block, channel);
+        if (!output) {
+            valid = false;
+            continue;
+        }
+        if (input && input != output)
+            std::memcpy(output, input, block.frameCount * sizeof(float));
+        else if (!input)
+            std::fill(output, output + block.frameCount, 0.0F);
+    }
+    return valid;
+}
+
 ProcessResult process(Steinberg::Vst::IAudioProcessor &processor,
                       const BlockView &block, PlanarBuffer &scratch, bool bypassed) noexcept {
     ProcessResult result;
