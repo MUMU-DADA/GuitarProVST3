@@ -92,6 +92,28 @@ struct State {
     float inputLastPeak = 0.0F;
     float inputMaxPeak = 0.0F;
     float inputLastRms = 0.0F;
+    bool inputInterleavedFormatObserved = false;
+    bool inputInterleavedObserved = false;
+    bool inputInterleavedOutputWritten = false;
+    std::size_t inputInterleavedBlocks = 0;
+    std::size_t inputInterleavedFormatErrors = 0;
+    std::size_t inputInterleavedMissingBlocks = 0;
+    std::size_t inputInterleavedInputChannelCount = 0;
+    std::size_t inputInterleavedOutputChannelCount = 0;
+    std::uintptr_t inputFirstCaptureAddress = 0;
+    std::uintptr_t inputLastCaptureAddress = 0;
+    std::uintptr_t inputFirstCaptureOwner = 0;
+    std::uintptr_t inputLastCaptureOwner = 0;
+    std::uintptr_t inputFirstOutputAddress = 0;
+    std::uintptr_t inputLastOutputAddress = 0;
+    std::string inputCaptureFormat = "unresolved";
+    std::string inputCaptureChannelLayout = "unresolved";
+    std::string inputCaptureOwnership = "borrowed_for_callback";
+    bool inputConfigurationObserved = false;
+    std::size_t inputConfiguredInputChannels = 0;
+    std::size_t inputConfiguredOutputChannels = 0;
+    double inputConfiguredSampleRate = 0.0;
+    std::size_t inputConfigurationErrors = 0;
     std::string reason = "p2_observation_only";
     EntryPointObservation masterProcess;
     EntryPointObservation effectsChainProcessDsp;
@@ -114,5 +136,6 @@ void setTotalBypass(bool bypassed) noexcept;
 bool processExternalInput(const input::CaptureView &capture,
                           const input::GeneratedView &generated,
                           const input::OutputView &output) noexcept;
+bool processExternalInputInterleaved(const input::InterleavedView &view) noexcept;
 
 }

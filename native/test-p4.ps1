@@ -12,8 +12,12 @@ if ($LASTEXITCODE) { throw 'P4 isolated router verification failed.' }
 
 if (-not $SkipHost) {
     $runtime = Join-Path $PSScriptRoot 'test-p2-runtime.ps1'
-    & $runtime -HostDirectory $HostDirectory -McpRoot $McpRoot -PluginPath $PluginPath -KeepHost:$KeepHost -EnableP4 -P4Route bus_mix
-    if ($LASTEXITCODE) { throw 'P4 host status verification failed.' }
+    foreach ($route in @('input_insert', 'bus_mix')) {
+        & $runtime -HostDirectory $HostDirectory -McpRoot $McpRoot -PluginPath $PluginPath -KeepHost:$KeepHost -EnableP4 -P4Route $route
+        if ($LASTEXITCODE) { throw "P4 host status verification failed for route $route." }
+    }
+    & $runtime -HostDirectory $HostDirectory -McpRoot $McpRoot -PluginPath $PluginPath -KeepHost:$KeepHost -EnableP4 -P4Route bus_mix -ExpectP3TotalBypass
+    if ($LASTEXITCODE) { throw 'P4 total bypass host verification failed.' }
 }
 
-Write-Output 'PASS: P4 capture router, input level status and bus mix configuration.'
+Write-Output 'PASS: P4 capture router, input level status, input_insert/bus_mix routes and total bypass.'

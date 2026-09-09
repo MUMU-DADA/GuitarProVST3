@@ -15,6 +15,7 @@
 
 #include "audio_adapter.h"
 #include "effect_chain.h"
+#include "portaudio_capture_abi.h"
 #include "pluginterfaces/base/funknownimpl.h"
 #include "pluginterfaces/base/ipluginbase.h"
 #include "pluginterfaces/vst/ivstaudioprocessor.h"
@@ -26,6 +27,7 @@ namespace gpvst3::hook {
 
 int streamCallbackHook(const void *input, void *output, unsigned long frames,
                        const void *timeInfo, unsigned long status, void *userData);
+void reconfigureInputRouterIfNeeded() noexcept;
 
 namespace {
 
@@ -333,6 +335,7 @@ struct Runtime {
     BufferAccessFn unlock = nullptr;
     SampleRateFn sampleRate = nullptr;
     void *audioCore = nullptr;
+    void *audioModule = nullptr;
     std::atomic<std::size_t> masterCalls{0};
     std::atomic<std::size_t> dspCalls{0};
     std::atomic<std::uint64_t> callbackSequence{0};
@@ -383,6 +386,18 @@ struct Runtime {
     std::atomic<bool> hostStreamRunning{false};
     std::atomic<std::size_t> hostBufferSize{0};
     std::atomic<bool> inputCapturePathLocated{false};
+    std::atomic<std::size_t> inputCaptureCalls{0};
+    std::size_t inputChannelCount = 2;
+    std::size_t outputChannelCount = 2;
+    std::atomic<int> inputConfiguredRate{0};
+    std::atomic<std::size_t> inputConfiguredChannels{0};
+    std::atomic<std::size_t> inputConfiguredOutputChannels{0};
+    std::atomic<int> inputObservedRate{0};
+    std::atomic<std::size_t> inputObservedChannels{0};
+    std::atomic<std::size_t> inputObservedOutputChannels{0};
+    std::atomic<std::size_t> inputConfigurationErrors{0};
+    std::atomic<bool> inputConfigurationPending{false};
+    std::atomic_flag inputProcessing = ATOMIC_FLAG_INIT;
 };
 
 Runtime g_runtime;
@@ -390,6 +405,15 @@ State g_initial;
 thread_local bool g_inMasterHook = false;
 
 void updateAudioLayerState() noexcept;
+double callbackSampleRate() noexcept {
+    const auto observedRate = g_runtime.rate.load(std::memory_order_relaxed);
+    if (observedRate > 0) return static_cast<double>(observedRate);
+    if (g_runtime.sampleRate && g_runtime.audioCore) {
+        const auto rate = g_runtime.sampleRate(g_runtime.audioCore);
+        if (rate > 0) return static_cast<double>(rate);
+    }
+    return 44100.0;
+}
 
 std::uint64_t bufferHash(const void *buffer) noexcept {
     if (!buffer || !g_runtime.rawData || !g_runtime.frameCount || !g_runtime.channelCount) return 0;
@@ -532,17 +556,33 @@ void updateAudioLayerState() noexcept {
 
 bool configureInputRouter() noexcept {
     const auto route = configuredInputRoute();
+    const auto parseChannels = [](const char *name, std::size_t fallback) noexcept {
+        const char *value = std::getenv(name);
+        if (!value || !*value) return fallback;
+        char *end = nullptr;
+        const auto parsed = std::strtoul(value, &end, 10);
+        if (end == value || *end != '\0' || parsed == 0 || parsed > 2) return fallback;
+        return static_cast<std::size_t>(parsed);
+    };
+    g_runtime.inputChannelCount = parseChannels("GPVST3_P4_INPUT_CHANNELS", 2);
+    g_runtime.outputChannelCount = parseChannels("GPVST3_P4_OUTPUT_CHANNELS", 2);
     g_runtime.inputRouter.setRoute(route);
     g_runtime.inputRouter.setEnabled(false);
     g_runtime.inputRouter.setStreamRunning(true);
     g_runtime.inputRouter.setProcessor({});
     g_runtime.inputEffect.shutdown();
     if (route == input::Route::Disabled) return true;
-    if (!g_runtime.inputRouter.prepare(2, 16384) ||
-        !g_runtime.inputEffect.initialize(44100.0, 16384))
+    const double initialRate = callbackSampleRate();
+    if (!g_runtime.inputRouter.prepare(2, portaudio::kMaxFrames) ||
+        !g_runtime.inputEffect.initialize(initialRate, 16384))
         return false;
+    g_runtime.inputConfiguredRate.store(static_cast<int>(initialRate), std::memory_order_release);
+    g_runtime.inputConfiguredChannels.store(g_runtime.inputChannelCount, std::memory_order_release);
+    g_runtime.inputConfiguredOutputChannels.store(g_runtime.outputChannelCount, std::memory_order_release);
     g_runtime.inputRouter.setProcessor(
         {&g_runtime.inputEffect, &RuntimeEffect::processCallback});
+    const auto *bypass = std::getenv("GPVST3_TOTAL_BYPASS");
+    g_runtime.inputRouter.setBypassed(bypass && std::strcmp(bypass, "1") == 0);
     g_runtime.inputRouter.setEnabled(true);
     updateAudioLayerState();
     return true;
@@ -688,6 +728,7 @@ State prepare(const host::Verification &verification) noexcept {
     }
     const auto gprse = GetModuleHandleW(L"GPRSE.dll");
     const auto amaudio = GetModuleHandleW(L"AMAudio.dll");
+    g_runtime.audioModule = amaudio;
     result.masterProcess = observe(gprse, kMasterProcess);
     result.effectsChainProcessDsp = observe(gprse, kEffectsChainProcessDsp);
     result.audioBufferAccessorsFound =
@@ -774,6 +815,7 @@ State prepare(const host::Verification &verification) noexcept {
 State snapshot() noexcept {
     State result = g_initial;
     updateAudioLayerState();
+    reconfigureInputRouterIfNeeded();
     const auto chain = g_runtime.chain.snapshot();
     const auto input = g_runtime.inputRouter.snapshot();
     result.installed = g_runtime.master.installed && g_runtime.dsp.installed;
@@ -897,7 +939,58 @@ State snapshot() noexcept {
     result.inputLastPeak = input.lastPeak;
     result.inputMaxPeak = input.maxPeak;
     result.inputLastRms = input.lastRms;
+    result.inputInterleavedFormatObserved = input.interleavedFormatObserved;
+    result.inputInterleavedObserved = input.interleavedInputObserved;
+    result.inputInterleavedOutputWritten = input.interleavedOutputWritten;
+    result.inputInterleavedBlocks = input.interleavedBlocks;
+    result.inputInterleavedFormatErrors = input.interleavedFormatErrors;
+    result.inputInterleavedMissingBlocks = input.interleavedMissingBlocks;
+    result.inputInterleavedInputChannelCount = input.interleavedInputChannelCount;
+    result.inputInterleavedOutputChannelCount = input.interleavedOutputChannelCount;
+    result.inputFirstCaptureAddress = input.firstCaptureAddress;
+    result.inputLastCaptureAddress = input.lastCaptureAddress;
+    result.inputFirstCaptureOwner = input.firstCaptureOwner;
+    result.inputLastCaptureOwner = input.lastCaptureOwner;
+    result.inputFirstOutputAddress = input.firstOutputAddress;
+    result.inputLastOutputAddress = input.lastOutputAddress;
+    result.inputCaptureFormat = input.interleavedFormatObserved ? "interleaved_float32" : "unresolved";
+    result.inputCaptureChannelLayout = input.interleavedInputChannelCount == 1
+        ? "mono" : (input.interleavedInputChannelCount == 2 ? "stereo" : "unresolved");
+    result.inputConfigurationObserved =
+        g_runtime.inputObservedRate.load(std::memory_order_acquire) > 0;
+    result.inputConfiguredInputChannels =
+        g_runtime.inputObservedChannels.load(std::memory_order_relaxed);
+    result.inputConfiguredOutputChannels =
+        g_runtime.inputObservedOutputChannels.load(std::memory_order_relaxed);
+    result.inputConfiguredSampleRate = static_cast<double>(
+        g_runtime.inputObservedRate.load(std::memory_order_relaxed));
+    result.inputConfigurationErrors =
+        g_runtime.inputConfigurationErrors.load(std::memory_order_relaxed);
     return result;
+}
+
+void reconfigureInputRouterIfNeeded() noexcept {
+    if (!g_runtime.inputRouter.snapshot().enabled) return;
+    const auto observedRate = g_runtime.inputObservedRate.load(std::memory_order_acquire);
+    const auto observedInput = g_runtime.inputObservedChannels.load(std::memory_order_acquire);
+    const auto observedOutput = g_runtime.inputObservedOutputChannels.load(std::memory_order_acquire);
+    if (observedRate <= 0 || observedInput == 0 || observedOutput == 0 ||
+        observedRate == g_runtime.inputConfiguredRate.load(std::memory_order_acquire))
+        return;
+    if (g_runtime.inputProcessing.test_and_set(std::memory_order_acquire)) return;
+    g_runtime.inputRouter.setEnabled(false);
+    const bool configured = g_runtime.inputEffect.reconfigure(static_cast<double>(observedRate), 16384);
+    if (configured) {
+        g_runtime.inputConfiguredRate.store(observedRate, std::memory_order_release);
+        g_runtime.inputConfiguredChannels.store(observedInput, std::memory_order_release);
+        g_runtime.inputConfiguredOutputChannels.store(observedOutput, std::memory_order_release);
+        g_runtime.inputConfigurationPending.store(false, std::memory_order_release);
+    } else {
+        g_runtime.inputConfigurationPending.store(true, std::memory_order_release);
+        g_runtime.inputConfigurationErrors.fetch_add(1, std::memory_order_relaxed);
+    }
+    g_runtime.inputRouter.setEnabled(configured);
+    g_runtime.inputProcessing.clear(std::memory_order_release);
 }
 
 void shutdown() noexcept {
@@ -953,6 +1046,40 @@ int streamCallbackHook(const void *input, void *output, unsigned long frames,
     g_runtime.outputCalls.fetch_add(1, std::memory_order_relaxed);
     const auto before = outputHash(output, frames);
     const auto result = original(input, output, frames, timeInfo, status, userData);
+    const auto inputState = g_runtime.inputRouter.snapshot();
+    portaudio::Configuration configuration;
+    const bool configurationValid = frames > 0 &&
+        frames <= portaudio::kMaxFrames &&
+        portaudio::configuration(g_runtime.audioModule, userData, configuration);
+    if (configurationValid) {
+        g_runtime.inputObservedRate.store(static_cast<int>(configuration.sampleRate),
+                                           std::memory_order_relaxed);
+        g_runtime.inputObservedChannels.store(configuration.inputChannels,
+                                               std::memory_order_relaxed);
+        g_runtime.inputObservedOutputChannels.store(configuration.outputChannels,
+                                                    std::memory_order_relaxed);
+        g_runtime.inputConfiguredChannels.store(configuration.inputChannels,
+                                                std::memory_order_release);
+        g_runtime.inputConfiguredOutputChannels.store(configuration.outputChannels,
+                                                       std::memory_order_release);
+    } else {
+        g_runtime.inputConfigurationErrors.fetch_add(1, std::memory_order_relaxed);
+    }
+    const bool preparedConfiguration = configurationValid &&
+        static_cast<int>(configuration.sampleRate) ==
+            g_runtime.inputConfiguredRate.load(std::memory_order_acquire);
+    if (preparedConfiguration && inputState.enabled &&
+        inputState.route != input::Route::Disabled) {
+        g_runtime.inputCapturePathLocated.store(true, std::memory_order_release);
+        g_runtime.inputCaptureCalls.fetch_add(1, std::memory_order_relaxed);
+        const input::InterleavedView view{
+            input, output, static_cast<std::size_t>(frames), configuration.inputChannels,
+            configuration.outputChannels, configuration.sampleRate,
+            static_cast<std::size_t>(frames),
+            userData, static_cast<std::uint64_t>(g_runtime.outputCalls.load(std::memory_order_relaxed)),
+            input::InterleavedSampleFormat::Float32};
+        processExternalInputInterleaved(view);
+    }
     const auto after = outputHash(output, frames);
     g_runtime.outputObserved.store(output != nullptr && frames != 0, std::memory_order_release);
     if (before != after) {
@@ -973,13 +1100,32 @@ int streamCallbackHook(const void *input, void *output, unsigned long frames,
 
 void setTotalBypass(bool bypassed) noexcept {
     g_runtime.chain.setBypassed(bypassed);
+    g_runtime.inputRouter.setBypassed(bypassed);
 }
 
 bool processExternalInput(const input::CaptureView &capture,
                           const input::GeneratedView &generated,
                           const input::OutputView &output) noexcept {
     g_runtime.inputCapturePathLocated.store(true, std::memory_order_release);
-    return g_runtime.inputRouter.process(capture, generated, output).completed;
+    g_runtime.inputCaptureCalls.fetch_add(1, std::memory_order_relaxed);
+    if (g_runtime.inputProcessing.test_and_set(std::memory_order_acquire)) return false;
+    const auto completed = g_runtime.inputRouter.process(capture, generated, output).completed;
+    g_runtime.inputProcessing.clear(std::memory_order_release);
+    return completed;
+}
+
+bool processExternalInputInterleaved(const input::InterleavedView &view) noexcept {
+    if (g_runtime.inputProcessing.test_and_set(std::memory_order_acquire)) return false;
+    if (static_cast<int>(view.sampleRate) != g_runtime.inputConfiguredRate.load(std::memory_order_acquire) ||
+        view.inputChannelCount != g_runtime.inputConfiguredChannels.load(std::memory_order_acquire) ||
+        view.outputChannelCount != g_runtime.inputConfiguredOutputChannels.load(std::memory_order_acquire)) {
+        g_runtime.inputConfigurationErrors.fetch_add(1, std::memory_order_relaxed);
+        g_runtime.inputProcessing.clear(std::memory_order_release);
+        return false;
+    }
+    const auto completed = g_runtime.inputRouter.processInterleaved(view).completed;
+    g_runtime.inputProcessing.clear(std::memory_order_release);
+    return completed;
 }
 
 } // namespace gpvst3::hook

@@ -1,6 +1,6 @@
 # P4 实现记录：外部吉他输入
 
-P4 已完成最小可交付的输入适配层和隔离验证。插件不创建第二套声卡流，capture tap 只接收 `AudioLayer`/PortAudio 提供的当前块指针；处理完成后立即写回宿主提供的输出缓冲。
+P4 已完成输入适配层、参数门控和隔离验证。插件不创建第二套声卡流，capture tap 只接收 `AudioLayer`/PortAudio 提供的当前块指针；处理完成后立即写回宿主提供的输出缓冲。
 
 ## 已实现
 
@@ -15,6 +15,9 @@ P4 已完成最小可交付的输入适配层和隔离验证。插件不创建�
   - 解析已验证 `AMAudio.dll` 的 `AudioLayer::instance`、`inputLevel`、`isRunning` 和 `bufferSize` 导出，读取宿主输入电平和流状态。
   - 新增 `processExternalInput()` 作为 PortAudio/`AudioLayerWorker` 的唯一 capture 接入契约。调用该契约后才把 `input_capture_path_located` 标记为 `true`。
   - `GPVST3_ENABLE_P4_INPUT=1` 配合 `GPVST3_P4_ROUTE=input_insert|bus_mix` 时，在工作线程创建独立的输入 processor；默认仍关闭。
+- `native/modules/portaudio_capture_abi.h`
+  - 固定锁定版本的 `PaStreamParameters` 快照位置和 `paFloat32` 格式门控，拒绝未知采样格式、通道数、采样率或超容量 block。
+  - capture/output 通道数分别记录，支持 mono capture 到 stereo 监听的显式映射；所有指针只在当前回调内借用。
 - `native/modules/bootstrap.cpp` 和状态快照新增 P4 路由、输入电平、流状态、capture 计数及错误字段。
 - `native/test-p4-router.ps1` 与 `native/tests/p4_input_router_test.cpp`
   - 覆盖输入插入、GP+输入混音、旁路直通、峰值/RMS 和计数器。
@@ -24,11 +27,12 @@ P4 已完成最小可交付的输入适配层和隔离验证。插件不创建�
 ```powershell
 ./native/build.ps1
 ./native/test-p4-router.ps1
+./native/test-p4.ps1
 ```
 
-本次已通过 MSVC x64 插件构建和独立路由夹具。夹具确认三种路由的样本结果、输入电平统计和错误安全回退均符合预期。
+本次已通过 MSVC x64 插件构建、独立路由夹具和真实 Guitar Pro 8.1.1.17 回归。夹具确认三种路由的样本结果、输入电平统计和错误安全回退均符合预期；宿主回归观察到交错 capture、输出写回、输入/输出通道配置、44100 Hz 采样率和零配置错误。
 
-在真实 Guitar Pro 8.1.1.17 中，`AMAudio` 导出的 `AudioLayer::inputLevel`/流状态访问器可用于监控；当前已根据锁定 RVA 和函数 prologue 观测到 `PortAudioAudioLayerImpl::Impl::streamCallback` 的最终输出回调及输出写回，但该回调中的 capture 指针所有权和输入通道布局仍未确认。真实 capture 指针必须由后续宿主适配器在确认 ABI 后调用 `processExternalInput()`。真实输入监听、反馈、设备切换和暂停/恢复听感仍属于宿主受限验证项。
+在真实 Guitar Pro 8.1.1.17 中，`AMAudio` 导出的 `AudioLayer::inputLevel`/流状态访问器可用于监控；当前已根据锁定 RVA 和函数 prologue 接入 `PortAudioAudioLayerImpl::Impl::streamCallback` 的 capture/output 适配。真实 capture 指针的跨线程所有权仍未宣称完成，状态快照会记录回调期地址和 owner witness 供回归检查。真实输入监听、反馈、设备切换和暂停/恢复听感仍属于宿主受限验证项。
 
 ## 运行开关
 

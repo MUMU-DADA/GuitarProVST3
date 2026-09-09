@@ -63,13 +63,14 @@ GP 继续负责音频设备、输入输出、采样率和流生命周期。插�
 
 ### P4：外部吉他输入
 
-**状态：已完成 capture 适配层、输入电平监控、输入插入/总线混音路由和隔离回归（2026-09-09）**。真实 `PortAudio` capture 指针的私有回调 ABI 尚无稳定导出，真实监听和设备回归仍为宿主受限项；实现与验证证据见 [P4 实现记录](P4_IMPLEMENTATION.md)。
+**状态：已完成 capture 适配层、输入电平监控、输入插入/总线混音路由、锁定宿主回调回归和隔离验证（2026-09-10）**。真实 `PortAudio` capture 指针的私有 ABI 仅在锁定版本门控下使用，所有权、真实监听和设备回归仍为宿主受限项；实现与验证证据见 [P4 实现记录](P4_IMPLEMENTATION.md)。
 
 - [x] 新增固定预分配 capture tap，读取 `AudioLayer::inputLevel/isRunning/bufferSize` 并输出原子输入电平快照。
 - [x] 实现外部吉他 `input_insert`，处理失败时直通并记录旁路/错误计数。
 - [x] 实现 GP 回放与外部输入分别处理，以及混合后进入 `bus_mix` 总线效果器。
 - [x] `PortAudioAudioLayerImpl::Impl::streamCallback` 的最终输出缓冲写回已在锁定宿主版本中观测。
-- [ ] 该回调中的真实 capture buffer 所有权和输入通道布局仍待宿主 ABI 证据补齐。
+- [x] 锁定版本的 PortAudio 参数快照已接入 capture adapter：仅接受交错 `paFloat32`，按当前输入/输出通道数转换，并在回调返回前写回。
+- [ ] 该回调中的真实 capture buffer 所有权仍待宿主 ABI 证据补齐；当前只记录 borrowed pointer 的回调期地址，不保留指针。
 - [ ] 真实宿主中的输入监听稳定性、反馈、设备切换、暂停/恢复听感：当前未运行，标记为宿主受限。
 
 ### P5：Qt 界面和状态保存

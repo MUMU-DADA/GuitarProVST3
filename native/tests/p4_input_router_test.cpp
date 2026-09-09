@@ -75,6 +75,58 @@ int main() {
                    snapshot.sampleRate == 48000.0,
                "route counters and meter"))
         return 1;
+
+    // PortAudio contract: capture/output are borrowed interleaved float32
+    // buffers. Verify the mono-capture to stereo-output mapping and writeback.
+    router.setRoute(input::Route::InputInsert);
+    float captureInterleaved[frames]{0.25F, -0.25F, 0.5F, -0.5F};
+    float outputInterleaved[frames * 2]{};
+    const input::InterleavedView interleaved{
+        captureInterleaved, outputInterleaved, frames, 1, 2, 48000.0, frames,
+        reinterpret_cast<void *>(0x42), 17, input::InterleavedSampleFormat::Float32};
+    result = router.processInterleaved(interleaved);
+    if (!check(result.completed && result.processed && close(outputInterleaved[0], 0.5F) &&
+                   close(outputInterleaved[1], 0.5F) && close(outputInterleaved[6], -1.0F) &&
+                   close(outputInterleaved[7], -1.0F),
+               "interleaved mono capture to stereo output"))
+        return 1;
+    const auto interleavedSnapshot = router.snapshot();
+    if (!check(interleavedSnapshot.interleavedFormatObserved &&
+                   interleavedSnapshot.interleavedInputObserved &&
+                   interleavedSnapshot.interleavedOutputWritten &&
+                   interleavedSnapshot.interleavedBlocks == 1 &&
+                   interleavedSnapshot.interleavedInputChannelCount == 1 &&
+                   interleavedSnapshot.interleavedOutputChannelCount == 2 &&
+                   interleavedSnapshot.firstCaptureAddress != 0 &&
+                   interleavedSnapshot.firstCaptureOwner == 0x42,
+               "interleaved ownership and format evidence"))
+        return 1;
+    float stereoCaptureInterleaved[frames * 2]{
+        0.25F, 0.5F, -0.25F, -0.5F, 0.5F, 0.25F, -0.5F, -0.25F};
+    float monoOutputInterleaved[frames]{};
+    const input::InterleavedView stereoToMono{
+        stereoCaptureInterleaved, monoOutputInterleaved, frames, 2, 1, 48000.0, frames,
+        reinterpret_cast<void *>(0x42), 18, input::InterleavedSampleFormat::Float32};
+    result = router.processInterleaved(stereoToMono);
+    if (!check(result.completed && result.processed && close(monoOutputInterleaved[0], 0.75F) &&
+                   close(monoOutputInterleaved[3], -0.75F),
+               "interleaved stereo capture to mono output"))
+        return 1;
+    const input::InterleavedView missing{
+        nullptr, outputInterleaved, frames, 1, 2, 48000.0, frames,
+        reinterpret_cast<void *>(0x42), 19, input::InterleavedSampleFormat::Float32};
+    result = router.processInterleaved(missing);
+    if (!check(!result.completed && router.snapshot().interleavedMissingBlocks == 1,
+               "missing capture fails closed"))
+        return 1;
+    const input::InterleavedView invalidFormat{
+        captureInterleaved, outputInterleaved, frames, 1, 2, 48000.0, frames,
+        reinterpret_cast<void *>(0x42), 20,
+        static_cast<input::InterleavedSampleFormat>(0x7F)};
+    result = router.processInterleaved(invalidFormat);
+    if (!check(!result.completed && router.snapshot().interleavedFormatErrors == 1,
+               "unsupported interleaved format fails closed"))
+        return 1;
     std::cout << "PASS: P4 capture monitor, input insert, bus mix and bypass routes.\n";
     return 0;
 }

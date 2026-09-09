@@ -148,6 +148,27 @@ try {
             $hook.input_route -ne $P4Route -or -not $hook.audio_layer_input_level_accessor_found) {
             throw "P4 input route/AudioLayer level monitor was not ready: $($hook | ConvertTo-Json -Depth 8 -Compress)"
         }
+        if (-not $hook.input_interleaved_format_observed -or
+            -not $hook.input_interleaved_observed -or
+            $hook.input_interleaved_format_errors -ne 0 -or
+            $hook.input_interleaved_missing_blocks -ne 0 -or
+            -not $hook.input_configuration_observed -or
+            $hook.input_configuration_errors -ne 0 -or
+            $hook.input_configured_input_channels -le 0 -or
+            $hook.input_configured_output_channels -le 0 -or
+            $hook.input_configured_sample_rate -le 0 -or
+            $hook.input_first_capture_address -eq '0' -or
+            $hook.input_first_output_address -eq '0') {
+            throw "P4 capture interleaved adapter evidence was not observed: $($hook | ConvertTo-Json -Depth 8 -Compress)"
+        }
+        if ($ExpectP3TotalBypass) {
+            if ($hook.input_interleaved_output_written -or $hook.input_interleaved_blocks -ne 0 -or
+                $hook.input_bypass_blocks -le 0) {
+                throw "P4 total bypass did not bypass capture processing: $($hook | ConvertTo-Json -Depth 8 -Compress)"
+            }
+        } elseif (-not $hook.input_interleaved_output_written -or $hook.input_interleaved_blocks -le 0) {
+            throw "P4 capture interleaved output writeback was not observed: $($hook | ConvertTo-Json -Depth 8 -Compress)"
+        }
     }
     if ($ExpectP3Fallback) {
         if (-not $hook.chain_faulted -or -not $hook.total_bypass -or
