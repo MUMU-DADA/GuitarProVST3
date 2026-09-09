@@ -1,6 +1,7 @@
 param(
     [string]$QtDir = '',
-    [string]$OutputRoot = ''
+    [string]$OutputRoot = '',
+    [string]$Vst3SdkDir = ''
 )
 
 $ErrorActionPreference = 'Stop'
@@ -15,6 +16,12 @@ if (-not $QtDir) {
 }
 if (-not $QtDir -or -not (Test-Path -LiteralPath $QtDir)) { throw 'Qt 5.15.x MSVC x64 SDK not found. Pass -QtDir explicitly.' }
 $QtDir = (Resolve-Path -LiteralPath $QtDir).Path
+
+if (-not $Vst3SdkDir) { $Vst3SdkDir = Join-Path $projectRoot 'third_party/vst3sdk' }
+if (-not (Test-Path -LiteralPath (Join-Path $Vst3SdkDir 'pluginterfaces/base/funknown.h'))) {
+    throw 'VST3 SDK not found. Initialize third_party/vst3sdk or pass -Vst3SdkDir explicitly.'
+}
+$Vst3SdkDir = (Resolve-Path -LiteralPath $Vst3SdkDir).Path
 
 if (-not $OutputRoot) { $OutputRoot = Join-Path $projectRoot '.tools/native' }
 $buildDir = Join-Path $OutputRoot 'build'
@@ -31,6 +38,8 @@ $includeDirs = @(
     (Join-Path $QtDir 'include'),
     (Join-Path $QtDir 'include/QtCore'),
     (Join-Path $QtDir 'include/QtGui'),
+    $Vst3SdkDir,
+    (Join-Path $Vst3SdkDir 'public.sdk'),
     (Join-Path $PSScriptRoot 'modules'),
     $buildDir
 )
@@ -43,8 +52,14 @@ if ($LASTEXITCODE) { throw 'Qt moc failed.' }
 $sources = @(
     (Join-Path $PSScriptRoot 'vst3_autoload.cpp'),
     (Join-Path $PSScriptRoot 'modules/bootstrap.cpp'),
-    (Join-Path $PSScriptRoot 'modules/state_manager.cpp')
+    (Join-Path $PSScriptRoot 'modules/state_manager.cpp'),
+    (Join-Path $PSScriptRoot 'modules/vst3_host.cpp'),
+    (Join-Path $Vst3SdkDir 'pluginterfaces/base/coreiids.cpp'),
+    (Join-Path $Vst3SdkDir 'pluginterfaces/base/funknown.cpp'),
+    (Join-Path $Vst3SdkDir 'pluginterfaces/base/ustring.cpp'),
+    (Join-Path $Vst3SdkDir 'public.sdk/source/common/memorystream.cpp'),
+    (Join-Path $Vst3SdkDir 'public.sdk/source/vst/vstinitiids.cpp')
 )
-& cl /nologo /std:c++17 /EHsc /MD /O2 /utf-8 /LD /DQT_NO_DEBUG /DQT_PLUGIN @clIncludeArgs @sources "/Fo$buildDir/" "/Fd$buildDir/guitarpro_vst3_autoload.pdb" "/Fe$pluginDir/guitarpro_vst3_autoload.dll" /link "/LIBPATH:$QtDir/lib" Qt5Core.lib Qt5Gui.lib "/IMPLIB:$buildDir/guitarpro_vst3_autoload.lib"
+& cl /nologo /std:c++17 /EHsc /MD /O2 /utf-8 /LD /DQT_NO_DEBUG /DQT_PLUGIN /DUNICODE /D_UNICODE @clIncludeArgs @sources "/Fo$buildDir/" "/Fd$buildDir/guitarpro_vst3_autoload.pdb" "/Fe$pluginDir/guitarpro_vst3_autoload.dll" /link "/LIBPATH:$QtDir/lib" Qt5Core.lib Qt5Gui.lib Ole32.lib "/IMPLIB:$buildDir/guitarpro_vst3_autoload.lib"
 if ($LASTEXITCODE) { throw 'P0 plugin compilation failed.' }
 Write-Output "Built $pluginDir/guitarpro_vst3_autoload.dll"

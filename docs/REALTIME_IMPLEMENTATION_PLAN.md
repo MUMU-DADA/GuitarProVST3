@@ -31,6 +31,8 @@ GP 继续负责音频设备、输入输出、采样率和流生命周期。插�
 
 ### P1：DLL 内嵌 VST3 Host
 
+**状态：已完成最小 Host 实现（2026-09-09）**。实现与隔离宿主证据见 [P1 实现记录](P1_IMPLEMENTATION.md)。
+
 - 将官方 VST3 SDK 集成到插件 DLL 的构建目标中。
 - 在非实时线程完成 VST3 bundle 扫描、`GetPluginFactory` 获取、class UID 枚举和实例创建。
 - 管理 `IComponent` / `IAudioProcessor` 的初始化、`setupProcessing`、`setActive`、参数、旁路、state chunk、尾音和延迟。

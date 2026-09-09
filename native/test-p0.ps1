@@ -1,7 +1,8 @@
 param(
     [string]$HostDirectory = 'C:\Program Files\Arobas Music\Guitar Pro 8',
     [string]$PluginPath = '',
-    [switch]$KeepHost
+    [switch]$KeepHost,
+    [switch]$RequireP1
 )
 
 $ErrorActionPreference = 'Stop'
@@ -51,7 +52,12 @@ try {
             if (-not (Test-Path -LiteralPath $statusPath)) { throw "P0 automatic loading failed for $variant." }
             $status = Get-Content -LiteralPath $statusPath -Raw | ConvertFrom-Json
             if (-not $status.loaded -or -not $status.bypassed -or -not $status.host_supported) { throw "Unexpected P0 status for $variant." }
-            $results += [pscustomobject]@{variant=$variant;pid=$process.Id;status=$status.status;host_supported=$status.host_supported;bypassed=$status.bypassed}
+            if ($RequireP1) {
+                if (-not $status.vst3_host -or -not $status.vst3_host.worker_thread -or -not $status.vst3_host.ready) {
+                    throw "Unexpected P1 VST3 host status for $variant."
+                }
+            }
+            $results += [pscustomobject]@{variant=$variant;pid=$process.Id;status=$status.status;host_supported=$status.host_supported;bypassed=$status.bypassed;vst3_host=$status.vst3_host}
         } finally {
             if (-not $process.HasExited) { Stop-Process -Id $process.Id -Force; $process.WaitForExit(5000) | Out-Null }
             $process.Dispose()
@@ -70,4 +76,8 @@ try {
         ConvertTo-Json -Depth 8 | Set-Content -LiteralPath (Join-Path $run 'verification.json')
     if (-not $KeepHost) { Remove-Item -LiteralPath $hostCopy -Recurse -Force -ErrorAction SilentlyContinue }
 }
-Write-Output "PASS: P0 automatic load, default bypass and uninstall recovery. Evidence: $run"
+if ($RequireP1) {
+    Write-Output "PASS: P0 automatic load plus P1 VST3 host lifecycle. Evidence: $run"
+} else {
+    Write-Output "PASS: P0 automatic load, default bypass and uninstall recovery. Evidence: $run"
+}
