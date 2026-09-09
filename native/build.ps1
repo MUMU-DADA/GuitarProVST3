@@ -53,6 +53,7 @@ $sources = @(
     (Join-Path $PSScriptRoot 'vst3_autoload.cpp'),
     (Join-Path $PSScriptRoot 'modules/bootstrap.cpp'),
     (Join-Path $PSScriptRoot 'modules/state_manager.cpp'),
+    (Join-Path $PSScriptRoot 'modules/qt_ui.cpp'),
     (Join-Path $PSScriptRoot 'modules/audio_adapter.cpp'),
     (Join-Path $PSScriptRoot 'modules/input_router.cpp'),
     (Join-Path $PSScriptRoot 'modules/effect_chain.cpp'),
@@ -64,6 +65,6 @@ $sources = @(
     (Join-Path $Vst3SdkDir 'public.sdk/source/common/memorystream.cpp'),
     (Join-Path $Vst3SdkDir 'public.sdk/source/vst/vstinitiids.cpp')
 )
-& cl /nologo /std:c++17 /EHsc /MD /O2 /utf-8 /LD /DQT_NO_DEBUG /DQT_PLUGIN /DUNICODE /D_UNICODE @clIncludeArgs @sources "/Fo$buildDir/" "/Fd$buildDir/guitarpro_vst3_autoload.pdb" "/Fe$pluginDir/guitarpro_vst3_autoload.dll" /link "/LIBPATH:$QtDir/lib" Qt5Core.lib Qt5Gui.lib Ole32.lib "/IMPLIB:$buildDir/guitarpro_vst3_autoload.lib"
+& cl /nologo /std:c++17 /EHsc /MD /O2 /utf-8 /LD /DQT_NO_DEBUG /DQT_PLUGIN /DUNICODE /D_UNICODE @clIncludeArgs @sources "/Fo$buildDir/" "/Fd$buildDir/guitarpro_vst3_autoload.pdb" "/Fe$pluginDir/guitarpro_vst3_autoload.dll" /link "/LIBPATH:$QtDir/lib" Qt5Core.lib Qt5Gui.lib Qt5Widgets.lib Ole32.lib "/IMPLIB:$buildDir/guitarpro_vst3_autoload.lib"
 if ($LASTEXITCODE) { throw 'P0 plugin compilation failed.' }
 Write-Output "Built $pluginDir/guitarpro_vst3_autoload.dll"

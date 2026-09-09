@@ -4,6 +4,7 @@
 #include "gp_hook.h"
 #include "host_lock.h"
 #include "qt_ui.h"
+#include "state_manager.h"
 #include "vst3_host.h"
 
 #include <QtCore/QJsonArray>
@@ -168,7 +169,8 @@ QJsonObject initialize() {
             {"realtime_process", "vst3_process_probe"}}},
         {"gp_hook", hookStatus(hookState)},
         {"qt_ui", ui::state()},
-        {"state_manager", "status_only_p0"},
+        {"state_manager", QJsonObject{{"status", "sidecar_json_p5"},
+                                        {"path", state::sidecarPath()}}},
         {"reason", hookState.runtimeProcessorReady
                        ? "P2 runtime VST3 effect processing enabled by environment switch"
                        : (host.supported ? "P0 bootstrap complete; processing remains bypassed"

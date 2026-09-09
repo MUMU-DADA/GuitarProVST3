@@ -5,6 +5,7 @@
 
 #include "modules/bootstrap.h"
 #include "modules/gp_hook.h"
+#include "modules/qt_ui.h"
 #include "modules/state_manager.h"
 
 namespace {
@@ -36,6 +37,7 @@ public:
         QTimer::singleShot(0, application, [application] {
             const auto status = gpvst3::bootstrap::initialize();
             gpvst3::state::writeStatus(status);
+            gpvst3::ui::showEffectChainPanel();
             const auto hook = status.value("gp_hook").toObject();
             if (!hook.value("enabled").toBool()) return;
             writeObservation();

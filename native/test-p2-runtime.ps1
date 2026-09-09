@@ -36,7 +36,10 @@ Copy-Item -LiteralPath $mcpAutoload -Destination (Join-Path $imageDir 'guitarpro
 Copy-Item -LiteralPath $mcpGeneric -Destination (Join-Path $genericDir 'guitarpro_mcp.dll')
 
 $fixture = Join-Path $run 'runtime.gp'
-Copy-Item -LiteralPath (Join-Path $McpRoot 'native/testdata/minimal.gp') -Destination $fixture
+$fixtureSource = Join-Path $McpRoot 'native/testdata/minimal.gp'
+if (-not (Test-Path -LiteralPath $fixtureSource)) { $fixtureSource = Join-Path $McpRoot 'test/testdata/minimal.gp' }
+if (-not (Test-Path -LiteralPath $fixtureSource)) { throw "Minimal GP fixture not found under $McpRoot." }
+Copy-Item -LiteralPath $fixtureSource -Destination $fixture
 Add-Type -AssemblyName System.IO.Compression.FileSystem
 $archive = [IO.Compression.ZipFile]::Open($fixture, [IO.Compression.ZipArchiveMode]::Update)
 try {
