@@ -41,11 +41,14 @@ GP 继续负责音频设备、输入输出、采样率和流生命周期。插�
 
 ### P2：GP 音频适配和实时接入
 
-- 定义内部音频块结构，包含输入/生成/输出缓冲、帧数、采样率、通道数和 block size。
-- 将 GP 的 `IAudioBuffer` 转换为 VST3 使用的 planar `float32`，处理完成后写回 GP 缓冲。
-- 先对 `GPRSE::Master::process` 和 `EffectsChain::processDSP` 做只读观测，确认真实调用线程、缓冲区所有权和处理顺序。
-- 确认修改后的缓冲能够继续流向 GP 的 `AudioLayer`，再接入一个实际效果器。
-- 验收：GP 播放 RSE/MIDI 时能够实时听到效果，旁路和启用之间可切换。
+**状态：已完成适配器、VST3 实际 process 探针和私有入口只读观测；运行时 hook 与真实播放写回仍为宿主受限（2026-09-09）**。实现与验证证据见 [P2 实现记录](P2_IMPLEMENTATION.md)。
+
+- [x] 定义内部音频块结构，包含输入/生成/输出缓冲、帧数、采样率、通道数和 block size。
+- [x] 提供 GP 通道指针到 VST3 planar `float32` 的复制适配，以及处理后的输出写回。
+- [x] 对 `GPRSE::Master::process` 和 `EffectsChain::processDSP` 做宿主哈希门控的导出只读观测。
+- [ ] 真实宿主中的调用线程、`IAudioBuffer` 所有权、处理顺序和后续 `AudioLayer` 写回：当前证据不足，保持 hook 关闭。
+- [x] 在已安装的 `ParametricOD.vst3`、`Gateway.vst3`、`NAM Rig.vst3` 上完成实际 `IAudioProcessor::process()` 块探针。
+- [ ] GP 播放 RSE/MIDI 时的听感、旁路/启用切换：需要安装运行时 hook 后在真实宿主回归，属于宿主受限项。
 
 ### P3：实时线程安全和链管理
 

@@ -14,6 +14,7 @@
 #include <system_error>
 #include <unordered_set>
 
+#include "audio_adapter.h"
 #include "pluginterfaces/base/funknownimpl.h"
 #include "pluginterfaces/base/ibstream.h"
 #include "pluginterfaces/base/ipluginbase.h"
@@ -207,6 +208,42 @@ void setClassError(ClassState &state, std::string message) {
     if (state.error.empty()) state.error = std::move(message);
 }
 
+bool probeProcess(IAudioProcessor &processor, IComponent &component, ClassState &state) {
+    constexpr std::size_t probeFrames = 32;
+    std::size_t channels = 2;
+    Steinberg::Vst::BusInfo bus{};
+    if (component.getBusCount(Steinberg::Vst::kAudio, Steinberg::Vst::kOutput) > 0 &&
+        succeeded(component.getBusInfo(Steinberg::Vst::kAudio, Steinberg::Vst::kOutput, 0, bus)) &&
+        bus.channelCount > 0)
+        channels = static_cast<std::size_t>(bus.channelCount);
+    else if (component.getBusCount(Steinberg::Vst::kAudio, Steinberg::Vst::kInput) > 0 &&
+             succeeded(component.getBusInfo(Steinberg::Vst::kAudio, Steinberg::Vst::kInput, 0, bus)) &&
+             bus.channelCount > 0)
+        channels = static_cast<std::size_t>(bus.channelCount);
+
+    audio::PlanarBuffer scratch;
+    if (!scratch.prepare(channels, probeFrames)) {
+        setClassError(state, "process_probe_buffer_failed");
+        return false;
+    }
+    std::vector<std::vector<float>> input(channels, std::vector<float>(probeFrames, 0.0F));
+    std::vector<std::vector<float>> output(channels, std::vector<float>(probeFrames, 0.0F));
+    std::vector<const float *> inputPointers(channels);
+    std::vector<float *> outputPointers(channels);
+    for (std::size_t channel = 0; channel < channels; ++channel) {
+        inputPointers[channel] = input[channel].data();
+        outputPointers[channel] = output[channel].data();
+    }
+    const audio::BlockView block{
+        inputPointers.data(), nullptr, outputPointers.data(), nullptr, channels, probeFrames,
+        kProbeSampleRate, probeFrames};
+    const auto result = audio::process(processor, block, scratch, false);
+    state.processProbeFrames = static_cast<unsigned int>(probeFrames);
+    state.processProbePassed = result.processed;
+    if (!result.processed) setClassError(state, std::string("process_probe_") + result.error);
+    return result.processed;
+}
+
 ClassState validateClass(const fs::path &modulePath, Steinberg::IPluginFactory &factory,
                          const Steinberg::PClassInfoW &info, HostApplication &host) {
     ClassState result;
@@ -240,7 +277,9 @@ ClassState validateClass(const fs::path &modulePath, Steinberg::IPluginFactory &
     }
     result.componentInitialized = true;
 
-    // Activate default audio buses before setup. Actual routing belongs to P2.
+    // Activate default audio buses before setup. GP routing is supplied by the
+    // hash-gated observation layer; the private write-back path stays disabled
+    // until its runtime ABI is traced.
     for (int direction = Steinberg::Vst::kInput; direction <= Steinberg::Vst::kOutput; ++direction) {
         const auto count = component->getBusCount(Steinberg::Vst::kAudio, direction);
         for (Steinberg::int32 index = 0; index < count; ++index) {
@@ -328,6 +367,7 @@ ClassState validateClass(const fs::path &modulePath, Steinberg::IPluginFactory &
         if (!result.active) setClassError(result, "set_active_failed");
         result.processing = result.active && succeeded(processor->setProcessing(true));
         if (result.active && !result.processing) setClassError(result, "set_processing_failed");
+        if (result.processing) probeProcess(*processor, *component, result);
         if (result.processing) processor->setProcessing(false);
         if (result.active) component->setActive(false);
     }
@@ -407,8 +447,10 @@ State scanAndValidate() {
             ++result.classesEnumerated;
             auto classState = validateClass(packagePath, *factory, info, *host);
             if (classState.componentCreated) ++result.instancesCreated;
+            if (classState.processorReady) ++result.processCalls;
+            if (classState.processProbePassed) ++result.processProbesPassed;
             if (classState.active && classState.processing && classState.componentInitialized &&
-                classState.processorReady)
+                classState.processorReady && classState.processProbePassed)
                 ++result.lifecyclesPassed;
             result.classes.push_back(std::move(classState));
         }

@@ -2,7 +2,8 @@ param(
     [string]$HostDirectory = 'C:\Program Files\Arobas Music\Guitar Pro 8',
     [string]$PluginPath = '',
     [switch]$KeepHost,
-    [switch]$RequireP1
+    [switch]$RequireP1,
+    [switch]$RequireP2
 )
 
 $ErrorActionPreference = 'Stop'
@@ -57,7 +58,20 @@ try {
                     throw "Unexpected P1 VST3 host status for $variant."
                 }
             }
-            $results += [pscustomobject]@{variant=$variant;pid=$process.Id;status=$status.status;host_supported=$status.host_supported;bypassed=$status.bypassed;vst3_host=$status.vst3_host}
+            if ($RequireP2) {
+                if (-not $status.audio_adapter -or $status.audio_adapter.status -ne 'planar_float32' -or
+                    -not $status.audio_adapter.scratch_prepared_off_thread) {
+                    throw "Unexpected P2 audio adapter status for $variant."
+                }
+                if (-not $status.vst3_host -or $status.vst3_host.process_probes_passed -lt 1) {
+                    throw "VST3 process probe did not pass for $variant."
+                }
+                if (-not $status.gp_hook -or -not $status.gp_hook.observation_only -or
+                    $status.gp_hook.installed) {
+                    throw "Unexpected P2 GP hook status for $variant."
+                }
+            }
+            $results += [pscustomobject]@{variant=$variant;pid=$process.Id;status=$status.status;host_supported=$status.host_supported;bypassed=$status.bypassed;vst3_host=$status.vst3_host;audio_adapter=$status.audio_adapter;gp_hook=$status.gp_hook}
         } finally {
             if (-not $process.HasExited) { Stop-Process -Id $process.Id -Force; $process.WaitForExit(5000) | Out-Null }
             $process.Dispose()
@@ -76,7 +90,9 @@ try {
         ConvertTo-Json -Depth 8 | Set-Content -LiteralPath (Join-Path $run 'verification.json')
     if (-not $KeepHost) { Remove-Item -LiteralPath $hostCopy -Recurse -Force -ErrorAction SilentlyContinue }
 }
-if ($RequireP1) {
+if ($RequireP2) {
+    Write-Output "PASS: P0/P1 plus P2 planar adapter, process probe and GP observation status. Evidence: $run"
+} elseif ($RequireP1) {
     Write-Output "PASS: P0 automatic load plus P1 VST3 host lifecycle. Evidence: $run"
 } else {
     Write-Output "PASS: P0 automatic load, default bypass and uninstall recovery. Evidence: $run"

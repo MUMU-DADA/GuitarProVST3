@@ -32,6 +32,8 @@ struct ClassState {
     std::size_t controllerStateBytes = 0;
     unsigned int latencySamples = 0;
     unsigned int tailSamples = 0;
+    bool processProbePassed = false;
+    unsigned int processProbeFrames = 0;
     std::string error;
 };
 
@@ -44,6 +46,8 @@ struct State {
     int classesEnumerated = 0;
     int instancesCreated = 0;
     int lifecyclesPassed = 0;
+    int processCalls = 0;
+    int processProbesPassed = 0;
     std::vector<ClassState> classes;
     std::vector<std::string> errors;
 };
