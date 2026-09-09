@@ -4,7 +4,7 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-$root = Split-Path -Parent $PSScriptRoot
+$root = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
 if (-not $PluginPath) { $PluginPath = Join-Path $root '.tools/native/plugins/imageformats/guitarpro_vst3_autoload.dll' }
 if (-not (Test-Path -LiteralPath $PluginPath -PathType Leaf)) { throw 'Build the plugin first with native/build.ps1.' }
 $pluginSource = (Resolve-Path -LiteralPath $PluginPath).Path
@@ -13,7 +13,7 @@ $OutputRoot = Join-Path ([IO.Path]::GetFullPath($OutputRoot)) ('p6-package-' + [
 New-Item -ItemType Directory -Force -Path $OutputRoot | Out-Null
 $packageOutput = Join-Path $OutputRoot 'release'
 $version = '0.6.0-test'
-& (Join-Path $PSScriptRoot 'package.ps1') -Version $version -PluginPath $PluginPath -OutputDirectory $packageOutput | Out-Host
+& (Join-Path (Split-Path -Parent $PSScriptRoot) 'package.ps1') -Version $version -PluginPath $PluginPath -OutputDirectory $packageOutput | Out-Host
 $packageDirectory = Join-Path $packageOutput "GuitarProVST3-$version"
 $manifest = Get-Content -LiteralPath (Join-Path $packageDirectory 'package.json') -Raw -Encoding UTF8 | ConvertFrom-Json
 if ($manifest.product -ne 'GuitarProVST3' -or @($manifest.files).Count -lt 6) { throw 'P6 package manifest is incomplete.' }

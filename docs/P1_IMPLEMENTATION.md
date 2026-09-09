@@ -21,7 +21,7 @@ P1 在 P0 自动加载 DLL 内增加了最小 VST3 Host。模块扫描和实例�
 
 ```powershell
 ./native/build.ps1
-./native/test-p1.ps1
+./native/test/test-p1.ps1
 ```
 
 在本机 Guitar Pro 8.1.1.17 隔离副本中，直接启动和快捷方式启动均通过。每次均发现并加载 3 个 bundle，枚举 4 个 class，创建 3 个 audio component，3 个生命周期通过；Gateway 和 ParametricOD 的参数/bypass 回环成功，状态记录 `worker_thread=true`、`ready=true`、state round-trip 成功，且退出后释放模块。证据文件由测试脚本写入被忽略的 `artifacts/` 目录。

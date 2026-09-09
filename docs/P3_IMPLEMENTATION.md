@@ -14,7 +14,7 @@ P3 在 P2 的哈希门控实时入口上增加了固定双槽效果器链。插�
   - 每个运行时效果器实例拥有自己的 processor、scratch 和 processing guard；工作线程预创建两个实例并在两个 slot 间切换。
   - 在 `44.1/48/96 kHz × 64/128/256 frame` 矩阵中执行 `setupProcessing()`、scratch 重配和原子链切换，并恢复到 44.1 kHz / 16384 frame。
   - 支持 `GPVST3_TOTAL_BYPASS=1` 的总旁路验证和 `GPVST3_FORCE_P3_ERROR=1` 的可检测错误回退验证开关。
-- `native/test-p3.ps1`
+- `native/test/test-p3.ps1`
   - 复用 P2 的真实 Guitar Pro 播放夹具，分别验证正常链处理/重配置和 processor 错误后的自动旁路回退。
 - `status.json` / `p2-observation.json`
   - 输出 slot 数、切换次数、处理计时、错误/回退计数、总旁路状态和重配置矩阵结果。
@@ -23,7 +23,7 @@ P3 在 P2 的哈希门控实时入口上增加了固定双槽效果器链。插�
 
 ```powershell
 ./native/build.ps1 -QtDir C:/path/to/Qt/5.15.2/msvc2019_64
-./native/test-p3.ps1
+./native/test/test-p3.ps1
 ```
 
 最近一次锁定的 Guitar Pro 8.1.1.17 / Windows x64 隔离宿主验证已通过：
@@ -32,7 +32,7 @@ P3 在 P2 的哈希门控实时入口上增加了固定双槽效果器链。插�
 - 可检测错误回退：`chain_faulted=true`、`total_bypass=true`、`chain_error_blocks=1`、`chain_fallback_blocks=1`，后续块均旁路。
 - 显式总旁路：`total_bypass=true`、`chain_faulted=false`、49 个块旁路、处理块为 0。
 
-三次运行均使用 `native/test-p3.ps1`，证据写入被忽略的 `artifacts/` 目录。
+三次运行均使用 `native/test/test-p3.ps1`，证据写入被忽略的 `artifacts/` 目录。
 
 ## 边界
 

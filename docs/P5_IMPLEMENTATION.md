@@ -15,16 +15,16 @@ P5 已完成最小 Qt 效果器链编辑器和 sidecar JSON 状态保存。插�
   - 默认目录仍为 `%LOCALAPPDATA%/GuitarProVST3`，测试可用 `GPVST3_DATA_DIR` 隔离。
 - `native/build.ps1`
   - 将 `qt_ui.cpp` 纳入构建并链接 `Qt5Widgets.lib`。
-- `native/test-p5-state.ps1`、`native/test-p5-ui.ps1`
+- `native/test/test-p5-state.ps1`、`native/test/test-p5-ui.ps1`
   - 覆盖 sidecar 字段往返、损坏 JSON 回退、面板创建、缺失插件行和核心控件。
 
 ## 验证
 
 ```powershell
 ./native/build.ps1 -QtDir C:/path/to/Qt/5.15.2/msvc2019_64
-./native/test-p5-state.ps1 -QtDir C:/path/to/Qt/5.15.2/msvc2019_64
-./native/test-p5-ui.ps1 -QtDir C:/path/to/Qt/5.15.2/msvc2019_64
-./native/test-p0.ps1 -PluginPath .tools/native/plugins/imageformats/guitarpro_vst3_autoload.dll
+./native/test/test-p5-state.ps1 -QtDir C:/path/to/Qt/5.15.2/msvc2019_64
+./native/test/test-p5-ui.ps1 -QtDir C:/path/to/Qt/5.15.2/msvc2019_64
+./native/test/test-p0.ps1 -PluginPath .tools/native/plugins/imageformats/guitarpro_vst3_autoload.dll
 ```
 
 本次已通过 MSVC x64 构建、sidecar 隔离夹具、Qt offscreen 面板夹具和真实 Guitar Pro P0 启动/卸载回归。真实 GP 中的 VST3 编辑器窗口仍由第三方 VST3/宿主接口负责，当前面板不伪造编辑器；GP 私有控件布局升级后的 dock 位置和音源区入口需要重新观察。

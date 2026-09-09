@@ -10,9 +10,9 @@
 
 ## 已验证
 
-- `native/tests/p4_input_router_test.cpp` 验证 mono capture → stereo output 的交错转换、写回、借用 owner 记录和空输入安全回退。
-- `native/test-p4-router.ps1` 验证路由、峰值/RMS、计数器和边界路径；`native/build.ps1` 验证插件 DLL 编译。
-- `./native/test-p4.ps1` 已在 Guitar Pro 8.1.1.17 锁定宿主上通过（2026-09-10），并分别回归 `input_insert` 与 `bus_mix`。本次两次快照均观察到 `input_interleaved_observed=true`、`input_interleaved_output_written=true`、输入/输出均为 2 通道、采样率为 44100 Hz，`input_configuration_errors=0`；`input_insert` 处理 157 个 capture block，`bus_mix` 混音 156 个 block，capture/output 地址和 `userData` owner witness 均非零。
+- `native/test/p4_input_router_test.cpp` 验证 mono capture → stereo output 的交错转换、写回、借用 owner 记录和空输入安全回退。
+- `native/test/test-p4-router.ps1` 验证路由、峰值/RMS、计数器和边界路径；`native/build.ps1` 验证插件 DLL 编译。
+- `./native/test/test-p4.ps1` 已在 Guitar Pro 8.1.1.17 锁定宿主上通过（2026-09-10），并分别回归 `input_insert` 与 `bus_mix`。本次两次快照均观察到 `input_interleaved_observed=true`、`input_interleaved_output_written=true`、输入/输出均为 2 通道、采样率为 44100 Hz，`input_configuration_errors=0`；`input_insert` 处理 157 个 capture block，`bus_mix` 混音 156 个 block，capture/output 地址和 `userData` owner witness 均非零。
 
 ## 未宣称完成
 

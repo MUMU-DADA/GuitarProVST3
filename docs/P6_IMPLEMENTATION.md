@@ -7,10 +7,10 @@ P6 把已验证的 Guitar Pro 8.1.1.17 哈希作为实时 hook 的必要前置�
 - `native/modules/host_lock.h`
   - 集中维护五个宿主文件的 SHA-256 白名单。
   - `verifyDirectory()` 供运行时和测试复用；`verify()` 仍校验当前 `GuitarPro.exe` 目录。
-- `native/test-p6-gate.ps1`、`native/tests/p6_host_lock_test.cpp`
+- `native/test/test-p6-gate.ps1`、`native/test/p6_host_lock_test.cpp`
   - 复制真实宿主文件后验证全部哈希通过，再向副本 `GuitarPro.exe` 追加字节并确认校验失败。
-  - `native/test-p0.ps1 -TamperHostFile GuitarPro.exe` 在可加载的隔离宿主中确认版本变化自动禁用 hook、VST3 和实时处理。
-- `native/tests/p6_workflow.ps1` 与 `native/test-p2-runtime.ps1 -P6Workflow`
+  - `native/test/test-p0.ps1 -TamperHostFile GuitarPro.exe` 在可加载的隔离宿主中确认版本变化自动禁用 hook、VST3 和实时处理。
+- `native/test/p6_workflow.ps1` 与 `native/test/test-p2-runtime.ps1 -P6Workflow`
   - 覆盖播放/停止、循环范围与循环回绕、换曲谱、保存/关闭/重开、原生设备状态和清洁退出。
   - 记录 `audioDevice`、`audioOutput`、`audioOutputChannels`、`audioBuffersSize` 的可用选项和实际切换结果；采样率由 GP 私有链路观察字段记录。
 - `native/package.ps1`
@@ -19,18 +19,18 @@ P6 把已验证的 Guitar Pro 8.1.1.17 哈希作为实时 hook 的必要前置�
 - `native/install.ps1`、`native/uninstall.ps1`
   - 只在目标没有同名未归属 DLL 时安装，并写入 `Plugins/guitarpro-vst3-install.json` 归属收据。
   - 再次安装或卸载前检查当前 DLL 是否仍与收据哈希一致；被修改的文件拒绝覆盖或删除，不触碰 Guitar Pro 主程序和用户数据。
-- `native/test-p6-package.ps1`
+- `native/test/test-p6-package.ps1`
   - 在临时宿主目录验证包清单、哈希、重复安装、篡改后拒绝卸载和正常卸载。
-- `native/test-p6.ps1`
+- `native/test/test-p6.ps1`
   - 统一执行哈希门控、启动/卸载、输入路由、sidecar、Qt UI、发布包和真实宿主工作流回归。
 
 ## 验证
 
 ```powershell
 ./native/build.ps1 -QtDir C:/path/to/Qt/5.15.2/msvc2019_64
-./native/test-p6-gate.ps1 -HostDirectory 'C:/Program Files/Arobas Music/Guitar Pro 8'
-./native/test-p6-package.ps1
-./native/test-p6.ps1 -McpRoot C:/path/to/GuitarProMCP
+./native/test/test-p6-gate.ps1 -HostDirectory 'C:/Program Files/Arobas Music/Guitar Pro 8'
+./native/test/test-p6-package.ps1
+./native/test/test-p6.ps1 -McpRoot C:/path/to/GuitarProMCP
 ```
 
 `test-p6.ps1 -SkipRuntime` 仍会执行全部隔离检查，适用于没有桌面 Guitar Pro/MCP 会话的构建机。真实工作流需要 Guitar Pro 8.1.1.17、已构建的 GuitarProMCP 测试插件和桌面音频设备；运行结果写入被忽略的 `artifacts/`。

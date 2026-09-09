@@ -13,7 +13,7 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-$root = Split-Path -Parent $PSScriptRoot
+$root = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
 if (-not $McpRoot) { $McpRoot = Join-Path (Split-Path -Parent $root) 'GuitarProMCP' }
 if (-not $PluginPath) { $PluginPath = Join-Path $root '.tools/native/plugins/imageformats/guitarpro_vst3_autoload.dll' }
 $mcpGeneric = Join-Path $McpRoot '.tools/native/plugins/generic/guitarpro_mcp.dll'
@@ -197,7 +197,7 @@ try {
     }
     $workflow = $null
     if ($P6Workflow) {
-        . (Join-Path $root 'native/tests/p6_workflow.ps1')
+        . (Join-Path $PSScriptRoot 'p6_workflow.ps1')
         $workflow = Invoke-P6Workflow -Session $session -Document $document -FixturePath $fixture -RunDirectory $run -Process $process
     }
     @{status='passed';playback=$playback;gp_hook=$hook;p6_workflow=$workflow;host_sha256=(Get-FileHash -LiteralPath (Join-Path $hostCopy 'GuitarPro.exe')).Hash;plugin_sha256=(Get-FileHash -LiteralPath $PluginPath).Hash} |

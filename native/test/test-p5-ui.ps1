@@ -4,7 +4,7 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-$root = Split-Path -Parent $PSScriptRoot
+$root = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
 if (-not $QtDir) { $QtDir = Join-Path (Split-Path -Parent $root) 'GuitarProMCP/.tools/qt/5.15.2/msvc2019_64' }
 if (-not (Test-Path -LiteralPath (Join-Path $QtDir 'include/QtWidgets/QApplication'))) { throw 'Qt 5.15.x SDK not found. Pass -QtDir explicitly.' }
 if (-not $OutputRoot) { $OutputRoot = Join-Path $root '.tools/native/p5-ui-test' }
@@ -15,7 +15,7 @@ $vsInstall = & $vswhere -latest -products '*' -requires Microsoft.VisualStudio.C
 Import-Module (Join-Path $vsInstall 'Common7/Tools/Microsoft.VisualStudio.DevShell.dll')
 Enter-VsDevShell -VsInstallPath $vsInstall -SkipAutomaticLocation -DevCmdArguments '-arch=x64 -host_arch=x64'
 $include = @("/I$(Join-Path $QtDir 'include')", "/I$(Join-Path $QtDir 'include/QtCore')", "/I$(Join-Path $QtDir 'include/QtGui')", "/I$(Join-Path $QtDir 'include/QtWidgets')", "/I$(Join-Path $root 'native/modules')")
-$sources = @((Join-Path $root 'native/modules/state_manager.cpp'), (Join-Path $root 'native/modules/qt_ui.cpp'), (Join-Path $root 'native/tests/p5_ui_test.cpp'))
+$sources = @((Join-Path $root 'native/modules/state_manager.cpp'), (Join-Path $root 'native/modules/qt_ui.cpp'), (Join-Path $PSScriptRoot 'p5_ui_test.cpp'))
 $exe = Join-Path $OutputRoot 'p5_ui_test.exe'
 & cl /nologo /std:c++17 /EHsc /MD /O2 /utf-8 @include @sources "/Fo$OutputRoot/" "/Fe$exe" /link "/LIBPATH:$(Join-Path $QtDir 'lib')" Qt5Core.lib Qt5Gui.lib Qt5Widgets.lib
 if ($LASTEXITCODE) { throw 'P5 UI test compilation failed.' }

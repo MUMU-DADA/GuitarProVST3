@@ -16,17 +16,17 @@ P2 已完成内部音频适配、VST3 实际块处理，以及针对 Guitar Pro 
   - `GPVST3_ENABLE_P2_HOOK=1` 且 prologue 匹配时安装 x64 入口观测 hook，记录调用次数、线程 ID、帧数、通道数、采样率和缓冲哈希变化；同时按锁定 RVA 安装 `AMAudio` 的 `PortAudioAudioLayerImpl::Impl::streamCallback` hook。
   - 额外设置 `GPVST3_ENABLE_P2_EFFECT=1` 时，在原始 `Master::process` 调用后复用已预创建的 `ParametricOD` VST3 processor：GP `AudioBuffer` → planar `float32` → VST3 `process()` → 原 GP 通道缓冲。
   - 运行时 processor 就绪时状态中的 `observation_only=false`；只启用 hook 时仍为 `true`。
-- `native/test-p2-runtime.ps1`
+- `native/test/test-p2-runtime.ps1`
   - 使用旁项目的原生 MCP 驱动，在隔离 Guitar Pro 副本中打开最小 RSE 曲谱并播放，读取 `p2-observation.json` 验证真实回调和处理结果。
 
 ## 验证
 
 ```powershell
 ./native/build.ps1
-./native/test-p2.ps1
+./native/test/test-p2.ps1
 ```
 
-`test-p2.ps1` 会先执行隔离启动回归，再调用 `test-p2-runtime.ps1` 完成真实播放处理验证；也可以单独运行后者复查运行时证据。
+`test-p2.ps1` 会先执行隔离启动回归，再调用 `native/test/test-p2-runtime.ps1` 完成真实播放处理验证；也可以单独运行后者复查运行时证据。
 
 最近一次 `test-p2-runtime.ps1` 证据（写入被忽略的 `artifacts/` 目录）：
 

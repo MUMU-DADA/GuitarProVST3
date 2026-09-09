@@ -19,15 +19,15 @@ P4 已完成输入适配层、参数门控和隔离验证。插件不创建第�
   - 固定锁定版本的 `PaStreamParameters` 快照位置和 `paFloat32` 格式门控，拒绝未知采样格式、通道数、采样率或超容量 block。
   - capture/output 通道数分别记录，支持 mono capture 到 stereo 监听的显式映射；所有指针只在当前回调内借用。
 - `native/modules/bootstrap.cpp` 和状态快照新增 P4 路由、输入电平、流状态、capture 计数及错误字段。
-- `native/test-p4-router.ps1` 与 `native/tests/p4_input_router_test.cpp`
+- `native/test/test-p4-router.ps1` 与 `native/test/p4_input_router_test.cpp`
   - 覆盖输入插入、GP+输入混音、旁路直通、峰值/RMS 和计数器。
 
 ## 验证
 
 ```powershell
 ./native/build.ps1
-./native/test-p4-router.ps1
-./native/test-p4.ps1
+./native/test/test-p4-router.ps1
+./native/test/test-p4.ps1
 ```
 
 本次已通过 MSVC x64 插件构建、独立路由夹具和真实 Guitar Pro 8.1.1.17 回归。夹具确认三种路由的样本结果、输入电平统计和错误安全回退均符合预期；宿主回归观察到交错 capture、输出写回、输入/输出通道配置、44100 Hz 采样率和零配置错误。

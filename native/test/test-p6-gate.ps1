@@ -5,7 +5,7 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-$root = Split-Path -Parent $PSScriptRoot
+$root = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
 if (-not (Test-Path -LiteralPath (Join-Path $HostDirectory 'GuitarPro.exe'))) {
     throw "Host not found: $HostDirectory"
 }
@@ -32,7 +32,7 @@ Enter-VsDevShell -VsInstallPath $vsInstall -SkipAutomaticLocation -DevCmdArgumen
 
 $include = @("/I$(Join-Path $QtDir 'include')", "/I$(Join-Path $QtDir 'include/QtCore')",
              "/I$(Join-Path $root 'native/modules')")
-$source = Join-Path $root 'native/tests/p6_host_lock_test.cpp'
+$source = Join-Path $PSScriptRoot 'p6_host_lock_test.cpp'
 $exe = Join-Path $OutputRoot 'p6_host_lock_test.exe'
 & cl /nologo /std:c++17 /EHsc /MD /O2 /utf-8 @include $source "/Fo$OutputRoot/" "/Fe$exe" /link "/LIBPATH:$(Join-Path $QtDir 'lib')" Qt5Core.lib
 if ($LASTEXITCODE) { throw 'P6 host lock test compilation failed.' }
