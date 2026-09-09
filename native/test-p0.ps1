@@ -3,7 +3,8 @@ param(
     [string]$PluginPath = '',
     [switch]$KeepHost,
     [switch]$RequireP1,
-    [switch]$RequireP2
+    [switch]$RequireP2,
+    [switch]$RequireP2Hook
 )
 
 $ErrorActionPreference = 'Stop'
@@ -32,11 +33,13 @@ $shortcut.WorkingDirectory = $hostCopy
 $shortcut.Save()
 
 $saved = @{}
-foreach ($name in @('QT_PLUGIN_PATH','QT_QPA_GENERIC_PLUGINS','GPVST3_DATA_DIR','TEMP','TMP')) { $saved[$name] = [Environment]::GetEnvironmentVariable($name, 'Process') }
+foreach ($name in @('QT_PLUGIN_PATH','QT_QPA_GENERIC_PLUGINS','GPVST3_DATA_DIR','GPVST3_ENABLE_P2_HOOK','GPVST3_ENABLE_P2_EFFECT','GPVST3_RUNTIME_VST3','TEMP','TMP')) { $saved[$name] = [Environment]::GetEnvironmentVariable($name, 'Process') }
 $results = @()
 try {
     Remove-Item Env:QT_PLUGIN_PATH,Env:QT_QPA_GENERIC_PLUGINS -ErrorAction SilentlyContinue
     $env:GPVST3_DATA_DIR = $run
+    if ($RequireP2Hook) { $env:GPVST3_ENABLE_P2_HOOK = '1' } else { Remove-Item Env:GPVST3_ENABLE_P2_HOOK -ErrorAction SilentlyContinue }
+    Remove-Item Env:GPVST3_ENABLE_P2_EFFECT,Env:GPVST3_RUNTIME_VST3 -ErrorAction SilentlyContinue
     $env:TEMP = $run
     $env:TMP = $run
     foreach ($variant in @('direct','shortcut')) {
@@ -66,12 +69,25 @@ try {
                 if (-not $status.vst3_host -or $status.vst3_host.process_probes_passed -lt 1) {
                     throw "VST3 process probe did not pass for $variant."
                 }
-                if (-not $status.gp_hook -or -not $status.gp_hook.observation_only -or
-                    $status.gp_hook.installed) {
+                if (-not $status.gp_hook) { throw "Missing P2 GP hook status for $variant." }
+                if ($RequireP2Hook) {
+                    if (-not $status.gp_hook.enabled -or -not $status.gp_hook.installed -or
+                        -not $status.gp_hook.observation_only) {
+                        throw "Runtime P2 GP observation hook did not install for $variant."
+                    }
+                } elseif (-not $status.gp_hook.observation_only -or $status.gp_hook.installed) {
                     throw "Unexpected P2 GP hook status for $variant."
                 }
             }
-            $results += [pscustomobject]@{variant=$variant;pid=$process.Id;status=$status.status;host_supported=$status.host_supported;bypassed=$status.bypassed;vst3_host=$status.vst3_host;audio_adapter=$status.audio_adapter;gp_hook=$status.gp_hook}
+            $observationPath = Join-Path $run 'p2-observation.json'
+            $observation = $null
+            if ($RequireP2Hook) {
+                $observationDeadline = [DateTime]::UtcNow.AddSeconds(3)
+                while (-not (Test-Path -LiteralPath $observationPath) -and [DateTime]::UtcNow -lt $observationDeadline) { Start-Sleep -Milliseconds 50 }
+                if (-not (Test-Path -LiteralPath $observationPath)) { throw "P2 observation snapshot was not written for $variant." }
+                $observation = Get-Content -LiteralPath $observationPath -Raw | ConvertFrom-Json
+            }
+            $results += [pscustomobject]@{variant=$variant;pid=$process.Id;status=$status.status;host_supported=$status.host_supported;bypassed=$status.bypassed;vst3_host=$status.vst3_host;audio_adapter=$status.audio_adapter;gp_hook=$status.gp_hook;p2_observation=$observation}
         } finally {
             if (-not $process.HasExited) { Stop-Process -Id $process.Id -Force; $process.WaitForExit(5000) | Out-Null }
             $process.Dispose()

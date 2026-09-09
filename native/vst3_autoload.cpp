@@ -4,7 +4,23 @@
 #include <QtGui/QImageIOPlugin>
 
 #include "modules/bootstrap.h"
+#include "modules/gp_hook.h"
 #include "modules/state_manager.h"
+
+namespace {
+
+void writeObservation() {
+    gpvst3::state::writeRealtimeObservation(gpvst3::bootstrap::hookSnapshot());
+    if (auto *application = QCoreApplication::instance())
+        QTimer::singleShot(250, application, &writeObservation);
+}
+
+void stopObservation() {
+    gpvst3::state::writeRealtimeObservation(gpvst3::bootstrap::hookSnapshot());
+    gpvst3::hook::shutdown();
+}
+
+}
 
 class GuitarProVst3Autoload final : public QImageIOPlugin {
     Q_OBJECT
@@ -16,8 +32,14 @@ public:
             return;
         if (qApp->property("gpvst3P0Scheduled").toBool()) return;
         qApp->setProperty("gpvst3P0Scheduled", true);
-        QTimer::singleShot(0, qApp, [] {
-            gpvst3::state::writeStatus(gpvst3::bootstrap::initialize());
+        auto *application = qApp;
+        QTimer::singleShot(0, application, [application] {
+            const auto status = gpvst3::bootstrap::initialize();
+            gpvst3::state::writeStatus(status);
+            const auto hook = status.value("gp_hook").toObject();
+            if (!hook.value("enabled").toBool()) return;
+            writeObservation();
+            qAddPostRoutine(&stopObservation);
         });
     }
 

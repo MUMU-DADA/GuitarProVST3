@@ -70,6 +70,7 @@ QJsonObject hookStatus(const gpvst3::hook::State &value) {
             {"export_found", entry.exportFound},
             {"call_observed", entry.callObserved},
             {"buffer_write_observed", entry.bufferWriteObserved},
+            {"call_count", static_cast<qint64>(entry.callCount)},
             {"frame_count", static_cast<qint64>(entry.frameCount)},
             {"channel_count", static_cast<qint64>(entry.channelCount)},
             {"sample_rate", entry.sampleRate},
@@ -77,9 +78,18 @@ QJsonObject hookStatus(const gpvst3::hook::State &value) {
     };
     return QJsonObject{
         {"installed", value.installed},
+        {"enabled", value.enabled},
         {"host_supported", value.hostSupported},
         {"observation_only", value.observationOnly},
         {"audio_buffer_accessors_found", value.audioBufferAccessorsFound},
+        {"effects_chain_inside_master", value.effectsChainInsideMaster},
+        {"runtime_effect_enabled", value.runtimeEffectEnabled},
+        {"runtime_processor_ready", value.runtimeProcessorReady},
+        {"runtime_process_observed", value.runtimeProcessObserved},
+        {"runtime_buffer_write_observed", value.runtimeBufferWriteObserved},
+        {"runtime_process_count", static_cast<qint64>(value.runtimeProcessCount)},
+        {"runtime_effect_name", QString::fromUtf8(value.runtimeEffectName.data())},
+        {"runtime_effect_error", QString::fromUtf8(value.runtimeEffectError.data())},
         {"reason", QString::fromUtf8(value.reason.data())},
         {"master_process", entryStatus(value.masterProcess)},
         {"effects_chain_processDSP", entryStatus(value.effectsChainProcessDsp)}};
@@ -94,7 +104,7 @@ QJsonObject initialize() {
     const auto hook = hook::prepare(host);
     const auto vst3 = vst3::prepare(host.supported);
     effects::Chain chain;
-    chain.setBypassed(true);
+    chain.setBypassed(!hook.runtimeProcessorReady);
 
     QJsonObject fileResults;
     for (auto it = host.files.cbegin(); it != host.files.cend(); ++it)
@@ -119,8 +129,15 @@ QJsonObject initialize() {
         {"gp_hook", hookStatus(hook)},
         {"qt_ui", ui::state()},
         {"state_manager", "status_only_p0"},
-        {"reason", host.supported ? "P0 bootstrap complete; processing remains bypassed" : "Host files do not match the P0 lock"}
+        {"reason", hook.runtimeProcessorReady
+                       ? "P2 runtime VST3 effect processing enabled by environment switch"
+                       : (host.supported ? "P0 bootstrap complete; processing remains bypassed"
+                                          : "Host files do not match the P0 lock")}
     };
+}
+
+QJsonObject hookSnapshot() {
+    return hookStatus(hook::snapshot());
 }
 
 }

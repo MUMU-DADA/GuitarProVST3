@@ -5,5 +5,6 @@
 namespace gpvst3::bootstrap {
 
 QJsonObject initialize();
+QJsonObject hookSnapshot();
 
 }

@@ -1,22 +1,23 @@
 # P2 实现记录：GP 音频适配和实时接入
 
-P2 已完成可在当前证据范围内安全验证的部分：内部块结构、planar `float32` 适配、预分配 scratch、VST3 `process()` 探针和 GP 私有入口只读观测。私有 ABI 的运行时改写仍保持关闭，因为预研没有确认 `IAudioBuffer` 对象布局、调用线程、所有权和后续写回顺序。
+P2 已完成内部音频适配、VST3 实际块处理，以及针对 Guitar Pro 8.1.1.17 的受控实时处理路径。私有 ABI 入口仍由宿主哈希、导出存在性和函数 prologue 三重门控；默认不安装 hook，也不加载运行时效果器。
 
 ## 已实现
 
 - `native/modules/audio_adapter.h/.cpp`
-  - `BlockView` 同时描述外部输入、GP 生成音频和输出缓冲，以及帧数、采样率、通道数和 block size。
-  - `PlanarBuffer::prepare()` 在控制/工作线程分配输入和输出 planar 缓冲；`process()` 路径只复制既有内存，不改变容器容量。
-  - `copyToPlanar()` / `copyFromPlanar()` 负责 GP 通道指针与 VST3 planar `float32` 之间的复制。存在 generated buffer 时优先处理生成音频，否则使用 input buffer。
-  - `audio::process()` 组装单 input/output bus 的 `ProcessData`，支持总旁路并把处理结果写回输出通道。
+  - `BlockView` 描述输入、GP 生成音频、输出通道、帧数、采样率和 block size。
+  - `PlanarBuffer::prepare()` 在控制/工作线程分配 scratch；`audio::process()` 路径只复用既有容量。
+  - `copyToPlanar()` / `copyFromPlanar()` 完成 GP 通道指针与 VST3 planar `float32` 的复制，支持总旁路。
+  - `audio::process()` 组装单 input/output bus 的 `ProcessData` 并调用 `IAudioProcessor::process()`。
 - `native/modules/vst3_host.cpp`
-  - 每个已创建并进入 processing 状态的音频组件，在工作线程使用 32 帧静音块实际调用一次 VST3 `IAudioProcessor::process()`。
-  - 状态记录 `process_calls`、`process_probes_passed`、`process_probe_frames` 和失败原因；处理探针失败时不计入通过的生命周期。
+  - 在工作线程扫描已安装 VST3 bundle，完成组件初始化、`setupProcessing`、激活、state/bypass 探针和 32 帧静音 `process()` 探针。
 - `native/modules/gp_hook.h/.cpp`
-  - 仅在宿主文件哈希匹配时解析 `GPRSE.dll` 的 `Master::process`、`EffectsChain::processDSP` 和 `AMAudio.dll` 缓冲访问导出。
-  - 记录模块/导出是否存在，明确返回 `observation_only`；没有写入 GP 代码，也没有在未知 ABI 上安装 trampoline。
-- `native/test-p2.ps1`
-  - 在隔离 Guitar Pro 副本中复用 P0/P1 启动测试，检查 planar 适配器状态、真实 VST3 process 探针和 hook 只读状态。
+  - 只对锁定的 Guitar Pro 8.1.1.17 文件哈希解析 `Master::process`、`EffectsChain::processDSP` 和 `AMAudio` 缓冲访问导出。
+  - `GPVST3_ENABLE_P2_HOOK=1` 且 prologue 匹配时安装 x64 入口观测 hook，记录调用次数、线程 ID、帧数、通道数、采样率和缓冲哈希变化。
+  - 额外设置 `GPVST3_ENABLE_P2_EFFECT=1` 时，在原始 `Master::process` 调用后复用已预创建的 `ParametricOD` VST3 processor：GP `AudioBuffer` → planar `float32` → VST3 `process()` → 原 GP 通道缓冲。
+  - 运行时 processor 就绪时状态中的 `observation_only=false`；只启用 hook 时仍为 `true`。
+- `native/test-p2-runtime.ps1`
+  - 使用旁项目的原生 MCP 驱动，在隔离 Guitar Pro 副本中打开最小 RSE 曲谱并播放，读取 `p2-observation.json` 验证真实回调和处理结果。
 
 ## 验证
 
@@ -25,10 +26,19 @@ P2 已完成可在当前证据范围内安全验证的部分：内部块结构�
 ./native/test-p2.ps1
 ```
 
-当前机器的 Guitar Pro 8.1.1.17 隔离副本中，直接启动和快捷方式启动均通过。每次发现并加载 3 个 VST3 bundle，3 个音频组件的 32 帧 `process()` 探针均通过；`Master::process`、`EffectsChain::processDSP` 和音频缓冲访问导出均可解析，hook 状态为 `installed=false`、`observation_only=true`。测试证据写入被忽略的 `artifacts/` 目录。
+`test-p2.ps1` 会先执行隔离启动回归，再调用 `test-p2-runtime.ps1` 完成真实播放处理验证；也可以单独运行后者复查运行时证据。
+
+最近一次 `test-p2-runtime.ps1` 证据（写入被忽略的 `artifacts/` 目录）：
+
+- Guitar Pro 8.1.1.17 / Windows x64，隔离副本实际播放状态为 `playing=true`。
+- `Master::process` 调用 49 次，首个块为 44100 Hz、2021 帧、2 声道；宿主缓冲哈希在调用后变化。
+- `EffectsChain::processDSP` 调用 49 次。
+- `ParametricOD` processor 初始化成功并处理 49 个块，`runtime_buffer_write_observed=true`。
+- `effects_chain_inside_master=false`，两个入口的首调用线程 ID 不同；因此没有把它们写成同一调用栈或固定顺序。
 
 ## 宿主受限边界
 
-- `call_observed=false`、`buffer_write_observed=false`：现有预研材料没有提供真实播放回调的线程、`IAudioBuffer` 所有权和写回顺序证据，因此没有把函数导出存在误写成运行时接入完成。
-- 没有声明 GP 播放时已经听到效果；当前验证覆盖的是实际第三方 VST3 processor 的进程内块处理探针。
-- 外部吉他 capture buffer、播放/暂停/循环切换、设备切换、采样率和 block size 重新配置属于后续真实宿主回归，未在本阶段伪造通过。
+- 已证明的是 `Master::process` 返回后的 GP 缓冲可被 VST3 处理并写回；尚未独立 hook `AudioLayer` 最终设备回调，不能仅凭哈希变化宣称声卡最终输出或听感已验收。
+- `EffectsChain::processDSP` 的调用线程与 `Master::process` 不同，`IAudioBuffer` 的完整对象所有权、跨线程关系和后续写回顺序仍未确认。
+- `GPVST3_ENABLE_P2_EFFECT` 只用于隔离验证，当前没有产品 UI 的启用/旁路切换，也没有声明外部吉他 capture、设备切换、暂停/循环和采样率重配已完成回归。
+- 未通过宿主哈希或 prologue 检查时，hook 和运行时效果器保持关闭，插件继续默认旁路。

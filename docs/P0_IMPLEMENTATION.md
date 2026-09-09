@@ -1,6 +1,6 @@
 # P0 实现记录
 
-P0 只建立插件自动加载入口、宿主版本锁定和默认旁路状态。它不扫描 VST3、不修改 GP 音频缓冲、不安装私有 ABI hook，也不创建效果器 UI；这些工作分别属于后续阶段。
+P0 只建立插件自动加载入口、宿主版本锁定和默认旁路状态。未设置后续阶段的显式开关时，插件不扫描 VST3、不修改 GP 音频缓冲、不安装私有 ABI hook，也不创建效果器 UI。
 
 ## 已实现
 
@@ -10,7 +10,7 @@ P0 只建立插件自动加载入口、宿主版本锁定和默认旁路状态�
 - `native/build.ps1`：使用 Qt 5.15.x MSVC x64 SDK 构建插件 DLL。
 - `native/test-p0.ps1`：在隔离宿主副本中验证直接启动、快捷方式启动、默认旁路和移除恢复。
 
-插件加载后只写入状态文件（默认位于 `%LOCALAPPDATA%/GuitarProVST3/status.json`，测试时由 `GPVST3_DATA_DIR` 指定），并保持 `bypassed=true`。宿主哈希不匹配时仍保持旁路并记录 `host_unsupported`，不执行 hook。
+插件加载后只写入状态文件（默认位于 `%LOCALAPPDATA%/GuitarProVST3/status.json`，测试时由 `GPVST3_DATA_DIR` 指定），默认保持 `bypassed=true`。宿主哈希不匹配时仍保持旁路并记录 `host_unsupported`，不执行 hook。
 
 ## 验证
 

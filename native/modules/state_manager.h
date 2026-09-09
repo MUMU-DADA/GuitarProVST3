@@ -6,5 +6,6 @@ namespace gpvst3::state {
 
 QString dataDirectory();
 bool writeStatus(const QJsonObject &status);
+bool writeRealtimeObservation(const QJsonObject &hookStatus);
 
 }

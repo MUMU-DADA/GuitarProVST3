@@ -28,4 +28,17 @@ bool writeStatus(const QJsonObject &input) {
     return file.write(bytes) == bytes.size() && file.commit();
 }
 
+bool writeRealtimeObservation(const QJsonObject &hookStatus) {
+    const QDir directory(dataDirectory());
+    if (!QDir().mkpath(directory.absolutePath())) return false;
+    QSaveFile file(directory.filePath("p2-observation.json"));
+    if (!file.open(QIODevice::WriteOnly)) return false;
+    const QJsonObject status{
+        {"schema", 1},
+        {"gp_hook", hookStatus},
+        {"time", QDateTime::currentDateTimeUtc().toString(Qt::ISODate)}};
+    const QByteArray bytes = QJsonDocument(status).toJson(QJsonDocument::Indented);
+    return file.write(bytes) == bytes.size() && file.commit();
+}
+
 }
