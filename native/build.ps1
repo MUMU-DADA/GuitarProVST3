@@ -54,6 +54,7 @@ $sources = @(
     (Join-Path $PSScriptRoot 'modules/bootstrap.cpp'),
     (Join-Path $PSScriptRoot 'modules/state_manager.cpp'),
     (Join-Path $PSScriptRoot 'modules/audio_adapter.cpp'),
+    (Join-Path $PSScriptRoot 'modules/input_router.cpp'),
     (Join-Path $PSScriptRoot 'modules/effect_chain.cpp'),
     (Join-Path $PSScriptRoot 'modules/gp_hook.cpp'),
     (Join-Path $PSScriptRoot 'modules/vst3_host.cpp'),

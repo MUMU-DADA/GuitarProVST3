@@ -33,13 +33,13 @@ $shortcut.WorkingDirectory = $hostCopy
 $shortcut.Save()
 
 $saved = @{}
-foreach ($name in @('QT_PLUGIN_PATH','QT_QPA_GENERIC_PLUGINS','GPVST3_DATA_DIR','GPVST3_ENABLE_P2_HOOK','GPVST3_ENABLE_P2_EFFECT','GPVST3_RUNTIME_VST3','TEMP','TMP')) { $saved[$name] = [Environment]::GetEnvironmentVariable($name, 'Process') }
+foreach ($name in @('QT_PLUGIN_PATH','QT_QPA_GENERIC_PLUGINS','GPVST3_DATA_DIR','GPVST3_ENABLE_P2_HOOK','GPVST3_ENABLE_P2_EFFECT','GPVST3_RUNTIME_VST3','GPVST3_TOTAL_BYPASS','GPVST3_FORCE_P3_ERROR','GPVST3_ENABLE_P4_INPUT','GPVST3_P4_ROUTE','TEMP','TMP')) { $saved[$name] = [Environment]::GetEnvironmentVariable($name, 'Process') }
 $results = @()
 try {
     Remove-Item Env:QT_PLUGIN_PATH,Env:QT_QPA_GENERIC_PLUGINS -ErrorAction SilentlyContinue
     $env:GPVST3_DATA_DIR = $run
     if ($RequireP2Hook) { $env:GPVST3_ENABLE_P2_HOOK = '1' } else { Remove-Item Env:GPVST3_ENABLE_P2_HOOK -ErrorAction SilentlyContinue }
-    Remove-Item Env:GPVST3_ENABLE_P2_EFFECT,Env:GPVST3_RUNTIME_VST3 -ErrorAction SilentlyContinue
+    Remove-Item Env:GPVST3_ENABLE_P2_EFFECT,Env:GPVST3_RUNTIME_VST3,Env:GPVST3_TOTAL_BYPASS,Env:GPVST3_FORCE_P3_ERROR,Env:GPVST3_ENABLE_P4_INPUT,Env:GPVST3_P4_ROUTE -ErrorAction SilentlyContinue
     $env:TEMP = $run
     $env:TMP = $run
     foreach ($variant in @('direct','shortcut')) {

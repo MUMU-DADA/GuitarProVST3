@@ -4,7 +4,10 @@ param(
     [string]$PluginPath = '',
     [switch]$KeepHost,
     [switch]$ExpectP3Fallback,
-    [switch]$ExpectP3TotalBypass
+    [switch]$ExpectP3TotalBypass,
+    [switch]$EnableP4,
+    [ValidateSet('input_insert','bus_mix')]
+    [string]$P4Route = 'bus_mix'
 )
 
 $ErrorActionPreference = 'Stop'
@@ -47,7 +50,7 @@ try {
 } finally { $archive.Dispose() }
 
 $saved = @{}
-foreach ($name in @('QT_PLUGIN_PATH','QT_QPA_GENERIC_PLUGINS','GPVST3_DATA_DIR','GPVST3_ENABLE_P2_HOOK','GPVST3_ENABLE_P2_EFFECT','GPVST3_RUNTIME_VST3','GPVST3_TOTAL_BYPASS','GPVST3_FORCE_P3_ERROR','GPMCP_DATA_DIR','GPMCP_SESSION_FILE','GPMCP_BACKGROUND','GPMCP_DEVELOPMENT','TEMP','TMP')) {
+foreach ($name in @('QT_PLUGIN_PATH','QT_QPA_GENERIC_PLUGINS','GPVST3_DATA_DIR','GPVST3_ENABLE_P2_HOOK','GPVST3_ENABLE_P2_EFFECT','GPVST3_RUNTIME_VST3','GPVST3_TOTAL_BYPASS','GPVST3_FORCE_P3_ERROR','GPVST3_ENABLE_P4_INPUT','GPVST3_P4_ROUTE','GPMCP_DATA_DIR','GPMCP_SESSION_FILE','GPMCP_BACKGROUND','GPMCP_DEVELOPMENT','TEMP','TMP')) {
     $saved[$name] = [Environment]::GetEnvironmentVariable($name, 'Process')
 }
 $process = $null
@@ -57,6 +60,12 @@ try {
     $env:GPVST3_DATA_DIR = $run
     $env:GPVST3_ENABLE_P2_HOOK = '1'
     $env:GPVST3_ENABLE_P2_EFFECT = '1'
+    if ($EnableP4) {
+        $env:GPVST3_ENABLE_P4_INPUT = '1'
+        $env:GPVST3_P4_ROUTE = $P4Route
+    } else {
+        Remove-Item Env:GPVST3_ENABLE_P4_INPUT,Env:GPVST3_P4_ROUTE -ErrorAction SilentlyContinue
+    }
     if ($ExpectP3Fallback) { $env:GPVST3_FORCE_P3_ERROR = '1' }
     else { Remove-Item Env:GPVST3_FORCE_P3_ERROR -ErrorAction SilentlyContinue }
     if ($ExpectP3TotalBypass) { $env:GPVST3_TOTAL_BYPASS = '1' }
@@ -112,6 +121,12 @@ try {
     }
     if (-not $hook.runtime_effect_enabled -or -not $hook.runtime_processor_ready) {
         throw "P2 runtime VST3 processor was not ready: $($hook | ConvertTo-Json -Depth 8 -Compress)"
+    }
+    if ($EnableP4) {
+        if (-not $hook.input_route_enabled -or -not $hook.input_processor_ready -or
+            $hook.input_route -ne $P4Route -or -not $hook.audio_layer_input_level_accessor_found) {
+            throw "P4 input route/AudioLayer level monitor was not ready: $($hook | ConvertTo-Json -Depth 8 -Compress)"
+        }
     }
     if ($ExpectP3Fallback) {
         if (-not $hook.chain_faulted -or -not $hook.total_bypass -or

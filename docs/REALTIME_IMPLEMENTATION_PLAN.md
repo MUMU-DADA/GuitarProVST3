@@ -62,10 +62,13 @@ GP 继续负责音频设备、输入输出、采样率和流生命周期。插�
 
 ### P4：外部吉他输入
 
-- 在 `AudioLayer` / PortAudio capture 路径中定位真实输入缓冲。
-- 先加入输入电平监控，再实现外部吉他 input insert。
-- 支持 GP 回放与外部输入分别处理，以及混合后进入总线效果器。
-- 验收：输入监听稳定，无明显反馈；设备切换、暂停和恢复后链状态正确。
+**状态：已完成 capture 适配层、输入电平监控、输入插入/总线混音路由和隔离回归（2026-09-09）**。真实 `PortAudio` capture 指针的私有回调 ABI 尚无稳定导出，真实监听和设备回归仍为宿主受限项；实现与验证证据见 [P4 实现记录](P4_IMPLEMENTATION.md)。
+
+- [x] 新增固定预分配 capture tap，读取 `AudioLayer::inputLevel/isRunning/bufferSize` 并输出原子输入电平快照。
+- [x] 实现外部吉他 `input_insert`，处理失败时直通并记录旁路/错误计数。
+- [x] 实现 GP 回放与外部输入分别处理，以及混合后进入 `bus_mix` 总线效果器。
+- [ ] `PortAudioAudioLayerImpl::Impl::streamCallback` 的真实 capture buffer 所有权和最终设备写回：当前只有字符串/调用证据，待宿主 ABI 证据补齐。
+- [ ] 真实宿主中的输入监听稳定性、反馈、设备切换、暂停/恢复听感：当前未运行，标记为宿主受限。
 
 ### P5：Qt 界面和状态保存
 

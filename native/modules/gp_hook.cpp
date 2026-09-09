@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cmath>
 #include <cstdlib>
 #include <cstdint>
 #include <cstring>
@@ -33,6 +34,10 @@ constexpr char kFrameCount[] = "?frameCount@AudioBuffer@audio@am@@UEBA_JXZ";
 constexpr char kChannelCount[] = "?channelCount@AudioBuffer@audio@am@@UEBAIXZ";
 constexpr char kAudioCoreInstance[] = "?Instance@AudioCore@audio@am@@SAAEAV123@XZ";
 constexpr char kSampleRate[] = "?samplingRate@AudioCore@audio@am@@QEBAHXZ";
+constexpr char kAudioLayerInstance[] = "?instance@AudioLayer@audio@am@@SAAEAV123@XZ";
+constexpr char kAudioLayerInputLevel[] = "?inputLevel@AudioLayer@audio@am@@QEBAMXZ";
+constexpr char kAudioLayerIsRunning[] = "?isRunning@AudioLayer@audio@am@@QEBA_NXZ";
+constexpr char kAudioLayerBufferSize[] = "?bufferSize@AudioLayer@audio@am@@QEBAHXZ";
 
 // The locked 8.1.1.17 entry points both begin with three complete, position
 // independent mov instructions. Refuse installation if memory differs.
@@ -50,6 +55,10 @@ using FrameCountFn = std::size_t (*)(const void *);
 using ChannelCountFn = unsigned (*)(const void *);
 using AudioCoreInstanceFn = void *(*)();
 using SampleRateFn = int (*)(const void *);
+using AudioLayerInstanceFn = void *(*)();
+using AudioLayerInputLevelFn = float (*)(const void *);
+using AudioLayerIsRunningFn = bool (*)(const void *);
+using AudioLayerBufferSizeFn = int (*)(const void *);
 
 namespace fs = std::filesystem;
 using Steinberg::FUnknownPtr;
@@ -309,11 +318,24 @@ struct Runtime {
     std::atomic<std::size_t> reconfigurationPassed{0};
     std::atomic<std::size_t> reconfigurationFailed{0};
     std::atomic<bool> reconfigurationValidated{false};
+    RuntimeEffect inputEffect;
+    input::Router inputRouter;
+    AudioLayerInputLevelFn audioLayerInputLevel = nullptr;
+    AudioLayerIsRunningFn audioLayerIsRunning = nullptr;
+    AudioLayerBufferSizeFn audioLayerBufferSize = nullptr;
+    void *audioLayer = nullptr;
+    std::atomic<float> hostInputLevel{0.0F};
+    std::atomic<bool> hostInputLevelObserved{false};
+    std::atomic<bool> hostStreamRunning{false};
+    std::atomic<std::size_t> hostBufferSize{0};
+    std::atomic<bool> inputCapturePathLocated{false};
 };
 
 Runtime g_runtime;
 State g_initial;
 thread_local bool g_inMasterHook = false;
+
+void updateAudioLayerState() noexcept;
 
 std::uint64_t bufferHash(const void *buffer) noexcept {
     if (!buffer || !g_runtime.rawData || !g_runtime.frameCount || !g_runtime.channelCount) return 0;
@@ -350,6 +372,7 @@ void masterProcessHook(void *self, void *buffer, void *ticks, void *musicians,
             g_runtime.rate.store(g_runtime.sampleRate(g_runtime.audioCore), std::memory_order_relaxed);
     }
     original(self, buffer, ticks, musicians, backingTrack);
+    updateAudioLayerState();
     if (g_runtime.rawData && g_runtime.frameCount && g_runtime.channelCount) {
         const auto &raw = g_runtime.rawData(buffer);
         const auto frames = g_runtime.frameCount(buffer);
@@ -396,6 +419,62 @@ bool configureRuntimeChain() noexcept {
     const char *bypass = std::getenv("GPVST3_TOTAL_BYPASS");
     g_runtime.chain.setBypassed(bypass && std::strcmp(bypass, "1") == 0);
     return true;
+}
+
+input::Route configuredInputRoute() noexcept {
+    const char *configured = std::getenv("GPVST3_P4_ROUTE");
+    if (!configured || !*configured || std::strcmp(configured, "disabled") == 0)
+        return input::Route::Disabled;
+    if (std::strcmp(configured, "input_insert") == 0)
+        return input::Route::InputInsert;
+    if (std::strcmp(configured, "bus_mix") == 0)
+        return input::Route::BusMix;
+    return input::Route::Disabled;
+}
+
+void updateAudioLayerState() noexcept {
+    if (!g_runtime.audioLayer) return;
+    if (g_runtime.audioLayerInputLevel) {
+        const auto level = g_runtime.audioLayerInputLevel(g_runtime.audioLayer);
+        if (std::isfinite(level)) {
+            g_runtime.hostInputLevel.store(level, std::memory_order_relaxed);
+            g_runtime.hostInputLevelObserved.store(true, std::memory_order_release);
+        }
+    }
+    if (g_runtime.audioLayerIsRunning) {
+        const auto running = g_runtime.audioLayerIsRunning(g_runtime.audioLayer);
+        g_runtime.hostStreamRunning.store(running, std::memory_order_release);
+        g_runtime.inputRouter.setStreamRunning(running);
+    }
+    if (g_runtime.audioLayerBufferSize) {
+        const auto frames = g_runtime.audioLayerBufferSize(g_runtime.audioLayer);
+        if (frames > 0)
+            g_runtime.hostBufferSize.store(static_cast<std::size_t>(frames),
+                                           std::memory_order_relaxed);
+    }
+}
+
+bool configureInputRouter() noexcept {
+    const auto route = configuredInputRoute();
+    g_runtime.inputRouter.setRoute(route);
+    g_runtime.inputRouter.setEnabled(false);
+    g_runtime.inputRouter.setStreamRunning(true);
+    g_runtime.inputRouter.setProcessor({});
+    g_runtime.inputEffect.shutdown();
+    if (route == input::Route::Disabled) return true;
+    if (!g_runtime.inputRouter.prepare(2, 16384) ||
+        !g_runtime.inputEffect.initialize(44100.0, 16384))
+        return false;
+    g_runtime.inputRouter.setProcessor(
+        {&g_runtime.inputEffect, &RuntimeEffect::processCallback});
+    g_runtime.inputRouter.setEnabled(true);
+    updateAudioLayerState();
+    return true;
+}
+
+bool inputFeatureEnabled() noexcept {
+    const char *enabled = std::getenv("GPVST3_ENABLE_P4_INPUT");
+    return enabled && std::strcmp(enabled, "1") == 0;
 }
 
 bool validateReconfiguration() noexcept {
@@ -515,6 +594,19 @@ State prepare(const host::Verification &verification) noexcept {
     result.audioBufferAccessorsFound =
         observe(amaudio, kRawData).exportFound && observe(amaudio, kFrameCount).exportFound &&
         observe(amaudio, kChannelCount).exportFound;
+    result.audioLayerInputLevelAccessorFound =
+        observe(amaudio, kAudioLayerInstance).exportFound &&
+        observe(amaudio, kAudioLayerInputLevel).exportFound;
+    g_runtime.audioLayerInputLevel =
+        reinterpret_cast<AudioLayerInputLevelFn>(GetProcAddress(amaudio, kAudioLayerInputLevel));
+    g_runtime.audioLayerIsRunning =
+        reinterpret_cast<AudioLayerIsRunningFn>(GetProcAddress(amaudio, kAudioLayerIsRunning));
+    g_runtime.audioLayerBufferSize =
+        reinterpret_cast<AudioLayerBufferSizeFn>(GetProcAddress(amaudio, kAudioLayerBufferSize));
+    const auto audioLayerInstance =
+        reinterpret_cast<AudioLayerInstanceFn>(GetProcAddress(amaudio, kAudioLayerInstance));
+    if (audioLayerInstance) g_runtime.audioLayer = audioLayerInstance();
+    updateAudioLayerState();
     const char *enabled = std::getenv("GPVST3_ENABLE_P2_HOOK");
     result.enabled = enabled && std::strcmp(enabled, "1") == 0;
     const char *effectEnabled = std::getenv("GPVST3_ENABLE_P2_EFFECT");
@@ -553,6 +645,12 @@ State prepare(const host::Verification &verification) noexcept {
             g_runtime.effects[0].shutdown();
             g_runtime.effects[1].shutdown();
         }
+        if (result.installed && inputFeatureEnabled()) configureInputRouter();
+        else {
+            g_runtime.inputRouter.setEnabled(false);
+            g_runtime.inputRouter.setRoute(input::Route::Disabled);
+            g_runtime.inputEffect.shutdown();
+        }
         result.reason = result.installed ? "runtime_observation_active" : "hook_install_failed";
     }
     g_initial = result;
@@ -561,7 +659,9 @@ State prepare(const host::Verification &verification) noexcept {
 
 State snapshot() noexcept {
     State result = g_initial;
+    updateAudioLayerState();
     const auto chain = g_runtime.chain.snapshot();
+    const auto input = g_runtime.inputRouter.snapshot();
     result.installed = g_runtime.master.installed && g_runtime.dsp.installed;
     result.masterProcess.callCount = g_runtime.masterCalls.load(std::memory_order_relaxed);
     result.masterProcess.callObserved = result.masterProcess.callCount != 0;
@@ -601,16 +701,58 @@ State snapshot() noexcept {
     result.reconfigurationPassed = g_runtime.reconfigurationPassed.load(std::memory_order_acquire);
     result.reconfigurationFailed = g_runtime.reconfigurationFailed.load(std::memory_order_acquire);
     result.reconfigurationValidated = g_runtime.reconfigurationValidated.load(std::memory_order_acquire);
+    result.audioLayerInputLevelObserved =
+        g_runtime.hostInputLevelObserved.load(std::memory_order_acquire);
+    result.audioLayerStreamRunning = g_runtime.hostStreamRunning.load(std::memory_order_acquire);
+    result.audioLayerBufferSize = g_runtime.hostBufferSize.load(std::memory_order_relaxed);
+    result.inputCapturePathLocated =
+        g_runtime.inputCapturePathLocated.load(std::memory_order_acquire);
+    result.inputCaptureObserved = input.captureObserved;
+    result.inputRouteEnabled = input.enabled;
+    result.inputProcessorReady = input.enabled && g_runtime.inputEffect.ready.load(std::memory_order_acquire);
+    result.inputRoute = input::routeName(input.route);
+    if (input.route == input::Route::Disabled)
+        result.inputRouteReason = "p4_route_disabled";
+    else if (!result.inputProcessorReady)
+        result.inputRouteReason = "p4_input_processor_unavailable";
+    else if (!result.inputCapturePathLocated)
+        result.inputRouteReason = "p4_capture_tap_unresolved";
+    else if (!input.captureObserved)
+        result.inputRouteReason = "p4_capture_tap_waiting";
+    else
+        result.inputRouteReason = "p4_capture_tap_active";
+    result.inputCaptureBlocks = input.captureBlocks;
+    result.inputProcessedBlocks = input.inputProcessedBlocks;
+    result.inputBusMixedBlocks = input.busMixedBlocks;
+    result.inputBypassBlocks = input.bypassBlocks;
+    result.inputErrorBlocks = input.errorBlocks;
+    result.inputDroppedBlocks = input.droppedBlocks;
+    result.inputFrameCount = input.frameCount;
+    result.inputChannelCount = input.channelCount;
+    result.inputSampleRate = input.sampleRate;
+    result.inputLastPeak = input.lastPeak;
+    result.inputMaxPeak = input.maxPeak;
+    result.inputLastRms = input.lastRms;
     return result;
 }
 
 void shutdown() noexcept {
     g_runtime.chain.setBypassed(true);
     g_runtime.chain.deactivate();
+    g_runtime.inputRouter.setEnabled(false);
+    g_runtime.inputRouter.setRoute(input::Route::Disabled);
+    g_runtime.inputEffect.shutdown();
     remove(g_runtime.dsp);
     remove(g_runtime.master);
     g_runtime.effects[0].shutdown();
     g_runtime.effects[1].shutdown();
+}
+
+bool processExternalInput(const input::CaptureView &capture,
+                          const input::GeneratedView &generated,
+                          const input::OutputView &output) noexcept {
+    g_runtime.inputCapturePathLocated.store(true, std::memory_order_release);
+    return g_runtime.inputRouter.process(capture, generated, output).completed;
 }
 
 } // namespace gpvst3::hook
