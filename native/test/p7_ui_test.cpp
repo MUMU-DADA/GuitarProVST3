@@ -76,7 +76,20 @@ int main(int argc, char **argv) {
     QCoreApplication::processEvents(QEventLoop::AllEvents, 50);
     if (!check(soundHost.findChild<QPushButton *>("gpvst3SoundEffectChainButton") != nullptr,
                "entry returns after sidebar rebuild")) return 1;
+    auto *entry = soundHost.findChild<QPushButton *>("gpvst3SoundEffectChainButton");
+    entry->click();
+    QCoreApplication::processEvents();
+    auto *opened = qApp->property("gpvst3P5Panel").value<QWidget *>();
+    if (!check(opened != nullptr && opened->isVisible(),
+               "entry opens the existing panel")) return 1;
     panel->close();
+    QCoreApplication::processEvents(QEventLoop::AllEvents, 50);
+    entry->click();
+    QCoreApplication::processEvents(QEventLoop::AllEvents, 50);
+    auto *reopened = qApp->property("gpvst3P5Panel").value<QWidget *>();
+    if (!check(reopened != nullptr && reopened->isVisible(),
+               "entry reopens the panel after close")) return 1;
+    reopened->close();
     std::cout << "PASS: P7 catalog UI, enabled semantics and host-limited editor evidence.\n";
     return 0;
 }

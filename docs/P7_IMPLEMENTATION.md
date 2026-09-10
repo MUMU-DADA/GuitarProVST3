@@ -9,6 +9,7 @@ P7 已加入自动 VST3 清单、二态 sidecar 语义和最小清单 UI；真�
 - `native/modules/state_manager.cpp` 继续使用 schema 1 和 `QSaveFile`，读取旧 `bypass` 时迁移为 `enabled = !bypass`，写入时同时保留兼容字段；新 UI 只使用 `enabled`。
 - `native/modules/qt_ui.cpp` 增加 P7 清单面板：只显示兼容插件名称和复选框，重名附厂商；新发现插件默认未选中；每次勾选自动保存，名称点击对未启用项无效，并对当前未验证的原生 editor ABI 显示 `host_limited`。
 - 启动时不再自动显示 P7 面板。入口按钮会持续注入右侧“音源”区域；曲谱、轨道或音源侧栏重建后会自动补回。若宿主没有可识别的音源容器，则在主窗口菜单提供“VST3 效果器”入口。
+- 入口按钮和菜单项现在通过面板管理函数重新获取窗口，不再捕获已关闭面板的悬空指针；面板关闭后再次点击入口会重新创建并聚焦面板。
 - `native/test/test-p7-ui.ps1` 和 `native/test/test-p7.ps1` 覆盖清单 UI、`checked = enabled`、旧旁路迁移、标准目录清单、宿主文件 SHA-256/PE x64 记录和安全边界。
 
 ## 验证证据

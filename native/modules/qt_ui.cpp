@@ -474,7 +474,13 @@ void setRealtimeBypassControl(RealtimeBypassControl control) noexcept {
 void setVst3Catalog(const QJsonArray &catalog) { g_vst3Catalog = catalog; }
 
 void showEffectChainPanel() {
-    if (!qApp || qApp->property("gpvst3P5Panel").value<QWidget *>()) return;
+    if (!qApp) return;
+    if (auto *existing = qApp->property("gpvst3P5Panel").value<QWidget *>()) {
+        existing->show();
+        existing->raise();
+        existing->activateWindow();
+        return;
+    }
     QJsonObject chain;
     state::loadChain(chain);
     bool legacy = false;
@@ -507,8 +513,8 @@ void showEffectChainPanel() {
             button->setObjectName(QStringLiteral("gpvst3SoundEffectChainButton"));
             button->setToolTip(QStringLiteral("VST3 效果器"));
             soundHost->layout()->addWidget(button);
-            QObject::connect(button, &QPushButton::clicked, button, [panel] {
-                panel->show(); panel->raise(); panel->activateWindow();
+            QObject::connect(button, &QPushButton::clicked, button, [] {
+                showEffectChainPanel();
             });
         }
         bool dockReady = timer->property("dockReady").toBool();
@@ -548,8 +554,8 @@ void showEffectChainPanel() {
                 if (!action) {
                     action = window->menuBar()->addAction(QStringLiteral("VST3 效果器"));
                     action->setObjectName(QStringLiteral("gpvst3P7EffectChainAction"));
-                    QObject::connect(action, &QAction::triggered, action, [panel] {
-                        panel->show(); panel->raise(); panel->activateWindow();
+                    QObject::connect(action, &QAction::triggered, action, [] {
+                        showEffectChainPanel();
                     });
                 }
             }
