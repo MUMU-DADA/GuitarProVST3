@@ -55,6 +55,8 @@ struct CatalogEntry {
     int recognitionAttempts = 0;
     std::string recognitionError;
     long long recognitionRetryAfter = 0;
+    long long recognitionDeadlineAt = 0;
+    std::string recognitionIgnoredReason;
 };
 
 struct State {
@@ -90,6 +92,9 @@ struct State {
     int recognitionAttempted = 0;
     int recognitionCompleted = 0;
     int recognitionFailed = 0;
+    int recognitionTimedOut = 0;
+    int recognitionWorkersStarted = 0;
+    int recognitionWorkersDetached = 0;
     std::string recognitionCurrentModule;
     std::string recognitionStatus = "idle";
 };

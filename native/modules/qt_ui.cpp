@@ -14,12 +14,16 @@
 #include <functional>
 #include <QtWidgets/QAbstractItemView>
 #include <QtWidgets/QAbstractButton>
+#include <QtWidgets/QBoxLayout>
 #include <QtWidgets/QApplication>
 #include <QtWidgets/QCheckBox>
 #include <QtGui/QCloseEvent>
+#include <QtGui/QFontMetrics>
+#include <QtGui/QResizeEvent>
 #include <QtWidgets/QAction>
 #include <QtWidgets/QFileDialog>
 #include <QtWidgets/QFormLayout>
+#include <QtWidgets/QFrame>
 #include <QtWidgets/QHBoxLayout>
 #include <QtWidgets/QHeaderView>
 #include <QtWidgets/QLabel>
@@ -56,6 +60,8 @@ void saveCurrentRuntimeState();
 QString g_vst3ScanState = QStringLiteral("pending");
 class P7Panel;
 P7Panel *g_p7Panel = nullptr;
+QPointer<QTimer> g_panelAttachTimer;
+bool g_panelUsesP7 = true;
 
 constexpr int kPathRole = Qt::UserRole;
 constexpr int kUidRole = Qt::UserRole + 1;
@@ -366,6 +372,36 @@ NativeEditorWindow *editorWindow() {
     return g_editorWindow;
 }
 
+class ElidedButton final : public QPushButton {
+public:
+    explicit ElidedButton(QWidget *parent = nullptr) : QPushButton(parent) {
+        setFlat(true);
+        setCursor(Qt::PointingHandCursor);
+        setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Preferred);
+        setMinimumWidth(24);
+        setStyleSheet(QStringLiteral("text-align: left; padding-left: 2px; padding-right: 2px;"));
+    }
+
+    void setFullText(const QString &value) {
+        fullText_ = value;
+        setToolTip(value);
+        updateElidedText();
+    }
+
+protected:
+    void resizeEvent(QResizeEvent *event) override {
+        QPushButton::resizeEvent(event);
+        updateElidedText();
+    }
+
+private:
+    void updateElidedText() {
+        const auto width = qMax(1, this->width() - 8);
+        setText(QFontMetrics(font()).elidedText(fullText_, Qt::ElideRight, width));
+    }
+    QString fullText_;
+};
+
 class P7Panel final : public QWidget {
 public:
     P7Panel() {
@@ -373,6 +409,7 @@ public:
         setAttribute(Qt::WA_DeleteOnClose);
         setWindowTitle(QStringLiteral("音源 · VST3 效果器"));
         setSizePolicy(QSizePolicy::Preferred, QSizePolicy::Preferred);
+        setMinimumWidth(240);
         resize(420, 360);
         auto *root = new QVBoxLayout(this);
         auto *heading = new QHBoxLayout;
@@ -386,7 +423,9 @@ public:
         root->addLayout(heading);
         scopeTabs_ = new QTabWidget(this);
         auto *trackPage = new QWidget(scopeTabs_);
+        trackPage->setObjectName(QStringLiteral("gpvst3TrackScopePage"));
         auto *trackLayout = new QVBoxLayout(trackPage);
+        trackLayout->setContentsMargins(4, 4, 4, 4);
         const auto trackNumber = qEnvironmentVariable("GPVST3_TRACK");
         auto *trackContext = new QLabel(trackNumber.isEmpty()
             ? QStringLiteral("当前音轨：无法确认当前音轨")
@@ -394,6 +433,11 @@ public:
         trackContext->setObjectName(QStringLiteral("gpvst3TrackContext"));
         trackLayout->addWidget(trackContext);
         trackLayout->addWidget(new QLabel(QStringLiteral("正在使用（从上到下为效果顺序）"), trackPage));
+        auto *trackDivider = new QFrame(trackPage);
+        trackDivider->setObjectName(QStringLiteral("gpvst3TrackScopeDivider"));
+        trackDivider->setFrameShape(QFrame::HLine);
+        trackDivider->setFrameShadow(QFrame::Sunken);
+        trackLayout->addWidget(trackDivider);
         list_ = new QListWidget(trackPage);
         list_->setObjectName(QStringLiteral("gpvst3TrackChainList"));
         list_->setSelectionMode(QAbstractItemView::SingleSelection);
@@ -407,8 +451,15 @@ public:
         trackLayout->addWidget(availableList_, 1);
         scopeTabs_->addTab(trackPage, QStringLiteral("当前音轨"));
         auto *globalPage = new QWidget(scopeTabs_);
+        globalPage->setObjectName(QStringLiteral("gpvst3GlobalScopePage"));
         auto *globalLayout = new QVBoxLayout(globalPage);
+        globalLayout->setContentsMargins(4, 4, 4, 4);
         globalLayout->addWidget(new QLabel(QStringLiteral("正在使用（从上到下为效果顺序）"), globalPage));
+        auto *globalDivider = new QFrame(globalPage);
+        globalDivider->setObjectName(QStringLiteral("gpvst3GlobalScopeDivider"));
+        globalDivider->setFrameShape(QFrame::HLine);
+        globalDivider->setFrameShadow(QFrame::Sunken);
+        globalLayout->addWidget(globalDivider);
         globalList_ = new QListWidget(globalPage);
         globalList_->setObjectName(QStringLiteral("gpvst3GlobalChainList"));
         globalList_->setSelectionMode(QAbstractItemView::SingleSelection);
@@ -570,21 +621,26 @@ private:
         QHash<QString, int> counts;
         for (const auto &value : g_vst3Catalog) {
             const auto entry = value.toObject();
-            if (entry.value("identified").toBool() || entry.value("compatible").toBool())
+            if ((entry.value("identified").toBool() || entry.value("compatible").toBool()) &&
+                !entry.value("class_id").toString().isEmpty() &&
+                entry.value("recognition_status").toString() != QStringLiteral("failed") &&
+                entry.value("recognition_status").toString() != QStringLiteral("timeout"))
                 counts[entry.value("name").toString()]++;
         }
         QSet<QString> listed;
         std::vector<QJsonValue> catalogEffects;
+        QJsonArray preservedMissing;
         for (const auto &value : g_vst3Catalog) {
             const auto entry = value.toObject();
-            const bool identified = entry.value("identified").toBool() || entry.value("compatible").toBool();
-            if (!identified && !entry.value("class_id").toString().isEmpty()) continue;
-            bool savedModule = false;
-            for (const auto &value : saved) {
-                const auto item = value.toObject();
-                savedModule |= item.value("module") == entry.value("module") && !item.value("class_id").toString().isEmpty();
-            }
-            if (!identified && savedModule) continue;
+            const auto status = entry.value("recognition_status").toString();
+            // Pending, failed and timed-out bundles remain in the cache for
+            // diagnostics, but never become an interactive row in either
+            // scope. A saved desired_enabled record is retained in sidecar
+            // and will be reconciled when a later scan reaches ready.
+            const bool identified = (entry.value("identified").toBool() || entry.value("compatible").toBool()) &&
+                !entry.value("class_id").toString().isEmpty() &&
+                status != QStringLiteral("failed") && status != QStringLiteral("timeout");
+            if (!identified) continue;
             QJsonObject effect = savedRows.contains(entry.value("module").toString() +
                                                    QStringLiteral("\n") + entry.value("class_id").toString())
                                      ? saved.at(savedRows.value(entry.value("module").toString() +
@@ -607,10 +663,11 @@ private:
         // Saved identities and opaque state survive incomplete metadata and cache rebuilds.
         for (const auto &value : saved) {
             const auto effect = value.toObject();
-            if (effect.value("module").toString().isEmpty() || listed.contains(key(effect))) continue;
-            auto missing = effect;
-
-            catalogEffects.push_back(missing);
+            if (effect.value("module").toString().isEmpty() || effect.value("class_id").toString().isEmpty() ||
+                listed.contains(key(effect))) continue;
+            // Keep sidecar state opaque and ordered without exposing a stale
+            // missing plug-in as a selectable entry.
+            preservedMissing.append(effect);
         }
         std::stable_sort(catalogEffects.begin(), catalogEffects.end(), [](const QJsonValue &a, const QJsonValue &b) {
             const auto left = a.toObject(), right = b.toObject();
@@ -633,6 +690,7 @@ private:
                    : QStringLiteral(" · 后台识别中"));
             appendRow(effect, displayName(effect, counts) + suffix);
         }
+        for (const auto &value : preservedMissing) effects_.append(value);
         state::setScopeEffects(sidecar_, scope_, effects_, state::currentScoreKey(), state::currentTrackKey());
         scanFeedback();
     }
@@ -643,21 +701,48 @@ private:
         auto *targetList = effect.value("enabled").toBool() ? activeList() : activeAvailableList();
         auto *item = new QListWidgetItem(targetList);
         auto *row = new QWidget(targetList);
+        row->setMinimumHeight(qMax(24, qRound(24 * devicePixelRatioF())));
         auto *layout = new QHBoxLayout(row);
-        layout->setContentsMargins(2, 2, 2, 2);
+        layout->setContentsMargins(2, 1, 2, 1);
+        layout->setSpacing(3);
         auto *check = new QCheckBox(row);
-        const bool pending = effect.value("class_id").toString().isEmpty();
-        const auto token = pending ? QString::fromLatin1(QCryptographicHash::hash(effect.value("module").toString().toUtf8(),
-                            QCryptographicHash::Sha256).toHex().left(16)) : effect.value("class_id").toString();
-        check->setObjectName((pending ? QStringLiteral("gpvst3Identify_") : QStringLiteral("gpvst3Enabled_")) + token);
-        check->setToolTip(pending ? QStringLiteral("后台识别完成后可启用；插件加载后可能自行联网。") : QString{});
+        const auto token = effect.value("class_id").toString();
+        check->setObjectName(QStringLiteral("gpvst3Enabled_") + token);
+        check->setFixedWidth(20);
+        const bool trackContextReady = scope_ != state::ScopeKind::Track ||
+            (!qEnvironmentVariable("GPVST3_TRACK").isEmpty() && g_vst3TrackSelectionControl);
+        check->setEnabled(trackContextReady);
+        check->setToolTip(trackContextReady ? QString{} :
+            QStringLiteral("音轨效果器暂不可用：等待宿主音轨上下文（track_scope_unresolved）。"));
+        check->setAccessibleName(QStringLiteral("启用 %1").arg(effect.value("name").toString()));
         check->setChecked(effect.value("enabled").toBool());
-        auto *name = new QPushButton(label, row);
-        name->setObjectName(QStringLiteral("gpvst3Editor_") + token);
-        name->setFlat(true);
-        name->setCursor(Qt::PointingHandCursor);
+        auto *name = new ElidedButton(row);
+        name->setObjectName(QStringLiteral("gpvst3Name_") + token);
+        name->setFullText(label);
+        name->setAccessibleName(effect.value("name").toString());
+        const auto fullIdentity = key(effect);
+        name->setToolTip(QStringLiteral("%1\n厂商：%2\nentry_id：%3")
+            .arg(effect.value("name").toString(), effect.value("vendor").toString(), fullIdentity));
+        auto *vendor = new QLabel(effect.value("vendor").toString(), row);
+        vendor->setObjectName(QStringLiteral("gpvst3Vendor_") + token);
+        vendor->setAlignment(Qt::AlignLeft | Qt::AlignVCenter);
+        vendor->setSizePolicy(QSizePolicy::Maximum, QSizePolicy::Preferred);
+        vendor->setToolTip(effect.value("vendor").toString());
+        auto *handle = new QLabel(QStringLiteral("⋮⋮"), row);
+        handle->setObjectName(QStringLiteral("gpvst3DragHandle_") + token);
+        handle->setAlignment(Qt::AlignCenter);
+        handle->setFixedWidth(20);
+        handle->setToolTip(QStringLiteral("拖动以调整处理顺序"));
+        auto *editor = new QPushButton(QStringLiteral("GUI"), row);
+        editor->setObjectName(QStringLiteral("gpvst3Editor_") + token);
+        editor->setFixedWidth(36);
+        editor->setToolTip(QStringLiteral("打开 %1 的原生编辑器").arg(effect.value("name").toString()));
+        editor->setAccessibleName(QStringLiteral("打开 %1 GUI").arg(effect.value("name").toString()));
         layout->addWidget(check);
         layout->addWidget(name, 1);
+        layout->addWidget(vendor);
+        layout->addWidget(handle);
+        layout->addWidget(editor);
         item->setSizeHint(row->sizeHint());
         targetList->setItemWidget(item, row);
         const auto identity = key(effect);
@@ -667,15 +752,6 @@ private:
             const int index = indexFor(identity); if (index < 0) return;
             auto effect = effects_.at(index).toObject();
             const auto previous = effect;
-            if (enabled && effect.value("class_id").toString().isEmpty()) {
-                { const QSignalBlocker blocked(check); check->setChecked(false); }
-                effect.insert("enabled", true);
-                effect.insert("bypass", false);
-                effects_.replace(index, effect);
-                saveRuntimeState();
-                status_->setText(QStringLiteral("后台识别中：完成后可启用。"));
-                return;
-            }
             if (!enabled && g_editorWindow && g_editorWindow->openedKey == key(effect)) g_editorWindow->close();
             effect.insert("enabled", enabled);
             effect.insert("bypass", !enabled);
@@ -699,7 +775,7 @@ private:
             if (!qEnvironmentVariable("GPVST3_TRACK").isEmpty())
                 QTimer::singleShot(0, this, [this] { loadChain(); });
         });
-        connect(name, &QPushButton::clicked, this, [this, identity] {
+        connect(editor, &QPushButton::clicked, this, [this, identity] {
             const int index = indexFor(identity); if (index >= 0) openEditor(index);
         });
     }
@@ -765,7 +841,23 @@ private:
             if (index >= 0) ordered.append(effects_.at(index));
         }
         if (ordered.isEmpty() && !effects_.isEmpty()) return;
-        effects_ = ordered;
+        QSet<QString> moved;
+        for (const auto &value : ordered) moved.insert(key(value.toObject()));
+        QJsonArray merged;
+        for (int order = 0; order < ordered.size(); ++order) {
+            auto effect = ordered.at(order).toObject();
+            effect.insert("order", order);
+            merged.append(effect);
+        }
+        int disabledOrder = ordered.size();
+        for (const auto &value : effects_) {
+            const auto effect = value.toObject();
+            if (effect.value("enabled").toBool() || moved.contains(key(effect))) continue;
+            auto disabled = effect;
+            disabled.insert("order", disabledOrder++);
+            merged.append(disabled);
+        }
+        effects_ = merged;
         saveRuntimeState();
         publishSelection();
     }
@@ -825,6 +917,137 @@ QWidget *findSoundHost() {
         }
     }
     return nullptr;
+}
+
+QWidget *findHostAnchor(QWidget *host, const QStringList &objectNames,
+                        const QStringList &texts) {
+    if (!host) return nullptr;
+    const auto children = host->findChildren<QWidget *>();
+    for (auto *widget : children) {
+        if (objectNames.contains(widget->objectName())) return widget;
+        if (auto *button = qobject_cast<QAbstractButton *>(widget)) {
+            if (texts.contains(button->text(), Qt::CaseInsensitive)) return widget;
+        }
+        if (auto *label = qobject_cast<QLabel *>(widget)) {
+            if (texts.contains(label->text(), Qt::CaseInsensitive)) return widget;
+        }
+    }
+    return nullptr;
+}
+
+QWidget *findApplicationAnchor(const QStringList &objectNames, const QStringList &texts) {
+    const auto children = QApplication::allWidgets();
+    // Prefer an exact stable objectName over discovery order. Qt does not
+    // guarantee the order returned by allWidgets(), and selecting a nested
+    // title label before its containing effect chain can place our section at
+    // the end of the page instead of immediately after the chain.
+    for (const auto &name : objectNames) {
+        if (name.isEmpty()) continue;
+        for (auto *widget : children)
+            if (widget->objectName() == name) return widget;
+    }
+    for (auto *widget : children) {
+        if (auto *button = qobject_cast<QAbstractButton *>(widget))
+            if (texts.contains(button->text(), Qt::CaseInsensitive)) return widget;
+        if (auto *label = qobject_cast<QLabel *>(widget))
+            if (texts.contains(label->text(), Qt::CaseInsensitive)) return widget;
+    }
+    return nullptr;
+}
+
+QLayout *layoutContaining(QWidget *host, QWidget *anchor) {
+    if (!host || !anchor) return nullptr;
+    if (auto *layout = host->layout(); layout && layout->indexOf(anchor) >= 0) return layout;
+    for (auto *layout : host->findChildren<QLayout *>())
+        if (layout->indexOf(anchor) >= 0) return layout;
+    return nullptr;
+}
+
+QWidget *layoutHostFor(QWidget *anchor) {
+    if (!anchor) return nullptr;
+    // GP nests the score/track controls in layouts such as masteringLayout
+    // and verticalLayout_2. Search those layouts before climbing to an outer
+    // page; appending to the outer page would move our section past unrelated
+    // controls while still leaving the native anchor untouched.
+    for (auto *current = anchor->parentWidget(); current; current = current->parentWidget())
+        if (layoutContaining(current, anchor)) return current;
+    return nullptr;
+}
+
+bool placeSectionAfterAnchor(QWidget *host, QWidget *section, QWidget *anchor) {
+    if (!host || !section || !anchor || !host->layout()) return false;
+    auto *hostLayout = layoutContaining(host, anchor);
+    if (!hostLayout) return false;
+    int anchorIndex = -1;
+    for (QWidget *candidate = anchor; candidate && candidate != host;
+         candidate = candidate->parentWidget()) {
+        anchorIndex = hostLayout->indexOf(candidate);
+        if (anchorIndex >= 0) break;
+    }
+    if (anchorIndex < 0) return false;
+
+    const int sectionIndex = hostLayout->indexOf(section);
+    if (sectionIndex >= 0 && sectionIndex == anchorIndex + 1) return true;
+    if (sectionIndex >= 0) hostLayout->removeWidget(section);
+
+    // Removing an item before the anchor shifts the insertion index left by
+    // one. Re-read the anchor index after removal so repeated sidebar
+    // rebuilds remain idempotent.
+    anchorIndex = -1;
+    for (QWidget *candidate = anchor; candidate && candidate != host;
+         candidate = candidate->parentWidget()) {
+        anchorIndex = hostLayout->indexOf(candidate);
+        if (anchorIndex >= 0) break;
+    }
+    if (anchorIndex < 0) return false;
+    if (auto *box = qobject_cast<QBoxLayout *>(hostLayout))
+        box->insertWidget(anchorIndex + 1, section);
+    else if (auto *grid = qobject_cast<QGridLayout *>(hostLayout))
+        grid->addWidget(section, grid->rowCount(), 0, 1, grid->columnCount());
+    else
+        hostLayout->addWidget(section);
+    section->setProperty("gpvst3AnchorName", anchor->objectName());
+    section->setProperty("gpvst3LayoutIndex", hostLayout->indexOf(section));
+    return true;
+}
+
+QWidget *ensureHostSection(QWidget *host, const QString &sectionName,
+                           const QString &dividerName, const QString &title,
+                           const QStringList &anchorNames, const QStringList &anchorTexts) {
+    if (!host || !host->layout()) return nullptr;
+    if (anchorNames.isEmpty() || (anchorNames.size() == 1 && anchorNames.front().isEmpty())) return nullptr;
+    if (auto *existing = host->findChild<QWidget *>(sectionName)) {
+        if (existing->parentWidget() != host) return nullptr;
+        auto *anchor = findHostAnchor(host, anchorNames, anchorTexts);
+        if (!anchor || !placeSectionAfterAnchor(host, existing, anchor)) return nullptr;
+        return existing;
+    }
+    auto *anchor = findHostAnchor(host, anchorNames, anchorTexts);
+    if (!anchor) return nullptr;
+    auto *section = new QWidget(host);
+    section->setObjectName(sectionName);
+    section->setProperty("gpvst3Owned", true);
+    section->setSizePolicy(QSizePolicy::Preferred, QSizePolicy::Minimum);
+    auto *layout = new QVBoxLayout(section);
+    layout->setContentsMargins(0, 4, 0, 4);
+    auto *divider = new QFrame(section);
+    divider->setObjectName(dividerName);
+    divider->setFrameShape(QFrame::HLine);
+    divider->setFrameShadow(QFrame::Sunken);
+    layout->addWidget(divider);
+    auto *label = new QLabel(title, section);
+    label->setObjectName(sectionName + QStringLiteral("Title"));
+    label->setAlignment(Qt::AlignLeft | Qt::AlignVCenter);
+    layout->addWidget(label);
+
+    // Insert after the nearest host-level anchor without touching any native
+    // item. If GP wraps the anchor, use the first ancestor represented in the
+    // host layout; otherwise leave the section unmounted for this build.
+    if (!placeSectionAfterAnchor(host, section, anchor)) {
+        section->deleteLater();
+        return nullptr;
+    }
+    return section;
 }
 
 } // namespace
@@ -949,25 +1172,51 @@ void showEffectChainPanel(bool show) {
     qApp->setProperty("gpvst3P5Panel", QVariant::fromValue(static_cast<QWidget *>(panel)));
     QObject::connect(panel, &QObject::destroyed, qApp, [] { qApp->setProperty("gpvst3P5Panel", QVariant()); });
 
-    // Keep the entry alive for the lifetime of the host. GP rebuilds this
-    // sidebar when the score or selected track changes, so a one-shot timer
-    // would leave the button missing after that rebuild.
-    auto *timer = new QTimer(qApp);
-    timer->setInterval(500);
-    QObject::connect(panel, &QObject::destroyed, timer, [timer] {
-        timer->stop();
-        timer->deleteLater();
-    });
-    const QPointer<QWidget> panelGuard(panel);
-    const auto attachPanel = [timer, panelGuard, useP7Panel] {
-        QWidget *panel = panelGuard.data();
+    // Keep the maintenance timer owned by qApp rather than by the selector.
+    // GP destroys and rebuilds the sidebar widgets during score/track changes;
+    // the next tick must recreate a hidden selector and reattach its entry.
+    g_panelUsesP7 = useP7Panel;
+    auto *timer = g_panelAttachTimer.data();
+    if (!timer) {
+        timer = new QTimer(qApp);
+        timer->setInterval(500);
+        g_panelAttachTimer = timer;
+    }
+    const auto attachPanel = [timer] {
+        QWidget *panel = qApp->property("gpvst3P5Panel").value<QWidget *>();
         if (!panel) {
-            timer->stop();
-            timer->deleteLater();
-            return;
+            panel = g_panelUsesP7 ? static_cast<QWidget *>(new P7Panel)
+                                  : static_cast<QWidget *>(new ChainPanel);
+            panel->setAttribute(Qt::WA_DeleteOnClose);
+            panel->setProperty("gpvst3ShowRequested", false);
+            qApp->setProperty("gpvst3P5Panel", QVariant::fromValue(panel));
+            QObject::connect(panel, &QObject::destroyed, qApp, [] {
+                qApp->setProperty("gpvst3P5Panel", QVariant());
+            });
         }
+        const bool useP7Panel = g_panelUsesP7;
         auto *soundHost = findSoundHost();
         bool soundEntryReady = soundHost != nullptr;
+        QWidget *trackSection = nullptr;
+        QWidget *globalSection = nullptr;
+        if (useP7Panel && soundHost) {
+            const auto trackAnchor = findApplicationAnchor(
+                {QStringLiteral("gpNativeInstrumentEffects"), QStringLiteral("gpvst3NativeSourceEffects"),
+                 QStringLiteral("rseEffectsChain"), QStringLiteral("instrumentEffects"),
+                 QStringLiteral("soundRack")},
+                {QStringLiteral("音源效果器"), QStringLiteral("音轨效果器"), QStringLiteral("RSE")});
+            const auto globalAnchor = findApplicationAnchor(
+                {QStringLiteral("gpMasterPostProcessing"), QStringLiteral("masterPostProcessing"),
+                 QStringLiteral("gpvst3MasterEffects"), QStringLiteral("masterEffects"),
+                 QStringLiteral("soundMastering"), QStringLiteral("soundMasteringTitle")},
+                {QStringLiteral("母带后期处理"), QStringLiteral("Master Post Processing")});
+            trackSection = ensureHostSection(layoutHostFor(trackAnchor), QStringLiteral("gpvst3TrackVst3Section"),
+                QStringLiteral("gpvst3TrackVst3Divider"), QStringLiteral("音轨 VST3 效果器"),
+                {trackAnchor ? trackAnchor->objectName() : QString{}}, {});
+            globalSection = ensureHostSection(layoutHostFor(globalAnchor), QStringLiteral("gpvst3GlobalVst3Section"),
+                QStringLiteral("gpvst3GlobalVst3Divider"), QStringLiteral("全局 Master VST3 效果器"),
+                {globalAnchor ? globalAnchor->objectName() : QString{}}, {});
+        }
         if (soundHost && !soundHost->findChild<QPushButton *>("gpvst3SoundEffectChainButton")) {
             auto *button = new QPushButton(g_scanButtonText, soundHost);
             button->setObjectName(QStringLiteral("gpvst3SoundEffectChainButton"));
@@ -990,6 +1239,8 @@ void showEffectChainPanel(bool show) {
             panel->setWindowTitle(QString());
             if (wasVisible) panel->show();
             else panel->hide();
+            panel->setProperty("gpvst3TrackAnchorReady", trackSection != nullptr);
+            panel->setProperty("gpvst3GlobalAnchorReady", globalSection != nullptr);
         } else if (useP7Panel && !soundHost && panel->parentWidget()) {
             // If the private sound section is temporarily absent, detach the
             // panel so the next section instance can adopt it safely.
@@ -1050,7 +1301,10 @@ void showEffectChainPanel(bool show) {
         }
         timer->setProperty("dockReady", dockReady);
     };
-    QObject::connect(timer, &QTimer::timeout, timer, attachPanel);
+    if (!timer->property("gpvst3Connected").toBool()) {
+        QObject::connect(timer, &QTimer::timeout, timer, attachPanel);
+        timer->setProperty("gpvst3Connected", true);
+    }
     // A user click must display a newly recreated selector in this event,
     // without waiting for another click or the sidebar maintenance timer.
     attachPanel();

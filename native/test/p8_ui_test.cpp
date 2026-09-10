@@ -6,8 +6,13 @@
 #include <QtCore/QJsonObject>
 #include <QtCore/QTemporaryDir>
 #include <QtWidgets/QApplication>
+#include <QtWidgets/QFrame>
+#include <QtWidgets/QLabel>
 #include <QtWidgets/QListWidget>
+#include <QtWidgets/QPushButton>
 #include <QtWidgets/QTabWidget>
+#include <QtWidgets/QVBoxLayout>
+#include <QtCore/QTimer>
 #include <iostream>
 
 namespace {
@@ -26,7 +31,9 @@ int main(int argc, char **argv) {
     qputenv("GPVST3_TRACK", "1");
     QApplication app(argc, argv);
     const QJsonArray catalog{
-        QJsonObject{{"module", "C:/VST3/A.vst3"}, {"class_id", "A"}, {"name", "A"}, {"vendor", "Test"}, {"compatible", true}},
+        QJsonObject{{"module", "C:/VST3/A.vst3"}, {"class_id", "A"},
+                    {"name", "A very long effect name for a narrow Guitar Pro sidebar"},
+                    {"vendor", "Test Vendor"}, {"compatible", true}},
         QJsonObject{{"module", "C:/VST3/B.vst3"}, {"class_id", "B"}, {"name", "B"}, {"vendor", "Test"}, {"compatible", true}},
         QJsonObject{{"module", "C:/VST3/C.vst3"}, {"class_id", "C"}, {"name", "C"}, {"vendor", "Test"}, {"compatible", true}}};
     if (!check(gpvst3::state::writeChain(QJsonObject{{"effects", QJsonArray{}}}), "seed state")) return 1;
@@ -56,6 +63,37 @@ int main(int argc, char **argv) {
     if (!check(global->count() == 2, "global enabled rows")) return 1;
     if (!check(global->itemWidget(global->item(0))->property("gpvst3EntryId").toString().endsWith("\nC"),
                "enabled entries stay first in saved order")) return 1;
+    auto *nameButton = global->findChild<QPushButton *>("gpvst3Name_A");
+    if (!check(nameButton && nameButton->sizePolicy().horizontalPolicy() == QSizePolicy::Ignored &&
+               nameButton->toolTip().contains(QStringLiteral("A very long effect name")),
+               "long plugin names keep a left aligned, discoverable tooltip")) return 1;
+
+    QWidget soundHost;
+    soundHost.setObjectName(QStringLiteral("soundsContainer"));
+    auto *soundLayout = new QVBoxLayout(&soundHost);
+    auto *nativeSource = new QLabel(QStringLiteral("音源效果器"), &soundHost);
+    nativeSource->setObjectName(QStringLiteral("gpNativeInstrumentEffects"));
+    auto *nativeMaster = new QLabel(QStringLiteral("母带后期处理"), &soundHost);
+    nativeMaster->setObjectName(QStringLiteral("gpMasterPostProcessing"));
+    soundLayout->addWidget(nativeSource);
+    soundLayout->addWidget(nativeMaster);
+    soundHost.show();
+    for (auto *timer : qApp->findChildren<QTimer *>()) timer->setInterval(0);
+    QCoreApplication::processEvents(QEventLoop::AllEvents, 100);
+    auto *trackSection = soundHost.findChild<QWidget *>("gpvst3TrackVst3Section");
+    auto *globalSection = soundHost.findChild<QWidget *>("gpvst3GlobalVst3Section");
+    if (!check(trackSection && trackSection->parentWidget() == &soundHost &&
+               globalSection && globalSection->parentWidget() == &soundHost,
+               "host sections are mounted as owned wrappers")) return 1;
+    if (!check(trackSection->findChild<QFrame *>("gpvst3TrackVst3Divider") &&
+               globalSection->findChild<QFrame *>("gpvst3GlobalVst3Divider"),
+               "track and global sections have structural dividers")) return 1;
+    if (!check(soundLayout->indexOf(nativeSource) < soundLayout->indexOf(trackSection) &&
+               soundLayout->indexOf(nativeMaster) < soundLayout->indexOf(globalSection),
+               "sections follow their native host anchors")) return 1;
+    if (!check(soundHost.findChild<QLabel *>("gpNativeInstrumentEffects") == nativeSource &&
+               soundHost.findChild<QLabel *>("gpMasterPostProcessing") == nativeMaster,
+               "native source and master controls remain present")) return 1;
     panel->close();
     QJsonObject saved; gpvst3::state::loadChain(saved);
     const auto reordered = gpvst3::state::scopeEffects(saved, gpvst3::state::ScopeKind::Global);

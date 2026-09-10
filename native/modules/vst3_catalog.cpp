@@ -22,7 +22,10 @@
 #endif
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <future>
+#include <memory>
+#include <thread>
 #include <mutex>
 
 namespace gpvst3::vst3 {
@@ -34,12 +37,23 @@ std::atomic<bool> stopping{false};
 State snapshot;
 // Destroy/join the worker before the snapshot it publishes into.
 std::future<State> scanFuture;
-std::future<State> recognitionFuture;
+struct RecognitionJob {
+    QString module;
+    std::chrono::steady_clock::time_point started;
+    std::atomic<bool> finished{false};
+    std::atomic<bool> timedOut{false};
+    std::mutex resultMutex;
+    State result;
+};
+std::shared_ptr<RecognitionJob> recognitionJob;
 QStringList recognitionQueue;
 QString recognitionModule;
 RecognitionControl recognitionControl = nullptr;
+constexpr std::chrono::seconds kRecognitionTimeout{10};
 unsigned revision = 0, delivered = 0;
 int generation = 0;
+int recognitionWorkersStarted = 0;
+int recognitionWorkersDetached = 0;
 
 QString normalized(const QString &path) {
     const auto clean = QDir::fromNativeSeparators(path);
@@ -118,6 +132,8 @@ CatalogEntry entryFrom(const QString &module, const QJsonObject &value) {
     entry.recognitionAttempts = value.value("recognition_attempts").toInt();
     entry.recognitionError = value.value("recognition_error").toString().toStdString();
     entry.recognitionRetryAfter = static_cast<long long>(value.value("recognition_retry_after").toDouble());
+    entry.recognitionDeadlineAt = static_cast<long long>(value.value("recognition_deadline_at").toDouble());
+    entry.recognitionIgnoredReason = value.value("recognition_ignored_reason").toString().toStdString();
     return entry;
 }
 
@@ -315,17 +331,64 @@ void persistRecognition(const QString &module, const State &identified) {
 }
 
 void startNextRecognition(bool hostSupported) {
-    if (!hostSupported || recognitionFuture.valid() || recognitionQueue.isEmpty() || stopping.load()) return;
+    if (!hostSupported || recognitionJob || recognitionQueue.isEmpty() || stopping.load()) return;
     recognitionModule = recognitionQueue.takeFirst();
-    recognitionFuture = std::async(std::launch::async, [module = recognitionModule, hostSupported] {
-        if (!recognitionControl) {
-            State result;
+    auto job = std::make_shared<RecognitionJob>();
+    job->module = recognitionModule;
+    job->started = std::chrono::steady_clock::now();
+    recognitionJob = job;
+    ++recognitionWorkersStarted;
+    const auto control = recognitionControl;
+    std::thread([job, hostSupported, control] {
+        State result;
+        if (stopping.load(std::memory_order_acquire)) {
+            result.status = "scan_stopped";
+            result.errors.push_back("recognition_stopped");
+        } else if (!control) {
             result.status = "recognition_unavailable";
             result.errors.push_back("recognition_control_unavailable");
-            return result;
+        } else {
+            result = control(job->module.toStdString(), hostSupported);
         }
-        return recognitionControl(module.toStdString(), hostSupported);
-    });
+        {
+            std::lock_guard<std::mutex> lock(job->resultMutex);
+            job->result = std::move(result);
+        }
+        job->finished.store(true, std::memory_order_release);
+    }).detach();
+}
+
+void persistRecognitionTimeout(const QString &module, long long deadline, const char *reason) {
+    const auto path = cachePath();
+    QFile file(path);
+    if (!file.open(QIODevice::ReadOnly)) return;
+    QJsonParseError parse{};
+    auto document = QJsonDocument::fromJson(file.readAll(), &parse);
+    file.close();
+    if (parse.error != QJsonParseError::NoError || !document.isObject()) return;
+    auto cache = document.object();
+    auto scopes = cache.value("scopes").toObject();
+    for (auto scope = scopes.begin(); scope != scopes.end(); ++scope) {
+        auto scopeObject = scope.value().toObject();
+        auto modules = scopeObject.value("modules").toObject();
+        auto record = modules.value(module).toObject();
+        if (record.isEmpty()) continue;
+        record.insert("recognition_status", "timeout");
+        record.insert("recognition_source", "factory");
+        record.insert("recognition_attempts", record.value("recognition_attempts").toInt() + 1);
+        record.insert("recognition_error", reason);
+        record.insert("recognition_deadline_at", static_cast<double>(deadline));
+        record.insert("recognition_ignored_reason", reason);
+        record.insert("recognition_retry_after", 0.0);
+        modules.insert(module, record);
+        scopeObject.insert("modules", modules);
+        scopes.insert(scope.key(), scopeObject);
+    }
+    cache.insert("scopes", scopes);
+    QSaveFile output(path);
+    if (!output.open(QIODevice::WriteOnly)) return;
+    const auto bytes = QJsonDocument(cache).toJson();
+    if (output.write(bytes) == bytes.size()) output.commit();
 }
 
 State scan(const QStringList &paths, QJsonObject cache, State result) {
@@ -366,6 +429,7 @@ State scan(const QStringList &paths, QJsonObject cache, State result) {
                                       entries.first().toObject().value("identified").toBool() ? "ready" : "queued"},
                                  {"recognition_source", "static"}, {"recognition_attempts", 0},
                                  {"recognition_error", QString{}}, {"recognition_retry_after", 0.0},
+                                 {"recognition_deadline_at", 0.0}, {"recognition_ignored_reason", QString{}},
                                  {"recognition_scanner_version", kScanner}};
         }
         if (!record.contains("recognition_status")) {
@@ -378,6 +442,8 @@ State scan(const QStringList &paths, QJsonObject cache, State result) {
         if (!record.contains("recognition_attempts")) record.insert("recognition_attempts", 0);
         if (!record.contains("recognition_error")) record.insert("recognition_error", QString{});
         if (!record.contains("recognition_retry_after")) record.insert("recognition_retry_after", 0.0);
+        if (!record.contains("recognition_deadline_at")) record.insert("recognition_deadline_at", 0.0);
+        if (!record.contains("recognition_ignored_reason")) record.insert("recognition_ignored_reason", QString{});
         if (!record.contains("recognition_scanner_version")) record.insert("recognition_scanner_version", kScanner);
         auto entryValues = record.value("entries").toArray();
         for (int entryIndex = 0; entryIndex < entryValues.size(); ++entryIndex) {
@@ -387,6 +453,8 @@ State scan(const QStringList &paths, QJsonObject cache, State result) {
             entry.insert("recognition_attempts", record.value("recognition_attempts"));
             entry.insert("recognition_error", record.value("recognition_error"));
             entry.insert("recognition_retry_after", record.value("recognition_retry_after"));
+            entry.insert("recognition_deadline_at", record.value("recognition_deadline_at"));
+            entry.insert("recognition_ignored_reason", record.value("recognition_ignored_reason"));
             entryValues.replace(entryIndex, entry);
         }
         record.insert("entries", entryValues);
@@ -436,7 +504,7 @@ State beginAsync(bool hostSupported) noexcept {
     std::lock_guard<std::mutex> lock(scanMutex);
     if (stopping.load()) { State state; state.status = "scan_stopped"; return state; }
     if (!hostSupported) { State state; state.status = "host_unsupported"; return state; }
-    if (scanFuture.valid() || recognitionFuture.valid() || !recognitionQueue.isEmpty()) return snapshot;
+    if (scanFuture.valid() || recognitionJob || !recognitionQueue.isEmpty()) return snapshot;
     const auto paths = roots();
     QString cacheStatus;
     const auto cache = readCache(cacheStatus);
@@ -505,8 +573,9 @@ bool poll(State &completed) noexcept {
         if (recognitionControl) {
             for (const auto &entry : snapshot.catalog)
                 if (!entry.identified && !entry.module.empty() &&
-                    (entry.recognitionStatus != "failed" ||
-                     QDateTime::currentSecsSinceEpoch() >= entry.recognitionRetryAfter) &&
+                    ((entry.recognitionStatus != "failed" && entry.recognitionStatus != "timeout") ||
+                     (entry.recognitionStatus == "failed" &&
+                      QDateTime::currentSecsSinceEpoch() >= entry.recognitionRetryAfter)) &&
                     std::find(recognitionQueue.cbegin(), recognitionQueue.cend(),
                               QString::fromStdString(entry.module)) == recognitionQueue.cend())
                     recognitionQueue.append(QString::fromStdString(entry.module));
@@ -521,12 +590,17 @@ bool poll(State &completed) noexcept {
         snapshot.recognitionPending = !recognitionQueue.isEmpty();
         snapshot.recognitionStatus = snapshot.recognitionPending ? "queued" : "idle";
         startNextRecognition(snapshot.hostSupported);
-        snapshot.recognitionWorker = recognitionFuture.valid();
+        snapshot.recognitionWorker = static_cast<bool>(recognitionJob);
         ++revision;
     }
-    if (recognitionFuture.valid() &&
-        recognitionFuture.wait_for(std::chrono::milliseconds(0)) == std::future_status::ready) {
-        const auto identified = recognitionFuture.get();
+    if (recognitionJob && recognitionJob->finished.load(std::memory_order_acquire)) {
+        auto job = recognitionJob;
+        State identified;
+        {
+            std::lock_guard<std::mutex> resultLock(job->resultMutex);
+            identified = job->result;
+        }
+        recognitionJob.reset();
         persistRecognition(recognitionModule, identified);
         std::vector<CatalogEntry> replacement = identified.catalog;
         if (replacement.empty()) {
@@ -559,13 +633,38 @@ bool poll(State &completed) noexcept {
         ++snapshot.recognitionCompleted;
         snapshot.recognitionPending = !recognitionQueue.isEmpty();
         snapshot.recognitionStatus = snapshot.recognitionPending ? "running" : "complete";
-        snapshot.recognitionWorker = recognitionFuture.valid();
+        snapshot.recognitionWorker = static_cast<bool>(recognitionJob);
         snapshot.recognitionCurrentModule.clear();
         startNextRecognition(snapshot.hostSupported);
         ++revision;
     }
-    snapshot.recognitionCurrentModule = recognitionFuture.valid() ? recognitionModule.toStdString() : std::string{};
-    snapshot.recognitionWorker = recognitionFuture.valid();
+    if (recognitionJob && !recognitionJob->finished.load(std::memory_order_acquire)) {
+        const auto now = std::chrono::steady_clock::now();
+        if (now - recognitionJob->started >= kRecognitionTimeout &&
+            !recognitionJob->timedOut.exchange(true, std::memory_order_acq_rel)) {
+            const auto deadline = QDateTime::currentSecsSinceEpoch();
+            persistRecognitionTimeout(recognitionModule, deadline, "recognition_timeout");
+            snapshot.catalog.erase(std::remove_if(snapshot.catalog.begin(), snapshot.catalog.end(),
+                [&](const CatalogEntry &entry) { return entry.module == recognitionModule.toStdString(); }),
+                snapshot.catalog.end());
+            ++snapshot.recognitionAttempted;
+            ++snapshot.recognitionTimedOut;
+            ++snapshot.recognitionCompleted;
+            ++recognitionWorkersDetached;
+            snapshot.recognitionStatus = "timeout";
+            snapshot.recognitionCurrentModule.clear();
+            // The callback has no cancellation ABI. Its detached result is
+            // ignored when it eventually returns; the UI and cache advance
+            // immediately so a blocked third-party module cannot stall GP.
+            recognitionJob.reset();
+            startNextRecognition(snapshot.hostSupported);
+            ++revision;
+        }
+    }
+    snapshot.recognitionCurrentModule = recognitionJob ? recognitionModule.toStdString() : std::string{};
+    snapshot.recognitionWorker = static_cast<bool>(recognitionJob);
+    snapshot.recognitionWorkersStarted = recognitionWorkersStarted;
+    snapshot.recognitionWorkersDetached = recognitionWorkersDetached;
     if (revision == delivered) return false;
     completed = snapshot;
     delivered = revision;
@@ -575,17 +674,15 @@ bool poll(State &completed) noexcept {
 void shutdownScan() noexcept {
     stopping.store(true);
     std::future<State> worker;
-    std::future<State> recognition;
     {
         std::lock_guard<std::mutex> lock(scanMutex);
         worker = std::move(scanFuture);
-        recognition = std::move(recognitionFuture);
         recognitionQueue.clear();
+        recognitionJob.reset();
     }
     // The worker can still publish a final progress snapshot; never join it
     // with scanMutex held. It exits before the next module and skips caching.
     if (worker.valid()) worker.wait();
-    if (recognition.valid()) recognition.wait();
 }
 
 void setRecognitionControl(RecognitionControl control) noexcept {

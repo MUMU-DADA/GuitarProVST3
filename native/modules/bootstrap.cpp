@@ -68,6 +68,9 @@ QJsonObject vst3Status(const gpvst3::vst3::State &value) {
         {"recognition_attempted", value.recognitionAttempted},
         {"recognition_completed", value.recognitionCompleted},
         {"recognition_failed", value.recognitionFailed},
+        {"recognition_timed_out", value.recognitionTimedOut},
+        {"recognition_workers_started", value.recognitionWorkersStarted},
+        {"recognition_workers_detached", value.recognitionWorkersDetached},
         {"recognition_current_module", QString::fromStdString(value.recognitionCurrentModule)},
         {"recognition_status", QString::fromStdString(value.recognitionStatus)},
         {"modules_loaded", value.modulesLoaded},
@@ -98,7 +101,9 @@ QJsonArray vst3Catalog(const gpvst3::vst3::State &value) {
             {"recognition_source", QString::fromStdString(entry.recognitionSource)},
             {"recognition_attempts", entry.recognitionAttempts},
             {"recognition_error", QString::fromStdString(entry.recognitionError)},
-            {"recognition_retry_after", static_cast<qint64>(entry.recognitionRetryAfter)}});
+            {"recognition_retry_after", static_cast<qint64>(entry.recognitionRetryAfter)},
+            {"recognition_deadline_at", static_cast<qint64>(entry.recognitionDeadlineAt)},
+            {"recognition_ignored_reason", QString::fromStdString(entry.recognitionIgnoredReason)}});
     }
     return result;
 }
@@ -106,6 +111,8 @@ QJsonArray vst3Catalog(const gpvst3::vst3::State &value) {
 void scanFeedback(const gpvst3::vst3::State &scan) {
     QStringList details;
     for (const auto &error : scan.errors) details.append(QString::fromStdString(error));
+    if (scan.recognitionTimedOut > 0)
+        details.prepend(QStringLiteral("识别超时：%1 个（已从当前列表隐藏）").arg(scan.recognitionTimedOut));
     if (!scan.currentModule.empty()) details.prepend(QString::fromStdString(scan.currentModule));
     if (!scan.recognitionCurrentModule.empty())
         details.prepend(QStringLiteral("识别：") + QString::fromStdString(scan.recognitionCurrentModule));

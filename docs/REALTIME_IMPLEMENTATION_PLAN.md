@@ -236,4 +236,4 @@ GP 继续负责音频设备、输入输出、采样率和流生命周期。插�
 
 ## P8：音轨级与全局 VST3 效果器、后台识别和顺序编辑（规划）
 
-本轮新增需求的实施计划见 [P8 计划](P8_TRACK_GLOBAL_VST3_PLAN.md)，实现记录见 [P8 实现记录](P8_IMPLEMENTATION.md)。后台主动识别及缓存、global/track schema 2、双 scope UI、启用项前置和拖动排序已完成并通过专项夹具；当前正式运行链仍是 master 后处理，`EffectsChain::index()` 仅提供链实例索引诊断，稳定音轨 ID 映射属于宿主受限，未映射时保持旁路。
+本轮新增需求的实施计划见 [P8 计划](P8_TRACK_GLOBAL_VST3_PLAN.md)，实现记录见 [P8 实现记录](P8_IMPLEMENTATION.md)。后台主动识别及缓存、global/track schema 2、双 scope UI、启用项前置和拖动排序只完成了 P8 的阶段性基础，并不代表 P8 完成；识别中隐藏/10 秒超时、真实音轨 runtime、global/track UI 锚点、原生音源效果链保留和窄侧栏适配按 P8.7–P8.12 继续补齐。当前正式运行链仍是 master 后处理，`EffectsChain::index()` 仅提供链实例索引诊断，稳定音轨 ID 映射属于宿主受限，未映射时保持旁路。

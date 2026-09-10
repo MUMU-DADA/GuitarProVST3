@@ -1,14 +1,29 @@
 # P8：音轨级与全局 VST3 效果器、后台识别和顺序编辑计划
 
-状态：已实现可验证范围（2026-09-11）；真实音轨映射保留宿主受限
+状态：阶段性实现，P8 未完成（2026-09-11）。P8.7、P8.9、P8.10、P8.11 已实现并验证；P8.8 仍为宿主受限，需取得稳定音轨映射后才能重新评估整体完成。
 
 当前锁定宿主可通过 `EffectsChain::index()` 提供链实例索引观测，但该字段不代表 GP 音轨 ID；在取得稳定的 `self -> track ID` 映射和可写 `IAudioBuffer` 边界前，音轨链继续旁路。
 
-本计划处理四个新需求：启动后后台完成插件刷新/识别并更新缓存；区分音轨级和全局 VST3 链；启用项在列表前部显示；支持拖动排序且排序决定声音处理顺序。
+本计划原有范围包括：启动后后台完成插件刷新/识别并更新缓存；区分音轨级和全局 VST3 链；启用项在列表前部显示；支持拖动排序且排序决定声音处理顺序。现根据宿主回归重新补齐六项未完成问题：识别中项目隐藏与 10 秒超时、音轨链真实可用、全局 UI 的母带后期处理位置、保留 GP 原生音源效果链、音轨 VST3 UI 的音源区位置，以及窄侧栏下的插件名称与布局适配。
+
+## 当前结论：已有实现不能视为 P8 完成
+
+现有代码和夹具已证明目录缓存、schema 2、双 scope 数据模型、后台超时、区域挂载和窄宽度行布局；真实音轨处理仍未完成。状态如下：
+
+| 编号 | 当前缺口 | 完成前的约束 |
+| --- | --- | --- |
+| 1 | 识别中隐藏和 10 秒硬截止 | **已实现/已验证**：queued/running/failed/timeout 不进列表；超时写入 cache 并推进队列 |
+| 2 | 音轨链只保存 desired state，`processDSP` 没有稳定 track 映射时保持旁路 | **宿主受限/未完成**：真实播放可观测多个 `self`/`index`，但没有稳定 `self -> track_key`；继续旁路 |
+| 3 | global UI 锚点 | **已实现/已验证**：`gpvst3GlobalVst3Section` 位于 `soundMastering` 后并有独立 divider |
+| 4 | 保留 GP 原生音源效果链 | **已实现/已验证**：只插入自有 wrapper，不清空或替换宿主 layout；原生控件仍存在 |
+| 5 | track UI 锚点 | **已实现/已验证**：`gpvst3TrackVst3Section` 位于 `soundRack` 后并有独立 divider |
+| 6 | 窄侧栏名称和操作布局 | **已实现/已验证**：左对齐、省略 tooltip、固定 GUI/拖动入口和高 DPI 最小高度通过 Qt fixture |
+
+补齐阶段采用“宿主布局证据 + 运行时处理证据 + UI 回归”三类验收。仅有离屏 Qt 夹具、JSON 返回、菜单可枚举或 DLL 加载成功，均不能单独把上述问题标记为完成。
 
 ## 当前实现和问题边界
 
-- `vst3_catalog.cpp` 已能在后台做静态文件扫描和缓存，但缺少静态元数据的候选项目前会在用户勾选时通过 `g_identifyControl` 同步识别。该调用最终进入 `vst3::identifyBundle()`，会在 UI 触发 `LoadLibrary`、`InitDll` 和 factory 枚举，因此会卡住选择界面。
+- `vst3_catalog.cpp` 在后台完成静态文件扫描和缓存；缺少静态元数据的候选项由 `poll()` 放入单 worker 主动识别队列。用户勾选或打开列表时不再调用 `g_identifyControl`，`vst3::identifyBundle()` 及其 `LoadLibrary`、`InitDll`、factory 枚举都在后台执行。
 - 当前 `P7Panel` 只有一套 `effects_` 和一个 `effect-chain.json` 链；`gp_hook` 只有一套实际运行的 `SelectionSlot`，VST3 处理位置是 `Master::process` 返回后的 master 后处理点。
 - `EffectsChain::processDSP` 当前只记录调用并转发到 GP 原函数，没有音轨标识到运行时链的映射。现有 `track` 字段只是 sidecar/UI 信息，不能证明实际作用域已是音轨级。
 - GP 运行时链使用 `am::overloud::Effect`，VST3 使用 `IComponent`/`IAudioProcessor`，不能把 VST3 实例直接塞进 GP 的私有效果器容器。音轨级实现应在 `processDSP` 的缓冲边界建立独立 VST3 链。
@@ -27,19 +42,19 @@
 
 - 静态扫描阶段继续保证不加载第三方模块、不创建第三方实例、不运行子进程、不联网。
 - 为了消除“待识别项必须由用户点击后才识别”的阻塞，新增的“后台主动识别”是静态扫描完成后的独立阶段。它只在已通过宿主哈希门控的控制线程执行单 bundle factory 识别，不在 UI 线程或音频线程执行。该阶段可能执行第三方 `DllMain`/`InitDll`/`GetPluginFactory`，因此不能再把整个启动流程宣称为“第三方代码执行次数为零”；证据需分别记录静态扫描和主动识别两个阶段。
-- 主动识别失败、超时或插件缺少可用 factory 时保留候选项并记录失败原因，不阻塞列表；启用动作只记录意图并等待识别结果，成功后自动提交，失败后保持未启用。
+- 主动识别失败、超时或插件缺少可用 factory 时记录失败原因但不进入可启用列表；超时项在当前扫描周期直接忽略。启用动作只记录意图并等待识别结果，成功后自动提交，失败后保持未启用。
 - P4 外部输入路由继续作为独立输入路径。第一版全局链定义为 GP master 混音链；是否把外部 capture 也纳入最终 global bus 另列为后续验证项，避免在未确认输出缓冲生命周期前改变监听语义。
 
 ## UI 设计
 
 ### 入口和作用域
 
-继续使用 `soundsContainer` 中现有的 `VST3` 入口，避免猜测 GP 未公开的 Master 私有控件插槽。点击后打开同一选择面板，顶部使用两个稳定的 scope tabs：
+继续使用 `soundsContainer` 中现有的 `VST3` 入口作为选择入口，避免破坏 GP 现有入口。选择模型可以共用两个 scope tabs，但实际 global/track 内容必须按 P8.10 分别挂到宿主锚点，不能把一个尾部面板当成两个作用域的最终布局：
 
 - `当前音轨`：默认页，标题显示当前曲谱、音轨索引和可取得的音轨名称；GP 切换选中音轨后面板重新绑定该音轨的链。
 - `全局 Master`：与选中音轨无关，显示作用于 GP 主混音的全局链。
 
-稳定 objectName 规划为 `gpvst3ScopeTrackTab`、`gpvst3ScopeGlobalTab`、`gpvst3TrackChainList`、`gpvst3GlobalChainList`、`gpvst3AvailableList`。若 GP 后续提供稳定的 Master 区域入口，可增加快捷入口，但不改变两个 tab 的状态模型。
+稳定 objectName 规划为 `gpvst3ScopeTrackTab`、`gpvst3ScopeGlobalTab`、`gpvst3TrackChainList`、`gpvst3GlobalChainList`、`gpvst3AvailableList`、`gpvst3TrackVst3Section` 和 `gpvst3GlobalVst3Section`。若 GP 后续提供稳定的 Master 区域入口，可增加快捷入口，但不改变两个 scope 的状态模型。
 
 ### 列表布局
 
@@ -61,7 +76,7 @@
 - “正在使用”区域只允许在同一 scope 内拖动；拖动后立即更新链数组并重新发布运行时链。
 - 勾选可用插件会追加到启用区域末尾；取消勾选会移动到可用区域，不改变其他启用插件的顺序。
 - 启用项始终在可选列表前列，启用项内部保持用户拖动顺序；未启用项按名称、厂商和稳定 entry key 排序。
-- 识别中的条目显示 `识别中…`，复选框不触发同步加载；识别成功后自动变为可启用项，失败显示原因并允许后台重试。
+- 识别中的条目不进入任何插件列表；识别进度只在状态栏显示，识别成功后才加入可启用项。失败和超时原因通过状态详情、日志和缓存记录查看，不能用一个不可操作的列表行占位。
 - 当前音轨上下文不确定时显示“无法确认当前音轨”，禁止把某一音轨的链误用于另一音轨；全局页仍可用。
 
 ## 数据模型和迁移
@@ -114,11 +129,11 @@ schema 1 的顶层 `effects` 全部迁移到 `global.effects`，因为现有运�
 1. `bootstrap::initialize()` 读取缓存并立即发布可用清单；现有 `beginAsync()/poll()` 继续负责静态文件指纹、PE x64 检查、`moduleinfo.json` 解析和缓存更新。
 2. 静态扫描完成或缓存命中后，`vst3_catalog` 构造 pending bundle 队列；同一时刻只运行一个主动识别任务。队列按已启用/sidecar 引用项优先，其余候选按稳定路径顺序处理。
 3. 主动识别任务复用 factory-only 的 `identifyBundle` 逻辑，不创建 processor、不运行 `process()` 探针；每个 bundle 结束后通过快照通知 UI，并用 `QSaveFile` 更新对应缓存记录。
-4. UI 勾选动作只更新 `desired_enabled` 和 scope 数组。如果条目仍在识别，立即返回并显示“后台识别中”；识别成功后由控制线程准备实例，失败则回滚为未启用并显示原因。
+4. UI 只对已进入可启用列表的条目接收勾选；识别中的条目没有可点击行。sidecar 可以暂存 `desired_enabled`，识别成功后由控制线程准备实例，失败或超时则保持未启用并在状态详情中记录原因。
 5. 手动刷新只提交一个合并请求：先做静态变化检查，再补充尚未完成的主动识别；不会因为用户重复点击而创建多个 loader 或识别任务。
-6. 退出时停止接收新任务，取消队列并等待 worker 排空；不能在 UI 析构中同步调用第三方识别。
+6. 退出时停止接收新任务并清空队列，静态扫描 worker 正常排空；识别调用没有安全取消 ABI 时，超时 worker 继续 detached，退出流程不等待它，不能在 UI 析构中同步调用第三方识别。
 
-缓存新增字段：`recognition_status`、`recognition_source`、`recognition_attempts`、`recognition_error`、`recognition_retry_after` 和 `recognition_scanner_version`。静态结果和主动识别结果必须能在证据中分开计数。
+缓存新增字段：`recognition_status`、`recognition_source`、`recognition_attempts`、`recognition_error`、`recognition_retry_after`、`recognition_deadline_at`、`recognition_ignored_reason` 和 `recognition_scanner_version`。静态结果和主动识别结果必须能在证据中分开计数。
 
 ## 音频接入和目标顺序
 
@@ -162,12 +177,12 @@ schema 1 的顶层 `effects` 全部迁移到 `global.effects`，因为现有运�
 
 涉及 `vst3_host.*`、`vst3_catalog.cpp`、`bootstrap.cpp`、`qt_ui.*`。
 
-- 新增单 worker 识别队列和取消/排空协议。
+- 新增单 worker 识别队列和停止/排空协议；当前识别控制没有安全取消 ABI，超时任务以 detached worker 方式回收，进程级 helper 隔离作为后续增强。
 - 移除 `P7Panel` 勾选回调中的同步 `g_identifyControl` 调用。
 - 识别进度、失败、重试时间和缓存写入状态进入 UI 快照。
 - 保持静态扫描和主动识别的执行证据分离。
 
-验收：冷启动、缓存命中、手动刷新、列表打开、识别进行中勾选均不阻塞 UI；同一 bundle 只识别一次；重启可复用识别缓存；关闭窗口和 GP 退出不遗留 worker。
+当前夹具验收：冷启动、缓存命中、手动刷新和列表打开均不阻塞 UI；识别中的 bundle 没有列表行；同一 bundle 只识别一次；重启可复用识别缓存；关闭窗口和 GP 退出不等待超时任务。由于识别控制没有安全取消 ABI，超时 worker 的 detached 计数会写入快照；进程级“无遗留线程”保证待 helper 隔离增强后补充。
 
 ### P8.2：schema 2 和作用域状态
 
@@ -218,6 +233,80 @@ schema 1 的顶层 `effects` 全部迁移到 `global.effects`，因为现有运�
 - 在测试 VST3 中加入可观察的实例 ID、顺序标记和增益，证明同一插件在不同 scope 使用不同实例和 state。
 - 真实 Guitar Pro 8.1.1.17 中验证启动识别、切换音轨、播放、停止、循环、保存重开、插件缺失和宿主哈希拒绝。
 - 更新安装说明和实现记录，明确真实音轨映射、capture 监听和最终声学结果的宿主限制。
+
+## P8 补齐计划：六项回归问题（P8.7–P8.12）
+
+P8.1–P8.6 作为已有基础继续保留。P8.7、P8.9、P8.10、P8.11 已通过对应夹具和真实宿主对象树；P8.8 的真实音轨映射仍未通过，因此 P8.12 联调尚不能把整体状态改为完成。实现时继续保持未知音轨上下文旁路，避免把旁路状态伪装成可用功能。
+
+### P8.7：识别中隐藏和 10 秒超时
+
+涉及 `vst3_catalog.*`、`vst3_host.*`、`bootstrap.*`、`qt_ui.*`、识别测试夹具。
+
+- 目录快照只向 UI 提供 `recognition_status=ready` 且具有完整 audio effect 元数据的条目。`queued`、`running`、缺少 class UID、`failed` 和 `timeout` 条目不进入“正在使用”或“可用插件”列表，也不能被复选框或编辑器按钮访问。后台进度只显示在扫描状态栏和入口按钮中。
+- 每个 bundle 从主动识别任务真正开始时计时，使用单调时钟设置 10 秒截止点；排队等待时间单独统计，不能因为排队而误算为插件已识别。
+- 识别控制调用可运行第三方 `DllMain`/`InitDll`，不能在 GP 进程内强制终止任意线程。当前控制接口没有安全取消 ABI，因此 worker 在截止点标记超时后 detached，结果被丢弃，主线程立即回收任务状态并继续下一个 bundle；退出流程也不等待该 detached worker。不能用 `std::future` 析构等待一个已经超时的第三方调用。后续若需要进程级终止保证，再将 factory 识别迁移到受 watchdog 管理的隔离 helper 进程。
+- 超时后写入 `recognition_status=timeout`、`recognition_error=recognition_timeout`、截止时间和尝试次数；当前扫描周期直接丢弃该候选，不能在下一次 `poll()`、列表刷新或面板重建时重新出现。手动刷新、bundle 文件指纹变化或扫描器版本变化才允许重新排队。
+- 识别期间用户已有的启用意图可以保存在 sidecar，但不能创建实例、发布运行时链或在 UI 中显示为已启用；只有下一次得到 `ready` 才恢复该意图。
+- 当前快照分别记录 worker 启动数、超时数和 detached 数，能够区分“未完成被隐藏”和“识别失败”；helper 进程及退出排空计数待进程级隔离增强后补充。
+
+验收：用一个会睡眠 11 秒的测试 bundle 启动冷扫描；10 秒时 UI 仍可操作，列表中没有该条目，状态栏显示超时计数，队列随后可以继续识别下一个 bundle；关闭 GP 不等待超时任务；重启后超时项不会从缓存重新出现在列表。
+
+### P8.8：音轨 VST3 从旁路变为可用链
+
+涉及 `gp_hook.*`、`state_manager.*`、`audio_adapter.*`、宿主观测工具、测试 VST3 和真实 Guitar Pro 回归。
+
+- 在锁定的 Guitar Pro 版本上继续以 `self`、调用线程、`IAudioBuffer` 地址、frame/channel/sample rate、调用序号和当前曲谱/选中音轨变化为证据，建立稳定的 `EffectsChain self -> track_key` 生命周期映射。`EffectsChain::index()` 只能作为诊断字段，不能单独当作音轨 ID。
+- 映射建立前，音轨页面显示“音轨效果器暂不可用（等待宿主音轨上下文）”，隐藏启用复选框或将其置为不可操作；禁止把 desired state 当成已经生效的链。global 页面不受该状态影响。
+- 映射建立后，为每个 `track_key` 预创建独立的 VST3 实例、双槽 runtime chain、planar scratch buffer 和处理计数；`processDSP` 先调用 GP 原函数，再只处理对应音轨的缓冲。未知、重复、重排、切换曲谱或生命周期失效的上下文必须旁路并记录原因。
+- 音轨链的组件/controller state、bypass、顺序和编辑器实例与 global 完全隔离；同一插件出现在两个作用域时不得共享可变 processor 或参数状态。
+- UI 只有在 runtime chain 已成功发布后才把音轨插件标为“正在使用”；创建失败、宿主拒绝和 buffer 边界不满足时回滚启用意图并显示可诊断原因。
+
+验收：至少两个真实 GP 音轨分别加载带不同实例标记和增益的测试 VST3，播放时两条 `processDSP` 路径的 track key、实例 ID、处理计数和输出能量一一对应；切换选中音轨、停止/循环和保存重开不把链广播到其他音轨。若宿主仍无法提供稳定映射，专项记录必须明确“宿主受限，P8 未完成”，不能以旁路通过代替验收。
+
+### P8.9：恢复并保护 GP 原生音源效果链
+
+涉及 `qt_ui.cpp/.h`、GP 私有控件观测、Qt UI 夹具和真实宿主截图/对象树证据。
+
+- 安装插件 UI 前先采集 `soundsContainer`、母带后期处理区域、原生音源区域及其 layout item 的对象名、类名、顺序、可见性和 parent；保存为宿主版本指纹，作为回归前后对比基线。
+- 禁止对宿主 layout 调用 `clear()`、替换中央 widget、把原生音源 widget reparent 到插件容器，或把整块 `P7Panel` 盲目追加到 `soundsContainer` 末尾。重建时只能移除由本插件创建且带有 `gpvst3*` objectName 的 wrapper、separator 和 selector。
+- 通过稳定 objectName/类名/相邻文本定位插入锚点；锚点找不到时保持插件区未挂载并报告原因，不能使用会挤掉原生控件的猜测位置。GP 重建侧边栏后重复挂载必须幂等，原生控件数量和顺序不能变化。
+- 回归证据至少包含挂载前后原生音源 UI 的对象树、layout 顺序、geometry、visibility，以及原有音源效果链仍能打开、编辑、旁路和播放的结果。
+
+验收：在同一 GP 进程中先确认原生音源效果链可见并启用，再打开本插件、切换两个作用域、刷新目录和切换选中音轨；原生音源控件不消失、不被覆盖、不被移到插件分界线之后错误的位置。
+
+### P8.10：按宿主区域放置 global/track VST3 UI 并加分界线
+
+涉及 `qt_ui.cpp/.h`、`P7Panel` 拆分后的共享模型、宿主控件锚点和 Qt/原生 UI 回归。
+
+- 选择面板的数据模型可以共享，但渲染容器按作用域拆开，不能再用一个同时代表 global 和 track 的浮动/尾部面板解决布局。
+- global 区固定插入“母带后期处理”区域的原生最后一个效果器之后，使用独立 wrapper 和水平 `QFrame::HLine` 分界线；建议稳定 objectName 为 `gpvst3GlobalVst3Section`、`gpvst3GlobalVst3Divider`、`gpvst3GlobalChainList`。
+- track 区固定插入原生“音源/音轨本身效果链”之后，使用独立 wrapper 和水平分界线；建议稳定 objectName 为 `gpvst3TrackVst3Section`、`gpvst3TrackVst3Divider`、`gpvst3TrackChainList`。track 区的选择和编辑只作用于当前已确认的音轨。
+- 两个区域都必须在 scope、曲谱、选中音轨和 GP 侧边栏重建后保持锚点；不能因为 global 页面打开而把 track 区挪走，也不能因为 track 上下文未知而隐藏或破坏 global 区。
+- 分界线是结构性 UI 元素，不使用空白、边距或标题文字代替；布局顺序和父子关系写入 UI 夹具断言。
+
+验收：真实宿主对象树能证明 global VST3 section 位于母带后期处理末尾、track VST3 section 位于原生音源效果链末尾；两条分界线可见且不会覆盖宿主控件。Qt 夹具和宿主回归都必须检查这两个相对位置。
+
+### P8.11：窄侧栏下的名称和操作布局
+
+涉及 `qt_ui.cpp/.h`、共享插件行组件、Qt offscreen 夹具和高 DPI/窄宽度回归。
+
+- 所有插件行改为左到右的稳定布局：复选框/状态、可伸缩的名称区、厂商/状态副文本、拖动手柄、`GUI`/编辑器按钮。名称和副文本使用左对齐，禁止居中；名称区设置 `QSizePolicy::Ignored` 或等效策略，允许在窄宽度下优先获得可见空间。
+- 名称过长时在行内使用省略号并提供完整名称、厂商、module/class UID 的 tooltip；不能通过把整行缩放到不可读来“适配”。启用列表和可用列表使用同一行组件，顺序和操作含义不能因宽度变化而改变。
+- 侧栏宽度小于预设阈值时，厂商副文本可折叠为 tooltip，按钮改为固定宽度图标/短文本，但复选框、拖动和 GUI 入口必须保持可点、可键盘访问。高 DPI 下按 devicePixelRatio 计算最小高度和间距。
+- 行、列表和外层 section 禁止强制固定大宽度；不要出现水平滚动条遮住名称或按钮。插件完整名称和当前状态应能通过可访问名称/API 查询得到。
+
+验收：在 260、320、420 px 侧栏宽度及 125%/150% DPI 下，长名称仍左对齐且至少显示可区分前缀；完整名称可通过 tooltip 获取；所有复选框、拖动手柄和 GUI 按钮可操作且不重叠。
+
+### P8.12：六项问题的联调、证据和交付
+
+涉及 `native/test`、真实 Guitar Pro 8.1.1.17 回归脚本、`docs/P8_IMPLEMENTATION.md`、`docs/INSTALL.md`。
+
+- 新增 `test-p8-recognition-timeout.ps1`、track runtime fixture、宿主布局快照比较、global/track 锚点断言和窄宽度 Qt fixture；现有 P8 state/recognition/UI 测试保留并扩展，不以修改断言来掩盖旁路。
+- 联调顺序固定为：冷启动识别与超时 → 原生音源链基线 → global/track section 挂载 → 音轨 runtime chain → scope 切换/拖动/保存重开 → 窄宽度和高 DPI → 退出排空。
+- 每个问题分别记录“已实现、已验证、实验性、未实现、宿主受限”。真实宿主没有证据的项目不得写入“已完成”；尤其是 track runtime 旁路、global 与 P4 capture 的相对顺序、第三方插件崩溃恢复继续单独标记。
+- 交付前运行 `git diff --check`、受影响的 C++/PowerShell/Qt 测试、真实宿主回归和 `git status`；实现记录必须列出超时隐藏、原生链保留、两个 section 的相对位置、音轨实际处理和窄宽度结果。
+
+P8 重新完成的最低证据是：识别中条目不可见且 10 秒后被忽略；至少两个音轨的 VST3 实际处理可区分；原生音源效果链仍存在；global/track UI 分别位于指定宿主区域并有分界线；窄侧栏的名称和控件可用。缺少任一项时，状态继续保持“P8 未完成”。
 
 ## 验收证据和完成标准
 
