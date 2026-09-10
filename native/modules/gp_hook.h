@@ -79,6 +79,10 @@ struct State {
     bool trackContextObserved = false;
     bool trackContextStable = false;
     bool trackScopeUnresolved = true;
+    bool effectsChainIndexAccessorFound = false;
+    bool effectsChainIndexObserved = false;
+    int observedEffectsChainIndex = -1;
+    std::size_t effectsChainContextCount = 0;
     std::string trackContextKey;
     std::size_t audioBufferSequenceCount = 0;
     std::size_t runtimeEffectInstances = 0;

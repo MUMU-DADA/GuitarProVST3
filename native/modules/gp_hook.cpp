@@ -54,6 +54,8 @@ constexpr char kMasterProcess[] =
     "?process@Master@rse@gp@@QEAAXAEAVAudioBuffer@audio@am@@AEBV?$vector@VTick@audio@am@@V?$allocator@VTick@audio@am@@@std@@@std@@AEBV?$vector@PEAVMusician@rse@gp@@V?$allocator@PEAVMusician@rse@gp@@@std@@@8@AEBV?$shared_ptr@VBackingTrack@rse@gp@@@8@@Z";
 constexpr char kEffectsChainProcessDsp[] =
     "?processDSP@EffectsChain@rse@gp@@QEAAXAEAVIAudioBuffer@audio@am@@AEAV?$array@VAudioBuffer@audio@am@@$02@std@@AEBV?$vector@VTick@audio@am@@V?$allocator@VTick@audio@am@@@std@@@8@@Z";
+constexpr char kEffectsChainIndex[] =
+    "?index@EffectsChain@rse@gp@@QEBAIXZ";
 constexpr char kRawData[] = "?rawData@AudioBuffer@audio@am@@UEBAAEBV?$array@PEAM$01@std@@XZ";
 constexpr char kFrameCount[] = "?frameCount@AudioBuffer@audio@am@@UEBA_JXZ";
 constexpr char kChannelCount[] = "?channelCount@AudioBuffer@audio@am@@UEBAIXZ";
@@ -94,6 +96,7 @@ using AudioLayerInstanceFn = void *(*)();
 using AudioLayerInputLevelFn = float (*)(const void *);
 using AudioLayerIsRunningFn = bool (*)(const void *);
 using AudioLayerBufferSizeFn = int (*)(const void *);
+using EffectsChainIndexFn = unsigned (*)(const void *);
 
 namespace fs = std::filesystem;
 using Steinberg::FUnknownPtr;
@@ -719,6 +722,7 @@ struct Runtime {
     BufferAccessFn lock = nullptr;
     BufferAccessFn unlock = nullptr;
     SampleRateFn sampleRate = nullptr;
+    EffectsChainIndexFn effectsChainIndex = nullptr;
     void *audioCore = nullptr;
     void *audioModule = nullptr;
     std::atomic<std::size_t> masterCalls{0};
@@ -726,6 +730,13 @@ struct Runtime {
     std::atomic<bool> trackContextObserved{false};
     std::atomic<bool> trackContextStable{false};
     std::atomic<bool> trackScopeUnresolved{true};
+    std::atomic<bool> effectsChainIndexObserved{false};
+    std::atomic<int> observedEffectsChainIndex{-1};
+    std::atomic<std::size_t> effectsChainContextCount{0};
+    struct EffectsChainObservation {
+        std::atomic<void *> self{nullptr};
+        std::atomic<int> index{-1};
+    } effectsChainObservations[32];
     std::atomic<std::size_t> trackChainProcessBlocks{0};
     std::atomic<std::size_t> globalChainProcessBlocks{0};
     std::atomic<std::uint64_t> callbackSequence{0};
@@ -810,6 +821,33 @@ double callbackSampleRate() noexcept {
         if (rate > 0) return static_cast<double>(rate);
     }
     return 44100.0;
+}
+
+void observeEffectsChainContext(void *self) noexcept {
+    if (!self || !g_runtime.effectsChainIndex) return;
+    const auto index = static_cast<int>(g_runtime.effectsChainIndex(self));
+    if (index < 0) return;
+    g_runtime.effectsChainIndexObserved.store(true, std::memory_order_release);
+    g_runtime.observedEffectsChainIndex.store(index, std::memory_order_relaxed);
+
+    for (auto &observation : g_runtime.effectsChainObservations) {
+        auto known = observation.self.load(std::memory_order_acquire);
+        if (known == self) {
+            if (observation.index.load(std::memory_order_acquire) != index)
+                g_runtime.trackContextStable.store(false, std::memory_order_release);
+            return;
+        }
+        if (known != nullptr) continue;
+        if (!observation.self.compare_exchange_strong(known, self,
+                                                      std::memory_order_acq_rel,
+                                                      std::memory_order_acquire))
+            continue;
+        observation.index.store(index, std::memory_order_release);
+        g_runtime.effectsChainContextCount.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+    // A full observation table is diagnostic only; processing remains bypassed.
+    g_runtime.trackContextStable.store(false, std::memory_order_release);
 }
 
 std::uint64_t bufferHash(const void *buffer) noexcept {
@@ -1054,11 +1092,12 @@ void dspProcessHook(void *self, void *buffer, void *scratch, void *ticks) {
         g_runtime.sameBufferObserved.store(true, std::memory_order_relaxed);
     if (g_runtime.dspCalls.fetch_add(1, std::memory_order_relaxed) == 0)
         g_runtime.dspThread.store(GetCurrentThreadId(), std::memory_order_relaxed);
-    // The private ABI does not expose a stable track identifier yet. Keep the
-    // observation separate and leave track processing bypassed until a future
-    // host build provides a verified mapping.
+    // EffectsChain::index() is a verified read-only accessor on the locked
+    // host build. It identifies the GP effects-chain instance, not a stable
+    // track ID; track processing remains bypassed until a track mapping and
+    // the IAudioBuffer boundary are independently validated.
     g_runtime.trackContextObserved.store(self != nullptr, std::memory_order_release);
-    g_runtime.trackContextStable.store(false, std::memory_order_release);
+    observeEffectsChainContext(self);
     g_runtime.trackScopeUnresolved.store(true, std::memory_order_release);
     if (g_inMasterHook) g_runtime.dspInsideMaster.store(true, std::memory_order_relaxed);
     reinterpret_cast<DspProcess>(g_runtime.dsp.trampoline)(self, buffer, scratch, ticks);
@@ -1131,6 +1170,7 @@ bool configureSelectedChain(const std::vector<Vst3SelectionEntry> &selection,
 
 State prepare(const host::Verification &verification, bool enableForSelection) noexcept {
     State result;
+    g_runtime.effectsChainIndex = nullptr;
     result.hostSupported = verification.supported;
     if (!verification.supported) {
         result.reason = "host_unsupported";
@@ -1142,6 +1182,7 @@ State prepare(const host::Verification &verification, bool enableForSelection) n
     g_runtime.audioModule = amaudio;
     result.masterProcess = observe(gprse, kMasterProcess);
     result.effectsChainProcessDsp = observe(gprse, kEffectsChainProcessDsp);
+    g_runtime.effectsChainIndex = reinterpret_cast<EffectsChainIndexFn>(GetProcAddress(gprse, kEffectsChainIndex));
     result.audioBufferAccessorsFound =
         observe(amaudio, kRawData).exportFound && observe(amaudio, kFrameCount).exportFound &&
         observe(amaudio, kChannelCount).exportFound;
@@ -1295,6 +1336,12 @@ State snapshot() noexcept {
     result.trackContextObserved = g_runtime.trackContextObserved.load(std::memory_order_acquire);
     result.trackContextStable = g_runtime.trackContextStable.load(std::memory_order_acquire);
     result.trackScopeUnresolved = g_runtime.trackScopeUnresolved.load(std::memory_order_acquire);
+    result.effectsChainIndexAccessorFound = result.effectsChainProcessDsp.moduleLoaded &&
+        result.effectsChainProcessDsp.exportFound && g_runtime.effectsChainIndex != nullptr;
+    result.effectsChainIndexObserved = g_runtime.effectsChainIndexObserved.load(std::memory_order_acquire);
+    result.observedEffectsChainIndex = g_runtime.observedEffectsChainIndex.load(std::memory_order_relaxed);
+    result.effectsChainContextCount =
+        g_runtime.effectsChainContextCount.load(std::memory_order_relaxed);
     {
         std::lock_guard<std::mutex> lock(g_runtime.selectionMutex);
         result.trackContextKey = g_runtime.currentTrackKey;
@@ -1520,6 +1567,13 @@ void shutdown() noexcept {
     g_runtime.trackContextObserved.store(false, std::memory_order_release);
     g_runtime.trackContextStable.store(false, std::memory_order_release);
     g_runtime.trackScopeUnresolved.store(true, std::memory_order_release);
+    g_runtime.effectsChainIndexObserved.store(false, std::memory_order_release);
+    g_runtime.observedEffectsChainIndex.store(-1, std::memory_order_relaxed);
+    g_runtime.effectsChainContextCount.store(0, std::memory_order_relaxed);
+    for (auto &observation : g_runtime.effectsChainObservations) {
+        observation.index.store(-1, std::memory_order_relaxed);
+        observation.self.store(nullptr, std::memory_order_relaxed);
+    }
     g_runtime.trackChainProcessBlocks.store(0, std::memory_order_relaxed);
     g_runtime.globalChainProcessBlocks.store(0, std::memory_order_relaxed);
     g_runtime.selectionMode.store(false, std::memory_order_release);
