@@ -40,6 +40,7 @@ if ($RejectHostFile) {
     $environment.GPVST3_P4_ROUTE = 'bus_mix'
 }
 if ($RequireP1 -or $RequireP2) {
+    $environment.GPVST3_RUN_LIFECYCLE_PROBE = '1'
     $programFiles = if ($env:ProgramW6432) { $env:ProgramW6432 } else { $env:ProgramFiles }
     $environment.GPVST3_VST3_ROOT = (@('Gateway.vst3','ParametricOD.vst3','NAM Rig.vst3') |
         ForEach-Object { Join-Path $programFiles ('Common Files/VST3/' + $_) }) -join ';'

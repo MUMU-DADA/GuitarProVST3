@@ -148,6 +148,7 @@ std::vector<Vst3SelectionEntry> captureVst3States();
 // caller supplies a native Windows child HWND created on the Qt UI thread.
 bool openVst3Editor(const Vst3SelectionEntry &entry, void *parentWindow) noexcept;
 void closeVst3Editors() noexcept;
+void scaleVst3Editor(void *host, double scale) noexcept;
 
 // Called by the eventual AudioLayer/PortAudio capture adapter. The function
 // owns no buffers and is safe to call from the audio callback after prepare().

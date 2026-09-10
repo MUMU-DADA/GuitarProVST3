@@ -6,8 +6,8 @@
 
 namespace gpvst3::vst3 {
 
-// P1 host results are plain data. The scan and plug-in lifecycle run on a
-// worker thread; Qt only serializes this snapshot afterwards.
+// Lifecycle diagnostics for explicit development probes or one user-selected
+// bundle. Static discovery never populates processor/lifecycle success flags.
 struct ClassState {
     std::string module;
     std::string classId;
@@ -35,10 +35,11 @@ struct ClassState {
     bool processProbePassed = false;
     unsigned int processProbeFrames = 0;
     std::string error;
+    bool effectIdentified = false;
 };
 
-// The UI only receives identity and compatibility results from the worker
-// scan. It never owns a module handle or creates a processor while listing.
+// Static identification is separate from tested runtime compatibility. A
+// pending file candidate has an empty classId, never a fabricated class UID.
 struct CatalogEntry {
     std::string module;
     std::string classId;
@@ -47,6 +48,8 @@ struct CatalogEntry {
     std::string category;
     bool compatible = false;
     std::string error;
+    bool identified = false;
+    std::string source;
 };
 
 struct State {
@@ -63,17 +66,30 @@ struct State {
     int processProbesPassed = 0;
     std::vector<ClassState> classes;
     std::vector<std::string> errors;
+    bool staticScan = false;
+    bool cacheHit = false;
+    int filesChecked = 0;
+    int metadataReads = 0;
+    int cacheReused = 0;
+    int modulesChecked = 0;
+    int scanGeneration = 0;
+    long long elapsedMs = 0;
+    std::string cacheStatus;
+    std::string currentModule;
+    std::vector<CatalogEntry> catalog;
 };
 
 // hostSupported gates all module loading. An unverified Guitar Pro build must
 // remain bypassed and must not load third-party code.
 State prepare(bool hostSupported = true) noexcept;
+// Explicit user selection only. Never called by static discovery or cache refresh.
+State identifyBundle(const std::string &module, bool hostSupported) noexcept;
 
-// Start metadata discovery without blocking the host's Qt startup callback.
-// The returned state is a small pending snapshot. poll() transfers the
-// completed worker result once it is ready and never waits for the scan.
+// Read the small local cache first, then check files on one worker. poll()
+// delivers changed progress/catalog snapshots without waiting for the worker.
 State beginAsync(bool hostSupported = true) noexcept;
 bool poll(State &completed) noexcept;
+void shutdownScan() noexcept;
 
 std::vector<CatalogEntry> effectCatalog(const State &state);
 

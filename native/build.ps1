@@ -3,7 +3,9 @@ param(
     [string]$OutputRoot = '',
     [string]$Vst3SdkDir = '',
     [ValidateSet('', 'GuitarPro.exe', 'GPCore.dll', 'GPRSE.dll', 'AMAudio.dll', 'AMOverloud.dll')]
-    [string]$RejectHostFile = ''
+    [string]$RejectHostFile = '',
+    [ValidateRange(0, 5000)]
+    [int]$CatalogDelayMs = 0
 )
 
 $ErrorActionPreference = 'Stop'
@@ -25,7 +27,7 @@ if (-not (Test-Path -LiteralPath (Join-Path $Vst3SdkDir 'pluginterfaces/base/fun
 }
 $Vst3SdkDir = (Resolve-Path -LiteralPath $Vst3SdkDir).Path
 
-if ($RejectHostFile -and (-not $OutputRoot -or
+if (($RejectHostFile -or $CatalogDelayMs) -and (-not $OutputRoot -or
     [IO.Path]::GetFullPath($OutputRoot).TrimEnd('\', '/') -ieq (Join-Path $projectRoot '.tools/native'))) {
     throw 'A negative-test DLL requires a separate -OutputRoot.'
 }
@@ -65,6 +67,7 @@ $sources = @(
     (Join-Path $PSScriptRoot 'modules/effect_chain.cpp'),
     (Join-Path $PSScriptRoot 'modules/gp_hook.cpp'),
     (Join-Path $PSScriptRoot 'modules/vst3_host.cpp'),
+    (Join-Path $PSScriptRoot 'modules/vst3_catalog.cpp'),
     (Join-Path $Vst3SdkDir 'pluginterfaces/base/coreiids.cpp'),
     (Join-Path $Vst3SdkDir 'pluginterfaces/base/funknown.cpp'),
     (Join-Path $Vst3SdkDir 'pluginterfaces/base/ustring.cpp'),
@@ -72,6 +75,7 @@ $sources = @(
     (Join-Path $Vst3SdkDir 'public.sdk/source/vst/vstinitiids.cpp')
 )
 $testDefines = @()
+if ($CatalogDelayMs) { $testDefines += "/DGPVST3_TEST_SCAN_DELAY_MS=$CatalogDelayMs" }
 if ($RejectHostFile) {
     $index = @('GUITARPRO.EXE','GPCORE.DLL','GPRSE.DLL','AMAUDIO.DLL','AMOVERLOUD.DLL').IndexOf($RejectHostFile.ToUpperInvariant())
     $testDefines += "/DGPVST3_TEST_REJECT_HOST_INDEX=$index"

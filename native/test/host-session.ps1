@@ -134,6 +134,21 @@ function Get-Gpvst3TestIdentity($Process, [string]$HostDirectory, [string]$Plugi
     return $identity
 }
 
+function Request-Gpvst3McpHostExit($Session, $Process) {
+    if ([Gpvst3TestProcess]::WaitForSingleObject($Process.Handle, 0) -eq 0) { return }
+    $main = Invoke-McpTool $Session gp_objects @{query='gp::gui::MainWindow';limit=10}
+    try {
+        Invoke-McpTool $Session gp_close_window @{snapshot=$main.snapshot;id=@($main.objects | Where-Object class -EQ 'gp::gui::MainWindow')[0].id} | Out-Null
+    } catch {
+        # GP can close the MCP connection before its scheduled quit response
+        # reaches the client. Settle the outcome using this exact process;
+        # never replay the close request after an unknown transport result.
+        if ([Gpvst3TestProcess]::WaitForSingleObject($Process.Handle, 5000) -ne 0) { throw }
+        $Process.Refresh()
+        if ($Process.ExitCode -ne 0) { throw }
+    }
+}
+
 function Stop-Gpvst3TestHost($Process, [switch]$KeepHost, [string]$RunDirectory = '') {
     if (-not $Process) { return }
     $forced = $false

@@ -21,10 +21,6 @@
 #include <QtCore/QJsonArray>
 #include <QtCore/QJsonDocument>
 #include <QtCore/QJsonObject>
-#include <QtCore/QProcess>
-#include <QtCore/QProcessEnvironment>
-#include <QtCore/QSaveFile>
-#include <QtCore/QTemporaryDir>
 
 #include "audio_adapter.h"
 #include "pluginterfaces/base/funknownimpl.h"
@@ -52,9 +48,6 @@ using Steinberg::Vst::IAudioProcessor;
 constexpr int kMaxSamplesPerBlock = 256;
 constexpr double kProbeSampleRate = 44100.0;
 
-std::mutex g_scanMutex;
-std::future<State> g_scanFuture;
-std::optional<State> g_cachedScan;
 
 bool succeeded(tresult result) noexcept {
     return result == Steinberg::kResultOk || result == Steinberg::kResultTrue;
@@ -388,10 +381,11 @@ ClassState validateClass(const fs::path &modulePath, Steinberg::IPluginFactory &
     return result;
 }
 
-State scanInProcess(bool metadataOnly = false) {
+State scanInProcess(bool metadataOnly = false, const std::vector<fs::path> &selected = {}) {
     State result;
     result.workerThread = true;
-    const auto modules = discover(result);
+    const auto modules = selected.empty() ? discover(result) : selected;
+    result.modulesDiscovered = static_cast<int>(modules.size());
     const char *configuredPaths = std::getenv("GPVST3_VST3_PATHS");
     if (!configuredPaths || !*configuredPaths) configuredPaths = std::getenv("GPVST3_VST3_ROOT");
     const bool validateLifecycles = !metadataOnly && configuredPaths && *configuredPaths;
@@ -478,7 +472,7 @@ State scanInProcess(bool metadataOnly = false) {
                                        : "non_audio_class";
                 const std::string subcategories = ascii(info.subCategories, Steinberg::PClassInfo2::kSubCategoriesSize);
                 const bool instrument = subcategories.find("Instrument") != std::string::npos;
-                classState.processorReady = classState.category == "Audio Module Class" && !instrument;
+                classState.effectIdentified = classState.category == "Audio Module Class" && !instrument;
                 if (instrument) classState.error = "instrument_class_not_effect";
             }
             const auto classKey = classState.module + "\\n" + classState.classId;
@@ -507,89 +501,6 @@ State scanInProcess(bool metadataOnly = false) {
     return result;
 }
 
-State scanAndValidate() {
-    const auto *configured = std::getenv("GPVST3_VST3_PATHS");
-    if (!configured || !*configured) configured = std::getenv("GPVST3_VST3_ROOT");
-    if (configured && *configured) return scanInProcess();
-    State result;
-    result.workerThread = true;
-    const auto modules = discover(result);
-    HMODULE current = nullptr;
-    GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-                      reinterpret_cast<LPCWSTR>(&scanAndValidate), &current);
-    wchar_t moduleFile[32768]{};
-    GetModuleFileNameW(current, moduleFile, 32768);
-    wchar_t systemDirectory[MAX_PATH]{};
-    GetSystemDirectoryW(systemDirectory, MAX_PATH);
-    const QString runner = QString::fromWCharArray(systemDirectory) + "/rundll32.exe";
-    QTemporaryDir temporary;
-    if (!temporary.isValid()) { result.status = "scan_directory_failed"; return result; }
-    for (const auto &path : modules) {
-        const QString output = temporary.path() + "/catalog.json";
-        QFile::remove(output);
-        QProcess process;
-        auto environment = QProcessEnvironment::systemEnvironment();
-        environment.remove("GPVST3_VST3_PATHS");
-        environment.insert("GPVST3_VST3_ROOT", QString::fromStdWString(path.wstring()));
-        process.setProcessEnvironment(environment);
-        process.setWorkingDirectory(QCoreApplication::applicationDirPath());
-        // rundll32 requires the comma/entry point outside the DLL path's
-        // quotes. QProcess argument quoting encloses the entire argument,
-        // which silently fails when installed below e.g. Program Files.
-        process.setNativeArguments(QStringLiteral("\"%1\",Gpvst3Scan \"%2\"")
-                                       .arg(QString::fromWCharArray(moduleFile), output));
-        process.start(runner, QStringList{});
-        if (!process.waitForStarted(3000) || !process.waitForFinished(10000)) {
-            process.kill();
-            process.waitForFinished(3000);
-            result.errors.push_back(path.u8string() + ":scan_timeout");
-            continue;
-        }
-        QFile file(output);
-        if (!file.open(QIODevice::ReadOnly)) {
-            result.errors.push_back(path.u8string() + ":scan_worker_failed");
-            continue;
-        }
-        const auto document = QJsonDocument::fromJson(file.readAll()).object();
-        result.modulesLoaded += document.value("modules_loaded").toInt();
-        result.classesEnumerated += document.value("classes_enumerated").toInt();
-        for (const auto &error : document.value("errors").toArray())
-            result.errors.push_back(error.toString().toStdString());
-        for (const auto &value : document.value("classes").toArray()) {
-            const auto object = value.toObject();
-            ClassState entry;
-            entry.module = path.u8string();
-            entry.classId = object.value("class_id").toString().toStdString();
-            entry.name = object.value("name").toString().toStdString();
-            entry.vendor = object.value("vendor").toString().toStdString();
-            entry.category = object.value("category").toString().toStdString();
-            entry.error = object.value("error").toString().toStdString();
-            entry.processorReady = object.value("compatible").toBool();
-            result.classes.push_back(std::move(entry));
-        }
-    }
-    result.ready = !result.classes.empty();
-    result.status = result.ready ? "catalog_ready" : "no_plugins";
-    return result;
-}
-
-void writeScanResult(const QString &path) {
-    const auto state = scanInProcess(true);
-    QJsonArray classes, errors;
-    for (const auto &entry : state.classes) classes.append(QJsonObject{
-        {"class_id", QString::fromStdString(entry.classId)}, {"name", QString::fromStdString(entry.name)},
-        {"vendor", QString::fromStdString(entry.vendor)}, {"category", QString::fromStdString(entry.category)},
-        {"error", QString::fromStdString(entry.error)}, {"compatible", entry.processorReady}});
-    for (const auto &error : state.errors) errors.append(QString::fromStdString(error));
-    const QJsonObject result{{"modules_loaded", state.modulesLoaded}, {"classes_enumerated", state.classesEnumerated},
-                              {"classes", classes}, {"errors", errors}};
-    QSaveFile file(path);
-    if (file.open(QIODevice::WriteOnly)) {
-        file.write(QJsonDocument(result).toJson(QJsonDocument::Compact));
-        file.commit();
-    }
-}
-
 } // namespace
 
 State prepare(bool hostSupported) noexcept {
@@ -600,7 +511,7 @@ State prepare(bool hostSupported) noexcept {
         return result;
     }
     try {
-        return std::async(std::launch::async, [] { return scanAndValidate(); }).get();
+        return std::async(std::launch::async, [] { return scanInProcess(); }).get();
     } catch (const std::exception &error) {
         State result;
         result.status = "error";
@@ -614,66 +525,24 @@ State prepare(bool hostSupported) noexcept {
     }
 }
 
-State beginAsync(bool hostSupported) noexcept {
-    if (!hostSupported) {
+State identifyBundle(const std::string &module, bool hostSupported) noexcept {
+    if (!hostSupported || module.empty()) {
         State result;
         result.status = "host_unsupported";
-        result.errors.push_back("host_hash_mismatch");
+        result.errors.push_back("host_unsupported");
         return result;
     }
-    std::lock_guard<std::mutex> lock(g_scanMutex);
-    if (g_cachedScan) return *g_cachedScan;
-    if (!g_scanFuture.valid()) {
-        g_scanFuture = std::async(std::launch::async, [] {
-            try {
-                return scanAndValidate();
-            } catch (const std::exception &error) {
-                State result;
-                result.status = "error";
-                result.errors.push_back(error.what());
-                return result;
-            } catch (...) {
-                State result;
-                result.status = "error";
-                result.errors.push_back("unknown_exception");
-                return result;
-            }
-        });
-    }
-    State pending;
-    pending.status = "scanning";
-    pending.scanPending = true;
-    pending.workerThread = true;
-    return pending;
-}
-
-bool poll(State &completed) noexcept {
-    std::lock_guard<std::mutex> lock(g_scanMutex);
-    if (g_cachedScan) {
-        completed = *g_cachedScan;
-        return true;
-    }
-    if (!g_scanFuture.valid() ||
-        g_scanFuture.wait_for(std::chrono::milliseconds(0)) != std::future_status::ready)
-        return false;
-    try {
-        g_cachedScan = g_scanFuture.get();
-    } catch (const std::exception &error) {
+    try { return scanInProcess(true, {fs::u8path(module)}); }
+    catch (...) {
         State result;
-        result.status = "error";
-        result.errors.push_back(error.what());
-        g_cachedScan = std::move(result);
-    } catch (...) {
-        State result;
-        result.status = "error";
-        result.errors.push_back("unknown_exception");
-        g_cachedScan = std::move(result);
+        result.status = "identification_failed";
+        result.errors.push_back("identification_exception");
+        return result;
     }
-    completed = *g_cachedScan;
-    return true;
 }
 
 std::vector<CatalogEntry> effectCatalog(const State &state) {
+    if (state.staticScan) return state.catalog;
     std::vector<CatalogEntry> result;
     std::unordered_set<std::string> seen;
     for (const auto &item : state.classes) {
@@ -682,7 +551,7 @@ std::vector<CatalogEntry> effectCatalog(const State &state) {
         if (!seen.insert(key).second) continue;
         result.push_back(CatalogEntry{item.module, item.classId, item.name, item.vendor,
                                       item.category, item.category == "Audio Module Class" && item.processorReady,
-                                      item.error});
+                                      item.error, item.effectIdentified || item.processorReady, "factory_on_request"});
     }
     std::sort(result.begin(), result.end(), [](const CatalogEntry &a, const CatalogEntry &b) {
         if (a.name != b.name) return a.name < b.name;
@@ -693,10 +562,3 @@ std::vector<CatalogEntry> effectCatalog(const State &state) {
 }
 
 } // namespace gpvst3::vst3
-
-// rundll32 child entry. No Qt plugin instance or GP hook is created here.
-extern "C" __declspec(dllexport) void CALLBACK Gpvst3Scan(HWND, HINSTANCE, LPSTR command, int) {
-    QString output = QString::fromLocal8Bit(command).trimmed();
-    if (output.startsWith('"') && output.endsWith('"')) output = output.mid(1, output.size() - 2);
-    try { gpvst3::vst3::writeScanResult(output); } catch (...) {}
-}

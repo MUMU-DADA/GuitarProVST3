@@ -19,6 +19,13 @@ bool check(bool value, const char *message) {
     if (!value) std::cerr << "FAIL: " << message << '\n';
     return value;
 }
+int opens = 0, closes = 0;
+bool openEditor(const gpvst3::ui::Vst3SelectionEntry &, void *host) noexcept {
+    ++opens;
+    gpvst3::ui::resizeNativeEditor(host, 640, 480);
+    return true;
+}
+void closeEditor() noexcept { ++closes; }
 bool rejectSelection(const std::vector<gpvst3::ui::Vst3SelectionEntry> &, std::string *error) noexcept {
     if (error) *error = "host_unsupported";
     return false;
@@ -40,7 +47,7 @@ int main(int argc, char **argv) {
     if (!check(gpvst3::state::writeChain(QJsonObject{{"effects", QJsonArray{}}}),
                "write empty P7 sidecar")) return 1;
     gpvst3::ui::setVst3Catalog(catalog);
-    gpvst3::ui::showEffectChainPanel();
+    gpvst3::ui::showEffectChainPanel(false);
     QCoreApplication::processEvents();
     auto *panel = qApp->property("gpvst3P5Panel").value<QWidget *>();
     if (!check(panel != nullptr, "P7 panel created")) return 1;
@@ -49,7 +56,7 @@ int main(int argc, char **argv) {
     panel->show();
     QCoreApplication::processEvents();
     auto *editorHost = panel->findChild<QWidget *>("gpvst3NativeEditorHost");
-    if (!check(editorHost != nullptr && !editorHost->isVisible(),
+    if (!check(editorHost == nullptr,
                "native editor host does not intercept selector clicks before opening")) return 1;
     panel->hide();
     for (auto *button : panel->findChildren<QPushButton *>()) {
@@ -79,12 +86,29 @@ int main(int argc, char **argv) {
                    !saved.value("effects").toArray().at(1).toObject().value("enabled").toBool(),
                "rejected selection is not persisted as enabled")) return 1;
     gpvst3::ui::setVst3SelectionControl(nullptr);
-    panel->findChildren<QPushButton *>().first()->click();
+    panel->findChild<QPushButton *>("gpvst3Editor_ONE")->click();
     QCoreApplication::processEvents();
     bool hostLimited = false;
     for (auto *label : panel->findChildren<QLabel *>())
         hostLimited |= label->text().contains(QStringLiteral("host_limited"));
     if (!check(hostLimited, "native editor boundary is explicit")) return 1;
+
+    gpvst3::ui::setVst3EditorControl(&openEditor, &closeEditor);
+    panel->findChild<QPushButton *>("gpvst3Editor_ONE")->click();
+    QWidget *window = nullptr;
+    for (auto *widget : QApplication::topLevelWidgets())
+        if (widget->objectName() == "gpvst3NativeEditorWindow") window = widget;
+    if (!check(window && window->isWindow() && window->isVisible() && !window->isModal() &&
+                   window->size() == QSize(640, 480) && window->parentWidget() != panel,
+               "native view has an independent correctly sized nonmodal window")) return 1;
+    const auto panelSize = panel->size();
+    panel->findChild<QPushButton *>("gpvst3Editor_ONE")->click();
+    if (!check(opens == 1 && window->size() == QSize(640, 480), "repeated open reuses view")) return 1;
+    window->move(100, 120);
+    if (!check(panel->size() == panelSize, "moving editor leaves selector layout unchanged")) return 1;
+    window->close();
+    if (!check(!window->isVisible() && first->isChecked(), "closing editor keeps effect enabled")) return 1;
+    panel->findChild<QPushButton *>("gpvst3Editor_ONE")->click();
 
     QWidget soundHost;
     soundHost.setObjectName(QStringLiteral("soundsContainer"));
@@ -105,12 +129,25 @@ int main(int argc, char **argv) {
     if (!check(opened != nullptr && opened->isVisible(),
                "entry opens the existing panel")) return 1;
     panel->close();
+    if (!check(window->isVisible(), "selector close keeps editor alive")) return 1;
+    QCoreApplication::sendPostedEvents(nullptr, QEvent::DeferredDelete);
+    if (!check(qApp->property("gpvst3P5Panel").value<QWidget *>() == nullptr,
+               "closed selector is actually destroyed before reopening")) return 1;
     QCoreApplication::processEvents(QEventLoop::AllEvents, 50);
     entry->click();
-    QCoreApplication::processEvents(QEventLoop::AllEvents, 50);
     auto *reopened = qApp->property("gpvst3P5Panel").value<QWidget *>();
-    if (!check(reopened != nullptr && reopened->isVisible(),
-               "entry reopens the panel after close")) return 1;
+    if (!check(reopened != nullptr && reopened->isVisible() && reopened->parentWidget() == &soundHost,
+               "one click synchronously recreates and shows selector after close")) return 1;
+    if (!check(window->isVisible(), "selector rebuild keeps editor alive")) return 1;
+    for (const auto &state : {QString("scanning"), QString("partial_failure"), QString("scan_failed"), QString("catalog_ready")}) {
+        gpvst3::ui::setVst3ScanState(state, 3, 20);
+        const auto text = entry->text();
+        if (!check(state == "scanning" ? text.contains("3/20") :
+                   state == "scan_failed" ? text.contains(QStringLiteral("点击重试")) : text == "VST3", "scan feedback")) return 1;
+    }
+    gpvst3::ui::setVst3ScanState("scanning", 0, 0, true);
+    if (!check(entry->text().contains(QStringLiteral("正在更新")), "cached refresh feedback")) return 1;
+    gpvst3::ui::shutdownEditors();
     reopened->close();
     std::cout << "PASS: P7 catalog UI, enabled semantics and host-limited editor evidence.\n";
     return 0;

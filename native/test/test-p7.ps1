@@ -72,12 +72,13 @@ try {
     if ($scanState.scan_pending -or $scanState.status -eq 'scanning') {
         throw "P7 VST3 metadata scan did not complete within $ScanTimeoutSeconds seconds."
     }
-    $catalog = @($status.vst3_catalog | Where-Object { $_.compatible })
+    $catalog = @($status.vst3_catalog | Where-Object { $_.identified -or -not $_.class_id })
     if ($status.qt_ui -ne 'panel_ready_p7') { throw "P7 UI state missing: $($status.qt_ui)" }
     if ($catalog.Count -eq 0) { throw 'P7 automatic VST3 catalog is empty.' }
     if ([int]$status.vst3_host.modules_discovered -lt 1) { throw 'P7 standard-directory scan found no VST3 bundle.' }
+    if ($scanState.modules_loaded -ne 0 -or $scanState.instances_created -ne 0) { throw 'Static scan loaded third-party code.' }
     $evidence = [ordered]@{
-        complete = $false
+        static_discovery_passed = $true
         identity = $identity
         host_files = $hostFiles
         host_directory = (Resolve-Path -LiteralPath $HostDirectory).Path
@@ -85,9 +86,9 @@ try {
             modules_discovered = $status.vst3_host.modules_discovered
             modules_loaded = $status.vst3_host.modules_loaded
             classes_enumerated = $status.vst3_host.classes_enumerated
-            compatible_catalog_count = $catalog.Count
+            catalog_count = $catalog.Count
             names = @($catalog | ForEach-Object { $_.name } | Sort-Object -Unique)
-            mode = $(if ($Vst3Root) { 'explicit_lifecycle_probe' } else { 'metadata_only_scan' })
+            mode = 'static_files'
             configured_root = $Vst3Root
         }
         same_level_entry = 'verified_by_mcp: gpvst3P7Panel and gpvst3SoundEffectChainButton are direct children of soundsContainer'

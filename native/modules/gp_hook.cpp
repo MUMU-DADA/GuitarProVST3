@@ -19,6 +19,7 @@
 #include "audio_adapter.h"
 #include "effect_chain.h"
 #include "vst3_parameters.h"
+#include "qt_ui.h"
 #include "pluginterfaces/vst/ivstmessage.h"
 #include <memory>
 #include "portaudio_capture_abi.h"
@@ -32,10 +33,12 @@
 #include "pluginterfaces/vst/ivstpluginterfacesupport.h"
 #include "public.sdk/source/common/memorystream.h"
 #include "pluginterfaces/gui/iplugview.h"
+#include "pluginterfaces/gui/iplugviewcontentscalesupport.h"
 
 namespace Steinberg {
 DEF_CLASS_IID(IPlugView)
 DEF_CLASS_IID(IPlugFrame)
+DEF_CLASS_IID(IPlugViewContentScaleSupport)
 }
 
 namespace gpvst3::hook {
@@ -131,8 +134,7 @@ public:
         if (!newSize || !hostWindow_) return Steinberg::kInvalidArgument;
         const int width = (std::max)(1, newSize->getWidth());
         const int height = (std::max)(1, newSize->getHeight());
-        SetWindowPos(hostWindow_, nullptr, 0, 0, width, height,
-                     SWP_NOACTIVATE | SWP_NOMOVE | SWP_NOZORDER);
+        gpvst3::ui::resizeNativeEditor(reinterpret_cast<void *>(hostWindow_), width, height);
         return view && succeeded(view->onSize(newSize)) ? Steinberg::kResultTrue
                                                         : Steinberg::kResultFalse;
     }
@@ -315,6 +317,11 @@ struct RuntimeEffect {
             if (!succeeded(factory->getClassInfo(index, &info))) continue;
             if (std::strcmp(info.category, "Audio Module Class") != 0) continue;
             if (!requestedClassId.empty() && uidString(info.cid) != requestedClassId) continue;
+            if (auto factory2 = FUnknownPtr<Steinberg::IPluginFactory2>(factory.get())) {
+                Steinberg::PClassInfo2 details{};
+                if (!succeeded(factory2->getClassInfo2(index, &details)) ||
+                    std::string(details.subCategories).find("Instrument") != std::string::npos) continue;
+            }
             selected = info;
             found = true;
             break;
@@ -511,12 +518,13 @@ struct RuntimeEffect {
             editorError = "editor_frame_failed";
             return false;
         }
+        if (auto scale = FUnknownPtr<Steinberg::IPlugViewContentScaleSupport>(editor.get()))
+            scale->setContentScaleFactor(static_cast<float>(gpvst3::ui::nativeEditorScale(reinterpret_cast<void *>(parentWindow))));
         ViewRect rect{};
         if (!succeeded(editor->getSize(&rect))) {
             rect = ViewRect(0, 0, 420, 260);
         }
-        SetWindowPos(parentWindow, nullptr, 0, 0, (std::max)(1, rect.getWidth()),
-                     (std::max)(1, rect.getHeight()), SWP_NOACTIVATE | SWP_NOMOVE | SWP_NOZORDER);
+        gpvst3::ui::resizeNativeEditor(reinterpret_cast<void *>(parentWindow), rect.getWidth(), rect.getHeight());
         if (!succeeded(editor->attached(reinterpret_cast<void *>(parentWindow),
                                         Steinberg::kPlatformTypeHWND))) {
             editor->setFrame(nullptr);
@@ -1617,6 +1625,19 @@ bool openVst3Editor(const Vst3SelectionEntry &entry, void *parentWindow) noexcep
             return slot.effects[index]->openEditor(static_cast<HWND>(parentWindow));
     }
     return false;
+}
+
+void scaleVst3Editor(void *host, double factor) noexcept {
+    for (auto &slot : g_runtime.selectionSlots) for (std::size_t i = 0; i < slot.count; ++i) {
+        auto &effect = *slot.effects[i];
+        if (effect.editorParent != host || !effect.editor) continue;
+        if (auto scale = FUnknownPtr<Steinberg::IPlugViewContentScaleSupport>(effect.editor.get())) {
+            if (!succeeded(scale->setContentScaleFactor(static_cast<float>(factor)))) continue;
+            ViewRect size{};
+            if (succeeded(effect.editor->getSize(&size)) && effect.plugFrame)
+                effect.plugFrame->resizeView(effect.editor.get(), &size);
+        }
+    }
 }
 
 void closeVst3Editors() noexcept {

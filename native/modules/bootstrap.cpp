@@ -9,6 +9,8 @@
 
 #include <QtCore/QJsonArray>
 #include <QtCore/QString>
+#include <QtCore/QTimer>
+#include <QtCore/QCoreApplication>
 
 namespace {
 
@@ -53,6 +55,12 @@ QJsonObject vst3Status(const gpvst3::vst3::State &value) {
         {"ready", value.ready},
         {"worker_thread", value.workerThread},
         {"scan_pending", value.scanPending},
+        {"scan_mode", value.staticScan ? "static_files" : "explicit_lifecycle_probe"},
+        {"cache_hit", value.cacheHit}, {"cache_status", QString::fromStdString(value.cacheStatus)},
+        {"files_checked", value.filesChecked}, {"metadata_reads", value.metadataReads},
+        {"cache_reused", value.cacheReused}, {"modules_checked", value.modulesChecked},
+        {"scan_generation", value.scanGeneration}, {"elapsed_ms", static_cast<qint64>(value.elapsedMs)},
+        {"current_module", QString::fromStdString(value.currentModule)},
         {"modules_discovered", value.modulesDiscovered},
         {"modules_loaded", value.modulesLoaded},
         {"classes_enumerated", value.classesEnumerated},
@@ -75,8 +83,38 @@ QJsonArray vst3Catalog(const gpvst3::vst3::State &value) {
             {"vendor", QString::fromUtf8(entry.vendor.data())},
             {"category", QString::fromUtf8(entry.category.data())},
             {"compatible", entry.compatible},
+            {"identified", entry.identified},
+            {"source", QString::fromStdString(entry.source)},
             {"error", QString::fromUtf8(entry.error.data())}});
     }
+    return result;
+}
+
+void scanFeedback(const gpvst3::vst3::State &scan) {
+    QStringList details;
+    for (const auto &error : scan.errors) details.append(QString::fromStdString(error));
+    if (!scan.currentModule.empty()) details.prepend(QString::fromStdString(scan.currentModule));
+    gpvst3::ui::setVst3ScanState(QString::fromStdString(scan.status), scan.modulesChecked,
+                                scan.modulesDiscovered, scan.cacheHit, details.join('\n'));
+}
+
+void refreshCatalog() {
+    const auto pending = gpvst3::vst3::beginAsync(gpvst3::hook::snapshot().hostSupported);
+    scanFeedback(pending);
+}
+
+QJsonArray identifyBundle(const QString &module, QString *error) {
+    // Selection is explicit, but the version/configuration gate still precedes third-party code.
+    const auto host = gpvst3::host::verify();
+    if (!host.supported || qEnvironmentVariable("GPVST3_ENABLE_P2_HOOK") == "0") {
+        if (error) *error = host.supported ? QStringLiteral("realtime_disabled_by_environment") : QStringLiteral("host_unsupported");
+        return {};
+    }
+    const auto state = gpvst3::vst3::identifyBundle(module.toStdString(), true);
+    QJsonArray result;
+    for (const auto &value : vst3Catalog(state)) if (value.toObject().value("identified").toBool()) result.append(value);
+    if (result.isEmpty() && error) *error = state.errors.empty() ? QStringLiteral("未识别到音频效果器")
+        : QString::fromStdString(state.errors.front());
     return result;
 }
 
@@ -202,12 +240,18 @@ QJsonObject initialize() {
     ui::setRealtimeBypassControl(&hook::setTotalBypass);
     ui::setVst3SelectionControl(&hook::setVst3Selection);
     ui::setVst3StateControl(&hook::captureVst3States);
-    ui::setVst3EditorControl(&hook::openVst3Editor, &hook::closeVst3Editors);
+    ui::setVst3EditorControl(&hook::openVst3Editor, &hook::closeVst3Editors, &hook::scaleVst3Editor);
     const auto hookState = hook::snapshot();
-    const auto vst3 = vst3::beginAsync(host.supported);
+    ui::setVst3DiscoveryControl(&refreshCatalog, &identifyBundle);
+    auto *refreshTimer = new QTimer(QCoreApplication::instance());
+    refreshTimer->setInterval(60000);
+    QObject::connect(refreshTimer, &QTimer::timeout, refreshTimer, &refreshCatalog);
+    refreshTimer->start();
+    const auto vst3 = qEnvironmentVariable("GPVST3_RUN_LIFECYCLE_PROBE") == "1"
+        ? vst3::prepare(host.supported) : vst3::beginAsync(host.supported);
     const auto catalog = vst3Catalog(vst3);
     ui::setVst3Catalog(catalog);
-    ui::setVst3ScanState(vst3.scanPending ? QStringLiteral("scanning") : QStringLiteral("ready"));
+    scanFeedback(vst3);
     effects::Chain chain;
     chain.setBypassed(!hookState.runtimeProcessorReady);
 
@@ -248,6 +292,7 @@ bool pollVst3(QJsonObject &status) {
     if (!vst3::poll(completed)) return false;
     const auto catalog = vst3Catalog(completed);
     ui::setVst3Catalog(catalog);
+    scanFeedback(completed);
     status.insert("vst3_host", vst3Status(completed));
     status.insert("vst3_catalog", catalog);
     state::writeStatus(status);

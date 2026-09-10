@@ -11,6 +11,7 @@
 #include "modules/gp_hook.h"
 #include "modules/qt_ui.h"
 #include "modules/state_manager.h"
+#include "modules/vst3_host.h"
 
 namespace {
 
@@ -32,8 +33,30 @@ void writeObservation() {
 }
 
 void stopObservation() {
+    gpvst3::vst3::shutdownScan();
     gpvst3::state::writeRealtimeObservation(gpvst3::bootstrap::hookSnapshot());
+    gpvst3::ui::shutdownEditors();
     gpvst3::hook::shutdown();
+}
+
+void initializePlugin() {
+    auto *application = QCoreApplication::instance();
+    auto status = gpvst3::bootstrap::initialize();
+    status.insert("plugin_path", pluginPath());
+    gpvst3::state::writeStatus(status);
+    gpvst3::ui::showEffectChainPanel(false);
+    gpvst3::ui::syncVst3Selection();
+    auto *scanTimer = new QTimer(application);
+    scanTimer->setInterval(100);
+    QObject::connect(scanTimer, &QTimer::timeout, application,
+                     [status]() mutable { gpvst3::bootstrap::pollVst3(status); });
+    scanTimer->start();
+    // A P7 selection can start the hook after bootstrap. Keep its
+    // observation and shutdown lifecycle available in default launches.
+    writeObservation();
+    QObject::connect(application, &QCoreApplication::aboutToQuit, application, &gpvst3::ui::shutdownEditors);
+    QObject::connect(application, &QCoreApplication::aboutToQuit, application, &gpvst3::vst3::shutdownScan);
+    qAddPostRoutine(&stopObservation);
 }
 
 }
@@ -49,26 +72,7 @@ public:
         if (qApp->property("gpvst3P0Scheduled").toBool()) return;
         qApp->setProperty("gpvst3P0Scheduled", true);
         auto *application = qApp;
-        QTimer::singleShot(0, application, [application] {
-            auto status = gpvst3::bootstrap::initialize();
-            status.insert("plugin_path", pluginPath());
-            gpvst3::state::writeStatus(status);
-            gpvst3::ui::showEffectChainPanel();
-            gpvst3::ui::syncVst3Selection();
-            auto *scanTimer = new QTimer(application);
-            scanTimer->setInterval(100);
-            QObject::connect(scanTimer, &QTimer::timeout, scanTimer,
-                             [scanTimer, status]() mutable {
-                                 if (!gpvst3::bootstrap::pollVst3(status)) return;
-                                 scanTimer->stop();
-                                 scanTimer->deleteLater();
-                             });
-            scanTimer->start();
-            // A P7 selection can start the hook after bootstrap. Keep its
-            // observation and shutdown lifecycle available in default launches.
-            writeObservation();
-            qAddPostRoutine(&stopObservation);
-        });
+        QTimer::singleShot(0, application, &initializePlugin);
     }
 
     Capabilities capabilities(QIODevice *, const QByteArray &) const override { return {}; }
