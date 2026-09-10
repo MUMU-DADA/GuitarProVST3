@@ -421,12 +421,12 @@ public:
         globalLayout->addWidget(globalAvailableList_, 1);
         scopeTabs_->addTab(globalPage, QStringLiteral("全局 Master"));
         root->addWidget(scopeTabs_, 1);
-        if (qEnvironmentVariable("GPVST3_TRACK").isEmpty()) {
-            bool hostWindow = false;
-            for (auto *widget : QApplication::topLevelWidgets())
-                hostWindow |= QByteArray(widget->metaObject()->className()) == "gp::gui::MainWindow";
-            if (!hostWindow) scope_ = state::ScopeKind::Global;
-        }
+        // A track tab is safe only when the host supplies a stable track
+        // context. Without that key, keep the legacy global chain as the
+        // initial scope so existing selections continue to process through
+        // the verified Master hook; the unresolved track tab remains visible
+        // and explicitly bypassed until a context is provided.
+        if (qEnvironmentVariable("GPVST3_TRACK").isEmpty()) scope_ = state::ScopeKind::Global;
         scopeTabs_->setCurrentIndex(scope_ == state::ScopeKind::Global ? 1 : 0);
         status_ = new QLabel(this);
         status_->setObjectName(QStringLiteral("gpvst3Status"));
