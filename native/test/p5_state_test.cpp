@@ -29,8 +29,9 @@ int main(int argc, char **argv) {
 
     QJsonObject empty;
     if (!check(gpvst3::state::loadChain(empty), "load default sidecar")) return 1;
-    if (!check(empty.value("schema").toInt() == 1 && empty.value("track").toInt() == 3,
-               "default identity")) return 1;
+    if (!check(empty.value("schema").toInt() == 2 && empty.value("track").toInt() == 3 &&
+                   empty.value("global").isObject() && empty.value("scores").isObject(),
+               "default schema 2 identity")) return 1;
     if (!check(empty.value("effects").isArray() && empty.value("effects").toArray().isEmpty(),
                "default effects")) return 1;
 

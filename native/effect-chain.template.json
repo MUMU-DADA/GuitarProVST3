@@ -1,7 +1,21 @@
 {
-  "schema": 1,
+  "schema": 2,
   "score_id": "unspecified",
   "track": 0,
   "bus": "master",
-  "effects": []
+  "effects": [],
+  "global": {
+    "effects": []
+  },
+  "scores": {
+    "unspecified": {
+      "tracks": {
+        "unspecified#track-0": {
+          "track_index": 0,
+          "track_name": "",
+          "effects": []
+        }
+      }
+    }
+  }
 }

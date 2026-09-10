@@ -16,6 +16,8 @@
 ## 文档入口
 
 - [实时实现计划](docs/REALTIME_IMPLEMENTATION_PLAN.md)：开发目标、交付边界、P0–P6 阶段、验收条件、核心约束和里程碑。
+- [P8 音轨级与全局 VST3 计划](docs/P8_TRACK_GLOBAL_VST3_PLAN.md)：后台识别、global/track 作用域、启用项排序、拖动顺序和音轨级实时接入的新增计划。
+- [P8 实现记录](docs/P8_IMPLEMENTATION.md)：已实现范围、专项验证和宿主受限项。
 - [P0 实现记录](docs/P0_IMPLEMENTATION.md)：当前实现边界、构建方式和原软件免安装测试入口。
 - [VST3 效果器链路预研报告（最终版）](gp8-vst3-research-20260909/VST3效果器链路预研报告_最终版.md)：接入点、私有 ABI、`IAudioBuffer`、RSE 处理链和输入输出限制的依据。
 - [原始预研报告](gp8-vst3-research-20260909/research_report.md)：预研原始记录和补充证据。

@@ -50,10 +50,16 @@ struct CatalogEntry {
     std::string error;
     bool identified = false;
     std::string source;
+    std::string recognitionStatus = "idle";
+    std::string recognitionSource;
+    int recognitionAttempts = 0;
+    std::string recognitionError;
+    long long recognitionRetryAfter = 0;
 };
 
 struct State {
     std::string status = "pending_p1";
+    bool hostSupported = false;
     bool ready = false;
     bool workerThread = false;
     bool scanPending = false;
@@ -77,7 +83,18 @@ struct State {
     std::string cacheStatus;
     std::string currentModule;
     std::vector<CatalogEntry> catalog;
+    // Static file discovery and active factory recognition are reported
+    // separately. Recognition always runs on the control worker.
+    bool recognitionPending = false;
+    bool recognitionWorker = false;
+    int recognitionAttempted = 0;
+    int recognitionCompleted = 0;
+    int recognitionFailed = 0;
+    std::string recognitionCurrentModule;
+    std::string recognitionStatus = "idle";
 };
+
+using RecognitionControl = State (*)(const std::string &, bool) noexcept;
 
 // hostSupported gates all module loading. An unverified Guitar Pro build must
 // remain bypassed and must not load third-party code.
@@ -90,6 +107,7 @@ State identifyBundle(const std::string &module, bool hostSupported) noexcept;
 State beginAsync(bool hostSupported = true) noexcept;
 bool poll(State &completed) noexcept;
 void shutdownScan() noexcept;
+void setRecognitionControl(RecognitionControl control) noexcept;
 
 std::vector<CatalogEntry> effectCatalog(const State &state);
 

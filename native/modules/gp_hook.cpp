@@ -15,6 +15,7 @@
 #include <mutex>
 #include <string>
 #include <vector>
+#include <unordered_map>
 
 #include "audio_adapter.h"
 #include "effect_chain.h"
@@ -722,6 +723,11 @@ struct Runtime {
     void *audioModule = nullptr;
     std::atomic<std::size_t> masterCalls{0};
     std::atomic<std::size_t> dspCalls{0};
+    std::atomic<bool> trackContextObserved{false};
+    std::atomic<bool> trackContextStable{false};
+    std::atomic<bool> trackScopeUnresolved{true};
+    std::atomic<std::size_t> trackChainProcessBlocks{0};
+    std::atomic<std::size_t> globalChainProcessBlocks{0};
     std::atomic<std::uint64_t> callbackSequence{0};
     std::atomic<std::uint64_t> masterFirstSequence{0};
     std::atomic<std::uint64_t> masterLastSequence{0};
@@ -754,6 +760,8 @@ struct Runtime {
     SelectionSlot selectionSlots[2];
     std::mutex selectionMutex;
     std::vector<Vst3SelectionEntry> requestedSelection;
+    std::unordered_map<std::string, std::vector<Vst3SelectionEntry>> requestedTrackSelections;
+    std::string currentTrackKey;
     std::atomic<bool> selectionMode{false};
     std::atomic<bool> selectionPublished{false};
     effects::Chain chain;
@@ -881,6 +889,7 @@ void masterProcessHook(void *self, void *buffer, void *ticks, void *musicians,
             audio::bypass(block);
         if (chainResult.completed && !chainResult.bypassed && !chainResult.error) {
             g_runtime.effectCalls.fetch_add(1, std::memory_order_relaxed);
+            g_runtime.globalChainProcessBlocks.fetch_add(1, std::memory_order_relaxed);
             g_runtime.effectProcessed.store(true, std::memory_order_relaxed);
         }
         if (effectBefore != bufferHash(buffer) && !chainResult.bypassed)
@@ -1045,6 +1054,12 @@ void dspProcessHook(void *self, void *buffer, void *scratch, void *ticks) {
         g_runtime.sameBufferObserved.store(true, std::memory_order_relaxed);
     if (g_runtime.dspCalls.fetch_add(1, std::memory_order_relaxed) == 0)
         g_runtime.dspThread.store(GetCurrentThreadId(), std::memory_order_relaxed);
+    // The private ABI does not expose a stable track identifier yet. Keep the
+    // observation separate and leave track processing bypassed until a future
+    // host build provides a verified mapping.
+    g_runtime.trackContextObserved.store(self != nullptr, std::memory_order_release);
+    g_runtime.trackContextStable.store(false, std::memory_order_release);
+    g_runtime.trackScopeUnresolved.store(true, std::memory_order_release);
     if (g_inMasterHook) g_runtime.dspInsideMaster.store(true, std::memory_order_relaxed);
     reinterpret_cast<DspProcess>(g_runtime.dsp.trampoline)(self, buffer, scratch, ticks);
 }
@@ -1273,6 +1288,17 @@ State snapshot() noexcept {
     result.effectsChainAfterMasterObserved =
         g_runtime.dspAfterMasterObserved.load(std::memory_order_relaxed);
     result.sameBufferObserved = g_runtime.sameBufferObserved.load(std::memory_order_relaxed);
+    result.globalChainEnabled = g_runtime.selectionPublished.load(std::memory_order_acquire) ||
+        g_runtime.chain.snapshot().activeSlot >= 0;
+    result.globalChainProcessBlocks = g_runtime.globalChainProcessBlocks.load(std::memory_order_relaxed);
+    result.trackChainProcessBlocks = g_runtime.trackChainProcessBlocks.load(std::memory_order_relaxed);
+    result.trackContextObserved = g_runtime.trackContextObserved.load(std::memory_order_acquire);
+    result.trackContextStable = g_runtime.trackContextStable.load(std::memory_order_acquire);
+    result.trackScopeUnresolved = g_runtime.trackScopeUnresolved.load(std::memory_order_acquire);
+    {
+        std::lock_guard<std::mutex> lock(g_runtime.selectionMutex);
+        result.trackContextKey = g_runtime.currentTrackKey;
+    }
     result.crossThreadObserved = result.masterProcess.threadId != 0 &&
         result.effectsChainProcessDsp.threadId != 0 &&
         result.masterProcess.threadId != result.effectsChainProcessDsp.threadId;
@@ -1485,6 +1511,17 @@ void shutdown() noexcept {
     g_runtime.effects[1].shutdown();
     g_runtime.selectionSlots[0].shutdown();
     g_runtime.selectionSlots[1].shutdown();
+    {
+        std::lock_guard<std::mutex> lock(g_runtime.selectionMutex);
+        g_runtime.requestedSelection.clear();
+        g_runtime.requestedTrackSelections.clear();
+        g_runtime.currentTrackKey.clear();
+    }
+    g_runtime.trackContextObserved.store(false, std::memory_order_release);
+    g_runtime.trackContextStable.store(false, std::memory_order_release);
+    g_runtime.trackScopeUnresolved.store(true, std::memory_order_release);
+    g_runtime.trackChainProcessBlocks.store(0, std::memory_order_relaxed);
+    g_runtime.globalChainProcessBlocks.store(0, std::memory_order_relaxed);
     g_runtime.selectionMode.store(false, std::memory_order_release);
     g_runtime.selectionPublished.store(false, std::memory_order_release);
 }
@@ -1595,6 +1632,42 @@ bool setVst3Selection(const std::vector<Vst3SelectionEntry> &selection, std::str
     if (!configureSelectedChain(selection, error)) return false;
     g_runtime.requestedSelection = selection;
     return true;
+}
+
+bool setGlobalVst3Selection(const std::vector<Vst3SelectionEntry> &selection,
+                            std::string *error) noexcept {
+    return setVst3Selection(selection, error);
+}
+
+bool setTrackVst3Selection(const std::string &trackKey,
+                           const std::vector<Vst3SelectionEntry> &selection,
+                           std::string *error) noexcept {
+    if (error) error->clear();
+    if (trackKey.empty()) {
+        if (error) *error = "track_scope_unresolved";
+        return false;
+    }
+    std::lock_guard<std::mutex> lock(g_runtime.selectionMutex);
+    if (selection.size() > SelectionSlot::kMaxEffects) {
+        if (error) *error = "runtime_vst3_chain_full";
+        return false;
+    }
+    g_runtime.currentTrackKey = trackKey;
+    g_runtime.requestedTrackSelections[trackKey] = selection;
+    // Until processDSP exposes a stable self -> track mapping, a track chain
+    // is intentionally held as desired state and remains bypassed.
+    g_runtime.trackScopeUnresolved.store(true, std::memory_order_release);
+    return true;
+}
+
+std::vector<Vst3SelectionEntry> captureGlobalVst3States() {
+    return captureVst3States();
+}
+
+std::vector<Vst3SelectionEntry> captureTrackVst3States(const std::string &trackKey) {
+    std::lock_guard<std::mutex> lock(g_runtime.selectionMutex);
+    const auto it = g_runtime.requestedTrackSelections.find(trackKey);
+    return it == g_runtime.requestedTrackSelections.end() ? std::vector<Vst3SelectionEntry>{} : it->second;
 }
 
 std::vector<Vst3SelectionEntry> captureVst3States() {

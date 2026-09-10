@@ -52,6 +52,7 @@ QJsonObject vst3Status(const gpvst3::vst3::State &value) {
     for (const auto &item : value.errors) errors.append(QString::fromUtf8(item.data()));
     return QJsonObject{
         {"status", QString::fromUtf8(value.status.data())},
+        {"host_supported", value.hostSupported},
         {"ready", value.ready},
         {"worker_thread", value.workerThread},
         {"scan_pending", value.scanPending},
@@ -62,6 +63,13 @@ QJsonObject vst3Status(const gpvst3::vst3::State &value) {
         {"scan_generation", value.scanGeneration}, {"elapsed_ms", static_cast<qint64>(value.elapsedMs)},
         {"current_module", QString::fromStdString(value.currentModule)},
         {"modules_discovered", value.modulesDiscovered},
+        {"recognition_pending", value.recognitionPending},
+        {"recognition_worker", value.recognitionWorker},
+        {"recognition_attempted", value.recognitionAttempted},
+        {"recognition_completed", value.recognitionCompleted},
+        {"recognition_failed", value.recognitionFailed},
+        {"recognition_current_module", QString::fromStdString(value.recognitionCurrentModule)},
+        {"recognition_status", QString::fromStdString(value.recognitionStatus)},
         {"modules_loaded", value.modulesLoaded},
         {"classes_enumerated", value.classesEnumerated},
         {"instances_created", value.instancesCreated},
@@ -85,7 +93,12 @@ QJsonArray vst3Catalog(const gpvst3::vst3::State &value) {
             {"compatible", entry.compatible},
             {"identified", entry.identified},
             {"source", QString::fromStdString(entry.source)},
-            {"error", QString::fromUtf8(entry.error.data())}});
+            {"error", QString::fromUtf8(entry.error.data())},
+            {"recognition_status", QString::fromStdString(entry.recognitionStatus)},
+            {"recognition_source", QString::fromStdString(entry.recognitionSource)},
+            {"recognition_attempts", entry.recognitionAttempts},
+            {"recognition_error", QString::fromStdString(entry.recognitionError)},
+            {"recognition_retry_after", static_cast<qint64>(entry.recognitionRetryAfter)}});
     }
     return result;
 }
@@ -94,7 +107,11 @@ void scanFeedback(const gpvst3::vst3::State &scan) {
     QStringList details;
     for (const auto &error : scan.errors) details.append(QString::fromStdString(error));
     if (!scan.currentModule.empty()) details.prepend(QString::fromStdString(scan.currentModule));
-    gpvst3::ui::setVst3ScanState(QString::fromStdString(scan.status), scan.modulesChecked,
+    if (!scan.recognitionCurrentModule.empty())
+        details.prepend(QStringLiteral("识别：") + QString::fromStdString(scan.recognitionCurrentModule));
+    const auto phase = scan.recognitionPending || scan.recognitionWorker
+        ? QStringLiteral("recognition") : QString::fromStdString(scan.status);
+    gpvst3::ui::setVst3ScanState(phase, scan.modulesChecked,
                                 scan.modulesDiscovered, scan.cacheHit, details.join('\n'));
 }
 
@@ -175,6 +192,13 @@ QJsonObject hookStatus(const gpvst3::hook::State &value) {
         {"max_process_nanoseconds", static_cast<qint64>(value.maxProcessNanoseconds)},
         {"total_process_nanoseconds", static_cast<qint64>(value.totalProcessNanoseconds)},
         {"chain_switch_count", static_cast<qint64>(value.chainSwitchCount)},
+        {"global_chain_enabled", value.globalChainEnabled},
+        {"global_chain_process_blocks", static_cast<qint64>(value.globalChainProcessBlocks)},
+        {"track_chain_process_blocks", static_cast<qint64>(value.trackChainProcessBlocks)},
+        {"track_context_observed", value.trackContextObserved},
+        {"track_context_stable", value.trackContextStable},
+        {"track_scope_unresolved", value.trackScopeUnresolved},
+        {"track_context_key", QString::fromStdString(value.trackContextKey)},
         {"audio_buffer_sequence_count", static_cast<qint64>(value.audioBufferSequenceCount)},
         {"runtime_effect_instances", static_cast<qint64>(value.runtimeEffectInstances)},
         {"reconfiguration_passed", static_cast<qint64>(value.reconfigurationPassed)},
@@ -238,10 +262,12 @@ QJsonObject initialize() {
     const auto host = host::verify();
     hook::prepare(host);
     ui::setRealtimeBypassControl(&hook::setTotalBypass);
-    ui::setVst3SelectionControl(&hook::setVst3Selection);
-    ui::setVst3StateControl(&hook::captureVst3States);
+    ui::setVst3SelectionControl(&hook::setGlobalVst3Selection);
+    ui::setVst3TrackSelectionControl(&hook::setTrackVst3Selection);
+    ui::setVst3StateControl(&hook::captureGlobalVst3States);
     ui::setVst3EditorControl(&hook::openVst3Editor, &hook::closeVst3Editors, &hook::scaleVst3Editor);
     const auto hookState = hook::snapshot();
+    vst3::setRecognitionControl(&vst3::identifyBundle);
     ui::setVst3DiscoveryControl(&refreshCatalog, &identifyBundle);
     auto *refreshTimer = new QTimer(QCoreApplication::instance());
     refreshTimer->setInterval(60000);

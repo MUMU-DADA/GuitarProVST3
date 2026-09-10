@@ -34,6 +34,10 @@ std::atomic<bool> stopping{false};
 State snapshot;
 // Destroy/join the worker before the snapshot it publishes into.
 std::future<State> scanFuture;
+std::future<State> recognitionFuture;
+QStringList recognitionQueue;
+QString recognitionModule;
+RecognitionControl recognitionControl = nullptr;
 unsigned revision = 0, delivered = 0;
 int generation = 0;
 
@@ -109,6 +113,11 @@ CatalogEntry entryFrom(const QString &module, const QJsonObject &value) {
     entry.identified = value.value("identified").toBool();
     entry.source = value.value("source").toString().toStdString();
     entry.error = value.value("error").toString().toStdString();
+    entry.recognitionStatus = value.value("recognition_status").toString().toStdString();
+    entry.recognitionSource = value.value("recognition_source").toString().toStdString();
+    entry.recognitionAttempts = value.value("recognition_attempts").toInt();
+    entry.recognitionError = value.value("recognition_error").toString().toStdString();
+    entry.recognitionRetryAfter = static_cast<long long>(value.value("recognition_retry_after").toDouble());
     return entry;
 }
 
@@ -122,7 +131,8 @@ bool validEntries(const QJsonArray &entries) {
         seen.insert(uid);
         if (entry.value("identified").toBool()) {
             if (!validUid(uid) || entry.value("category").toString() != "Audio Module Class" ||
-                entry.value("source").toString() != "moduleinfo") return false;
+                (entry.value("source").toString() != "moduleinfo" &&
+                 entry.value("source").toString() != "factory")) return false;
         } else if (!uid.isEmpty()) return false;
     }
     return true;
@@ -252,6 +262,72 @@ void publish(const State &state) {
     ++revision;
 }
 
+void persistRecognition(const QString &module, const State &identified) {
+    const auto path = cachePath();
+    QFile file(path);
+    if (!file.open(QIODevice::ReadOnly)) return;
+    QJsonParseError parse{};
+    auto document = QJsonDocument::fromJson(file.readAll(), &parse);
+    file.close();
+    if (parse.error != QJsonParseError::NoError || !document.isObject()) return;
+    auto cache = document.object();
+    auto scopes = cache.value("scopes").toObject();
+    std::vector<CatalogEntry> recognized = identified.catalog;
+    if (recognized.empty()) {
+        for (const auto &item : identified.classes) {
+            if (item.category != "Audio Module Class") continue;
+            recognized.push_back(CatalogEntry{item.module, item.classId, item.name, item.vendor,
+                item.category, item.processorReady, item.error, item.effectIdentified || item.processorReady,
+                "factory"});
+        }
+    }
+    QJsonArray jsonEntries;
+    for (const auto &entry : recognized) {
+        if (entry.module != module.toStdString() || !entry.identified ||
+            entry.category != "Audio Module Class") continue;
+        jsonEntries.append(QJsonObject{{"class_id", QString::fromStdString(entry.classId)},
+            {"name", QString::fromStdString(entry.name)}, {"vendor", QString::fromStdString(entry.vendor)},
+            {"category", QString::fromStdString(entry.category)}, {"identified", true}, {"source", "factory"}});
+    }
+    for (auto scope = scopes.begin(); scope != scopes.end(); ++scope) {
+        auto scopeObject = scope.value().toObject();
+        auto modules = scopeObject.value("modules").toObject();
+        auto record = modules.value(module).toObject();
+        if (record.isEmpty()) continue;
+        record.insert("recognition_status", jsonEntries.isEmpty() ? "failed" : "ready");
+        record.insert("recognition_source", "factory");
+        record.insert("recognition_attempts", record.value("recognition_attempts").toInt() + 1);
+        record.insert("recognition_error", jsonEntries.isEmpty() && !identified.errors.empty()
+                     ? QString::fromStdString(identified.errors.front()) : QString{});
+        record.insert("recognition_retry_after", jsonEntries.isEmpty()
+                     ? static_cast<double>(QDateTime::currentSecsSinceEpoch() + 60) : 0.0);
+        if (!jsonEntries.isEmpty()) record.insert("entries", jsonEntries);
+        modules.insert(module, record);
+        scopeObject.insert("modules", modules);
+        scopes.insert(scope.key(), scopeObject);
+    }
+    cache.insert("scopes", scopes);
+    QSaveFile output(path);
+    if (!output.open(QIODevice::WriteOnly)) return;
+    const auto bytes = QJsonDocument(cache).toJson();
+    if (output.write(bytes) != bytes.size()) return;
+    output.commit();
+}
+
+void startNextRecognition(bool hostSupported) {
+    if (!hostSupported || recognitionFuture.valid() || recognitionQueue.isEmpty() || stopping.load()) return;
+    recognitionModule = recognitionQueue.takeFirst();
+    recognitionFuture = std::async(std::launch::async, [module = recognitionModule, hostSupported] {
+        if (!recognitionControl) {
+            State result;
+            result.status = "recognition_unavailable";
+            result.errors.push_back("recognition_control_unavailable");
+            return result;
+        }
+        return recognitionControl(module.toStdString(), hostSupported);
+    });
+}
+
 State scan(const QStringList &paths, QJsonObject cache, State result) {
     QElapsedTimer elapsed;
     elapsed.start();
@@ -285,8 +361,35 @@ State scan(const QStringList &paths, QJsonObject cache, State result) {
         } else {
             const auto entries = inspect(module, result, error);
             record = QJsonObject{{"fingerprint", stamp}, {"entries", entries}, {"error", error},
-                                 {"retry_after", error.isEmpty() ? 0.0 : static_cast<double>(now + 60)}};
+                                 {"retry_after", error.isEmpty() ? 0.0 : static_cast<double>(now + 60)},
+                                 {"recognition_status", error.isEmpty() && !entries.isEmpty() &&
+                                      entries.first().toObject().value("identified").toBool() ? "ready" : "queued"},
+                                 {"recognition_source", "static"}, {"recognition_attempts", 0},
+                                 {"recognition_error", QString{}}, {"recognition_retry_after", 0.0},
+                                 {"recognition_scanner_version", kScanner}};
         }
+        if (!record.contains("recognition_status")) {
+            const auto cachedEntries = record.value("entries").toArray();
+            const bool identified = !cachedEntries.isEmpty() &&
+                cachedEntries.first().toObject().value("identified").toBool();
+            record.insert("recognition_status", identified ? "ready" : "queued");
+        }
+        if (!record.contains("recognition_source")) record.insert("recognition_source", "static");
+        if (!record.contains("recognition_attempts")) record.insert("recognition_attempts", 0);
+        if (!record.contains("recognition_error")) record.insert("recognition_error", QString{});
+        if (!record.contains("recognition_retry_after")) record.insert("recognition_retry_after", 0.0);
+        if (!record.contains("recognition_scanner_version")) record.insert("recognition_scanner_version", kScanner);
+        auto entryValues = record.value("entries").toArray();
+        for (int entryIndex = 0; entryIndex < entryValues.size(); ++entryIndex) {
+            auto entry = entryValues.at(entryIndex).toObject();
+            entry.insert("recognition_status", record.value("recognition_status"));
+            entry.insert("recognition_source", record.value("recognition_source"));
+            entry.insert("recognition_attempts", record.value("recognition_attempts"));
+            entry.insert("recognition_error", record.value("recognition_error"));
+            entry.insert("recognition_retry_after", record.value("recognition_retry_after"));
+            entryValues.replace(entryIndex, entry);
+        }
+        record.insert("entries", entryValues);
         if (!error.isEmpty() && error != "metadata_missing") result.errors.push_back((module + ':' + error).toStdString());
         records.insert(module, record);
         for (const auto &entry : record.value("entries").toArray()) found.push_back(entryFrom(module, entry.toObject()));
@@ -333,13 +436,14 @@ State beginAsync(bool hostSupported) noexcept {
     std::lock_guard<std::mutex> lock(scanMutex);
     if (stopping.load()) { State state; state.status = "scan_stopped"; return state; }
     if (!hostSupported) { State state; state.status = "host_unsupported"; return state; }
-    if (scanFuture.valid()) return snapshot;
+    if (scanFuture.valid() || recognitionFuture.valid() || !recognitionQueue.isEmpty()) return snapshot;
     const auto paths = roots();
     QString cacheStatus;
     const auto cache = readCache(cacheStatus);
     const auto scope = cache.value("scopes").toObject().value(scopeKey(paths)).toObject();
     State pending;
     pending.staticScan = true;
+    pending.hostSupported = hostSupported;
     pending.scanPending = true;
     pending.workerThread = true;
     pending.status = "scanning";
@@ -375,8 +479,93 @@ bool poll(State &completed) noexcept {
     std::lock_guard<std::mutex> lock(scanMutex);
     if (scanFuture.valid() && scanFuture.wait_for(std::chrono::milliseconds(0)) == std::future_status::ready) {
         snapshot = scanFuture.get();
+        recognitionQueue.clear();
+        QSet<QString> prioritized;
+        QJsonObject sidecar;
+        if (state::loadChain(sidecar)) {
+            const auto mark = [&](const QJsonArray &effects) {
+                for (const auto &value : effects) {
+                    const auto effect = value.toObject();
+                    if (!effect.value("enabled").toBool()) continue;
+                    const auto module = effect.value("module").toString();
+                    if (!module.isEmpty()) prioritized.insert(module);
+                }
+            };
+            mark(sidecar.value("global").toObject().value("effects").toArray());
+            const auto scores = sidecar.value("scores").toObject();
+            for (auto score = scores.begin(); score != scores.end(); ++score) {
+                const auto tracks = score.value().toObject().value("tracks").toObject();
+                for (auto track = tracks.begin(); track != tracks.end(); ++track)
+                    mark(track.value().toObject().value("effects").toArray());
+            }
+        }
+        // Recognition is an injected host capability. Standalone catalog
+        // fixtures and unsupported hosts keep the P7 static-scan contract and
+        // never manufacture an unavailable worker task.
+        if (recognitionControl) {
+            for (const auto &entry : snapshot.catalog)
+                if (!entry.identified && !entry.module.empty() &&
+                    (entry.recognitionStatus != "failed" ||
+                     QDateTime::currentSecsSinceEpoch() >= entry.recognitionRetryAfter) &&
+                    std::find(recognitionQueue.cbegin(), recognitionQueue.cend(),
+                              QString::fromStdString(entry.module)) == recognitionQueue.cend())
+                    recognitionQueue.append(QString::fromStdString(entry.module));
+            std::stable_sort(recognitionQueue.begin(), recognitionQueue.end(),
+                             [&](const QString &left, const QString &right) {
+                const bool lp = prioritized.contains(left), rp = prioritized.contains(right);
+                return lp != rp ? lp > rp : left < right;
+            });
+        } else {
+            recognitionQueue.clear();
+        }
+        snapshot.recognitionPending = !recognitionQueue.isEmpty();
+        snapshot.recognitionStatus = snapshot.recognitionPending ? "queued" : "idle";
+        startNextRecognition(snapshot.hostSupported);
+        snapshot.recognitionWorker = recognitionFuture.valid();
         ++revision;
     }
+    if (recognitionFuture.valid() &&
+        recognitionFuture.wait_for(std::chrono::milliseconds(0)) == std::future_status::ready) {
+        const auto identified = recognitionFuture.get();
+        persistRecognition(recognitionModule, identified);
+        std::vector<CatalogEntry> replacement = identified.catalog;
+        if (replacement.empty()) {
+            for (const auto &item : identified.classes) {
+                if (item.category != "Audio Module Class" ||
+                    (!item.effectIdentified && !item.processorReady)) continue;
+                replacement.push_back(CatalogEntry{item.module, item.classId, item.name, item.vendor,
+                    item.category, item.processorReady, item.error,
+                    item.effectIdentified || item.processorReady, "factory"});
+            }
+        }
+        replacement.erase(std::remove_if(replacement.begin(), replacement.end(), [](const CatalogEntry &entry) {
+            return !entry.identified || entry.category != "Audio Module Class";
+        }), replacement.end());
+        if (!replacement.empty()) {
+            snapshot.catalog.erase(std::remove_if(snapshot.catalog.begin(), snapshot.catalog.end(),
+                [&](const CatalogEntry &entry) { return entry.module == recognitionModule.toStdString(); }), snapshot.catalog.end());
+            snapshot.catalog.insert(snapshot.catalog.end(), replacement.begin(), replacement.end());
+        } else {
+            const auto reason = identified.errors.empty() ? std::string("recognition_failed") : identified.errors.front();
+            for (auto &entry : snapshot.catalog)
+                if (entry.module == recognitionModule.toStdString()) entry.error = reason;
+        }
+        std::sort(snapshot.catalog.begin(), snapshot.catalog.end(), [](const CatalogEntry &a, const CatalogEntry &b) {
+            if (a.name != b.name) return a.name < b.name;
+            return a.module < b.module;
+        });
+        ++snapshot.recognitionAttempted;
+        if (replacement.empty()) ++snapshot.recognitionFailed;
+        ++snapshot.recognitionCompleted;
+        snapshot.recognitionPending = !recognitionQueue.isEmpty();
+        snapshot.recognitionStatus = snapshot.recognitionPending ? "running" : "complete";
+        snapshot.recognitionWorker = recognitionFuture.valid();
+        snapshot.recognitionCurrentModule.clear();
+        startNextRecognition(snapshot.hostSupported);
+        ++revision;
+    }
+    snapshot.recognitionCurrentModule = recognitionFuture.valid() ? recognitionModule.toStdString() : std::string{};
+    snapshot.recognitionWorker = recognitionFuture.valid();
     if (revision == delivered) return false;
     completed = snapshot;
     delivered = revision;
@@ -386,12 +575,21 @@ bool poll(State &completed) noexcept {
 void shutdownScan() noexcept {
     stopping.store(true);
     std::future<State> worker;
+    std::future<State> recognition;
     {
         std::lock_guard<std::mutex> lock(scanMutex);
         worker = std::move(scanFuture);
+        recognition = std::move(recognitionFuture);
+        recognitionQueue.clear();
     }
     // The worker can still publish a final progress snapshot; never join it
     // with scanMutex held. It exits before the next module and skips caching.
     if (worker.valid()) worker.wait();
+    if (recognition.valid()) recognition.wait();
+}
+
+void setRecognitionControl(RecognitionControl control) noexcept {
+    std::lock_guard<std::mutex> lock(scanMutex);
+    recognitionControl = control;
 }
 } // namespace gpvst3::vst3

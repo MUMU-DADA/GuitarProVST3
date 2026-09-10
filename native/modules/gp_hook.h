@@ -73,6 +73,13 @@ struct State {
     std::uint64_t maxProcessNanoseconds = 0;
     std::uint64_t totalProcessNanoseconds = 0;
     std::size_t chainSwitchCount = 0;
+    bool globalChainEnabled = false;
+    std::size_t globalChainProcessBlocks = 0;
+    std::size_t trackChainProcessBlocks = 0;
+    bool trackContextObserved = false;
+    bool trackContextStable = false;
+    bool trackScopeUnresolved = true;
+    std::string trackContextKey;
     std::size_t audioBufferSequenceCount = 0;
     std::size_t runtimeEffectInstances = 0;
     std::size_t reconfigurationPassed = 0;
@@ -144,6 +151,16 @@ void setTotalBypass(bool bypassed) noexcept;
 bool setVst3Selection(const std::vector<Vst3SelectionEntry> &selection,
                       std::string *error = nullptr) noexcept;
 std::vector<Vst3SelectionEntry> captureVst3States();
+// P8 scope-aware aliases. Global uses the verified Master post-processing
+// chain; track selection remains bypassed until a stable host track context is
+// observed in processDSP.
+bool setGlobalVst3Selection(const std::vector<Vst3SelectionEntry> &selection,
+                            std::string *error = nullptr) noexcept;
+bool setTrackVst3Selection(const std::string &trackKey,
+                           const std::vector<Vst3SelectionEntry> &selection,
+                           std::string *error = nullptr) noexcept;
+std::vector<Vst3SelectionEntry> captureGlobalVst3States();
+std::vector<Vst3SelectionEntry> captureTrackVst3States(const std::string &trackKey);
 // Open the editor owned by the currently active processing instance. The
 // caller supplies a native Windows child HWND created on the Qt UI thread.
 bool openVst3Editor(const Vst3SelectionEntry &entry, void *parentWindow) noexcept;

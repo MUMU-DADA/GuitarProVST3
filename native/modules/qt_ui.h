@@ -12,6 +12,7 @@ namespace gpvst3::ui {
 using RealtimeBypassControl = void (*)(bool) noexcept;
 using Vst3SelectionEntry = gpvst3::hook::Vst3SelectionEntry;
 using Vst3SelectionControl = bool (*)(const std::vector<Vst3SelectionEntry> &, std::string *) noexcept;
+using Vst3TrackSelectionControl = bool (*)(const std::string &, const std::vector<Vst3SelectionEntry> &, std::string *) noexcept;
 using Vst3StateControl = std::vector<Vst3SelectionEntry> (*)();
 using Vst3EditorControl = bool (*)(const Vst3SelectionEntry &, void *) noexcept;
 using Vst3EditorCloseControl = void (*)() noexcept;
@@ -24,6 +25,7 @@ using Vst3IdentifyControl = QJsonArray (*)(const QString &, QString *);
 const char *state() noexcept;
 void setRealtimeBypassControl(RealtimeBypassControl control) noexcept;
 void setVst3SelectionControl(Vst3SelectionControl control) noexcept;
+void setVst3TrackSelectionControl(Vst3TrackSelectionControl control) noexcept;
 void setVst3StateControl(Vst3StateControl control) noexcept;
 void setVst3EditorControl(Vst3EditorControl open, Vst3EditorCloseControl close,
                          Vst3EditorScaleControl scale = nullptr) noexcept;

@@ -526,15 +526,19 @@ State prepare(bool hostSupported) noexcept {
 }
 
 State identifyBundle(const std::string &module, bool hostSupported) noexcept {
+    State result;
+    result.hostSupported = hostSupported;
     if (!hostSupported || module.empty()) {
-        State result;
         result.status = "host_unsupported";
         result.errors.push_back("host_unsupported");
         return result;
     }
-    try { return scanInProcess(true, {fs::u8path(module)}); }
+    try {
+        result = scanInProcess(true, {fs::u8path(module)});
+        result.hostSupported = hostSupported;
+        return result;
+    }
     catch (...) {
-        State result;
         result.status = "identification_failed";
         result.errors.push_back("identification_exception");
         return result;
