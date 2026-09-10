@@ -19,6 +19,10 @@ bool check(bool value, const char *message) {
     if (!value) std::cerr << "FAIL: " << message << '\n';
     return value;
 }
+bool rejectSelection(const std::vector<gpvst3::ui::Vst3SelectionEntry> &, std::string *error) noexcept {
+    if (error) *error = "host_unsupported";
+    return false;
+}
 }
 
 int main(int argc, char **argv) {
@@ -42,6 +46,12 @@ int main(int argc, char **argv) {
     if (!check(panel != nullptr, "P7 panel created")) return 1;
     if (!check(!panel->isVisible(), "P7 panel does not pop up at startup")) return 1;
     if (!check(panel->findChildren<QCheckBox *>().size() == 2, "catalog rows created")) return 1;
+    panel->show();
+    QCoreApplication::processEvents();
+    auto *editorHost = panel->findChild<QWidget *>("gpvst3NativeEditorHost");
+    if (!check(editorHost != nullptr && !editorHost->isVisible(),
+               "native editor host does not intercept selector clicks before opening")) return 1;
+    panel->hide();
     for (auto *button : panel->findChildren<QPushButton *>()) {
         if (!check(button->text() != QStringLiteral("添加") &&
                        button->text() != QStringLiteral("删除") &&
@@ -57,6 +67,18 @@ int main(int argc, char **argv) {
     const auto effect = saved.value("effects").toArray().first().toObject();
     if (!check(effect.value("enabled").toBool() && !effect.value("bypass").toBool(),
                "checked means enabled")) return 1;
+    gpvst3::ui::setVst3SelectionControl(&rejectSelection);
+    auto *second = panel->findChild<QCheckBox *>("gpvst3Enabled_TWO");
+    second->setChecked(true);
+    auto *status = panel->findChild<QLabel *>("gpvst3Status");
+    if (!check(!second->isChecked() && first->isChecked() &&
+                   status->text().contains(QStringLiteral("兼容性校验")) &&
+                   status->toolTip() == QStringLiteral("host_unsupported"),
+               "failed selection rolls back and reports the actual host failure")) return 1;
+    if (!check(gpvst3::state::loadChain(saved) &&
+                   !saved.value("effects").toArray().at(1).toObject().value("enabled").toBool(),
+               "rejected selection is not persisted as enabled")) return 1;
+    gpvst3::ui::setVst3SelectionControl(nullptr);
     panel->findChildren<QPushButton *>().first()->click();
     QCoreApplication::processEvents();
     bool hostLimited = false;

@@ -533,7 +533,12 @@ State scanAndValidate() {
         environment.insert("GPVST3_VST3_ROOT", QString::fromStdWString(path.wstring()));
         process.setProcessEnvironment(environment);
         process.setWorkingDirectory(QCoreApplication::applicationDirPath());
-        process.start(runner, {QString::fromWCharArray(moduleFile) + ",Gpvst3Scan", output});
+        // rundll32 requires the comma/entry point outside the DLL path's
+        // quotes. QProcess argument quoting encloses the entire argument,
+        // which silently fails when installed below e.g. Program Files.
+        process.setNativeArguments(QStringLiteral("\"%1\",Gpvst3Scan \"%2\"")
+                                       .arg(QString::fromWCharArray(moduleFile), output));
+        process.start(runner, QStringList{});
         if (!process.waitForStarted(3000) || !process.waitForFinished(10000)) {
             process.kill();
             process.waitForFinished(3000);

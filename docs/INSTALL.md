@@ -17,3 +17,5 @@
 ```
 
 实时 hook 只在 `config/host_manifest.json` 对应的 Guitar Pro 8.1.1.17 / Windows x64 文件全部匹配时启用；其他版本保持旁路。
+
+正常启动后，在音源区域点击 `VST3`，勾选插件即可启用，点击名称打开其 GUI。无需设置开发环境变量；如曾显式设置 `GPVST3_ENABLE_P2_HOOK=0`，请移除该设置并重启后再启用插件。默认启动及扫描的验证边界见 [P7 实现记录](P7_IMPLEMENTATION.md)。

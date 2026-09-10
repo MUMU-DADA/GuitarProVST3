@@ -349,6 +349,11 @@ public:
         status_->setObjectName(QStringLiteral("gpvst3Status"));
         status_->setWordWrap(true);
         root->addWidget(status_);
+        // The native editor host is positioned explicitly when an editor is
+        // opened.  Keep the child HWND hidden until then; otherwise Qt shows
+        // an unconfigured child widget together with the panel and its native
+        // window receives mouse input over the selector rows.
+        editorHost_->hide();
         loadChain();
         g_p7Panel = this;
     }
@@ -396,7 +401,25 @@ private:
                                  stateBytes(effect, "component_state"), stateBytes(effect, "controller_state")});
         }
         selectionDirty_ = false;
-        return g_vst3SelectionControl(selection);
+        std::string error;
+        if (g_vst3SelectionControl(selection, &error)) return true;
+        QString message = QStringLiteral("无法启用此插件：插件初始化失败。");
+        if (error == "host_unsupported")
+            message = QStringLiteral("当前 Guitar Pro 版本未通过兼容性校验，无法启用效果器。");
+        else if (error == "realtime_disabled_by_environment")
+            message = QStringLiteral("实时效果器已被启动配置禁用，请恢复默认配置后重启 Guitar Pro。");
+        else if (error == "hook_install_failed" || error == "entry_points_not_found" ||
+                 error == "buffer_accessors_not_found" || error == "gprse_not_loaded")
+            message = QStringLiteral("无法接入 Guitar Pro 音频处理，请重启后重试。");
+        else if (error == "runtime_vst3_not_found")
+            message = QStringLiteral("找不到此插件，请重新安装插件后重启 Guitar Pro。");
+        else if (error.rfind("runtime_vst3_state_restore_failed", 0) == 0)
+            message = QStringLiteral("无法启用此插件：已保存的插件状态恢复失败。");
+        else if (error == "runtime_vst3_chain_full")
+            message = QStringLiteral("效果器链已满，请先停用其他插件。");
+        status_->setText(message);
+        status_->setToolTip(QString::fromStdString(error));
+        return false;
     }
 
     void saveRuntimeState() {
@@ -517,11 +540,11 @@ private:
                 effects_.replace(index, previous);
                 const QSignalBlocker blocked(check);
                 check->setChecked(previous.value("enabled").toBool());
-                status_->setText(QStringLiteral("无法启用此插件：初始化或状态恢复失败。"));
                 return;
             }
             if (!enabled && openedKey_ == key(effect)) editorHost_->close();
             saveRuntimeState();
+            status_->setToolTip(QString());
             status_->setText(enabled ? QStringLiteral("已启用：点击名称打开原生 GUI")
                                       : QStringLiteral("已停用：%1").arg(effect.value("name").toString()));
         });

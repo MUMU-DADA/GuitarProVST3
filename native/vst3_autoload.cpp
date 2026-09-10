@@ -11,7 +11,9 @@
 namespace {
 
 void writeObservation() {
-    gpvst3::state::writeRealtimeObservation(gpvst3::bootstrap::hookSnapshot());
+    const auto hook = gpvst3::bootstrap::hookSnapshot();
+    if (hook.value("enabled").toBool())
+        gpvst3::state::writeRealtimeObservation(hook);
     if (auto *application = QCoreApplication::instance())
         QTimer::singleShot(250, application, &writeObservation);
 }
@@ -48,8 +50,8 @@ public:
                                  scanTimer->deleteLater();
                              });
             scanTimer->start();
-            const auto hook = status.value("gp_hook").toObject();
-            if (!hook.value("enabled").toBool()) return;
+            // A P7 selection can start the hook after bootstrap. Keep its
+            // observation and shutdown lifecycle available in default launches.
             writeObservation();
             qAddPostRoutine(&stopObservation);
         });

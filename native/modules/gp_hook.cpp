@@ -410,10 +410,7 @@ struct RuntimeEffect {
             error = "runtime_vst3_parameter_setup_failed";
             return false;
         }
-        if (saved && !restoreState(*saved)) {
-            error = "runtime_vst3_state_restore_failed";
-            return false;
-        }
+        if (saved && !restoreState(*saved)) return false;
         Steinberg::Vst::ProcessSetup setup{};
         setup.processMode = Steinberg::Vst::kRealtime;
         setup.symbolicSampleSize = Steinberg::Vst::kSample32;
@@ -436,17 +433,32 @@ struct RuntimeEffect {
     }
 
     bool restoreState(const Vst3SelectionEntry &saved) {
+        const auto restored = [this](tresult result, const char *stage) {
+            if (succeeded(result)) return true;
+            error = std::string("runtime_vst3_state_restore_failed:") + stage + ":" +
+                    std::to_string(static_cast<long>(result));
+            return false;
+        };
         if (!saved.componentState.empty()) {
             Steinberg::MemoryStream stream(const_cast<unsigned char *>(saved.componentState.data()),
                                            saved.componentState.size());
-            if (!succeeded(component->setState(&stream))) return false;
+            if (!restored(component->setState(&stream), "component")) return false;
             stream.seek(0, Steinberg::IBStream::kIBSeekSet, nullptr);
-            if (controller && !succeeded(controller->setComponentState(&stream))) return false;
+            if (controller) {
+                // Some controllers rely on the component's state and do not
+                // implement a separate component-state copy (e.g. Mateus Asato).
+                // Keep genuine restore failures fatal; kNotImplemented alone
+                // does not invalidate the component state restored above.
+                const auto copied = controller->setComponentState(&stream);
+                if (copied != Steinberg::kNotImplemented && !restored(copied, "component_controller"))
+                    return false;
+            }
         }
         if (!saved.controllerState.empty()) {
             Steinberg::MemoryStream stream(const_cast<unsigned char *>(saved.controllerState.data()),
                                            saved.controllerState.size());
-            if (!controller || !succeeded(controller->setState(&stream))) return false;
+            if (!restored(controller ? controller->setState(&stream) : Steinberg::kNoInterface,
+                          "controller")) return false;
         }
         return true;
     }
@@ -623,11 +635,14 @@ struct SelectionSlot {
     }
 
     bool prepare(const std::vector<Vst3SelectionEntry> &entries, double rate,
-                 std::size_t maxBlock, const SelectionSlot *previous) {
+                 std::size_t maxBlock, const SelectionSlot *previous, std::string *error) {
         shutdown();
         if (entries.empty()) return true;
         if (entries.size() > kMaxEffects || !pipeline[0].prepare(2, maxBlock) ||
-            !pipeline[1].prepare(2, maxBlock)) return false;
+            !pipeline[1].prepare(2, maxBlock)) {
+            if (error) *error = "runtime_vst3_chain_buffer_failed";
+            return false;
+        }
         for (std::size_t index = 0; index < entries.size(); ++index) {
             if (previous) for (std::size_t old = 0; old < previous->count; ++old) {
                 const auto &effect = previous->effects[old];
@@ -639,6 +654,7 @@ struct SelectionSlot {
                 effects[index] = std::make_shared<RuntimeEffect>();
                 if (!effects[index]->initialize(rate, maxBlock, fs::u8path(entries[index].module),
                                                 entries[index].classId, &entries[index])) {
+                    if (error) *error = effects[index]->error;
                     shutdown();
                     return false;
                 }
@@ -1087,9 +1103,10 @@ EntryPointObservation observe(HMODULE module, const char *symbol) noexcept {
 
 } // namespace
 
-bool configureSelectedChain(const std::vector<Vst3SelectionEntry> &selection) noexcept;
+bool configureSelectedChain(const std::vector<Vst3SelectionEntry> &selection,
+                            std::string *error = nullptr) noexcept;
 
-State prepare(const host::Verification &verification) noexcept {
+State prepare(const host::Verification &verification, bool enableForSelection) noexcept {
     State result;
     result.hostSupported = verification.supported;
     if (!verification.supported) {
@@ -1122,14 +1139,16 @@ State prepare(const host::Verification &verification) noexcept {
     if (audioLayerInstance) g_runtime.audioLayer = audioLayerInstance();
     updateAudioLayerState();
     const char *enabled = std::getenv("GPVST3_ENABLE_P2_HOOK");
-    result.enabled = enabled && std::strcmp(enabled, "1") == 0;
+    result.enabled = (enabled && std::strcmp(enabled, "1") == 0) ||
+                     (enableForSelection && (!enabled || !*enabled));
     const char *effectEnabled = std::getenv("GPVST3_ENABLE_P2_EFFECT");
     result.runtimeEffectEnabled = result.enabled && effectEnabled && std::strcmp(effectEnabled, "1") == 0;
     if (!gprse) result.reason = "gprse_not_loaded";
     else if (!result.masterProcess.exportFound || !result.effectsChainProcessDsp.exportFound)
         result.reason = "entry_points_not_found";
     else if (!result.audioBufferAccessorsFound) result.reason = "buffer_accessors_not_found";
-    else if (!result.enabled) result.reason = "p2_observation_only_callsite_unverified";
+    else if (!result.enabled) result.reason = enabled && *enabled
+        ? "realtime_disabled_by_environment" : "realtime_waiting_for_selection";
     else {
         g_runtime.rawData = reinterpret_cast<RawDataFn>(GetProcAddress(amaudio, kRawData));
         g_runtime.frameCount = reinterpret_cast<FrameCountFn>(GetProcAddress(amaudio, kFrameCount));
@@ -1372,19 +1391,27 @@ State snapshot() noexcept {
     return result;
 }
 
-bool configureSelectedChain(const std::vector<Vst3SelectionEntry> &selection) noexcept {
-    if (!g_runtime.master.installed || selection.size() > SelectionSlot::kMaxEffects) return false;
+bool configureSelectedChain(const std::vector<Vst3SelectionEntry> &selection, std::string *error) noexcept {
+    if (error) error->clear();
+    if (!g_runtime.master.installed || selection.size() > SelectionSlot::kMaxEffects) {
+        if (error) *error = !g_runtime.master.installed ? "hook_install_failed" : "runtime_vst3_chain_full";
+        return false;
+    }
     const auto rate = callbackSampleRate();
     const auto old = g_runtime.chain.snapshot().activeSlot;
     const auto target = old == 0 ? 1U : 0U;
     if (!g_runtime.chain.prepareSlot(target,
-            {&g_runtime.selectionSlots[target], &SelectionSlot::processCallback})) return false;
+            {&g_runtime.selectionSlots[target], &SelectionSlot::processCallback})) {
+        if (error) *error = "runtime_vst3_chain_prepare_failed";
+        return false;
+    }
     const auto *previous = g_runtime.selectionMode.load(std::memory_order_acquire) && old >= 0
         ? &g_runtime.selectionSlots[old] : nullptr;
     try {
-        if (!g_runtime.selectionSlots[target].prepare(selection, rate, 16384, previous)) return false;
+        if (!g_runtime.selectionSlots[target].prepare(selection, rate, 16384, previous, error)) return false;
     } catch (...) {
         g_runtime.selectionSlots[target].shutdown();
+        if (error) *error = "runtime_vst3_initialize_exception";
         return false;
     }
     // Prepare before the handoff. Existing instances retain their GUI,
@@ -1541,9 +1568,23 @@ void setTotalBypass(bool bypassed) noexcept {
     g_runtime.inputRouter.setBypassed(bypassed);
 }
 
-bool setVst3Selection(const std::vector<Vst3SelectionEntry> &selection) noexcept {
+bool setVst3Selection(const std::vector<Vst3SelectionEntry> &selection, std::string *error) noexcept {
+    if (error) error->clear();
+    // P7 controls are called on the Qt control thread. Install before taking
+    // selectionMutex because prepare() also locks it to restore a saved chain.
+    if (!g_runtime.master.installed && !selection.empty()) {
+        const auto prepared = prepare(host::verify(), true);
+        if (!prepared.installed) {
+            if (error) *error = prepared.reason;
+            return false;
+        }
+    }
     std::lock_guard<std::mutex> lock(g_runtime.selectionMutex);
-    if (!g_runtime.master.installed || !configureSelectedChain(selection)) return false;
+    if (!g_runtime.master.installed && selection.empty()) {
+        g_runtime.requestedSelection.clear();
+        return true;
+    }
+    if (!configureSelectedChain(selection, error)) return false;
     g_runtime.requestedSelection = selection;
     return true;
 }

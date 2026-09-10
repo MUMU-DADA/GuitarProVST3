@@ -128,10 +128,10 @@ struct State {
     EntryPointObservation audioOutputCallback;
 };
 
-// Entry-point patching is enabled only by the explicit environment switch and
-// the locked host hash/prologue checks. The optional runtime effect remains
-// disabled unless GPVST3_ENABLE_P2_EFFECT=1 is also present.
-State prepare(const host::Verification &verification) noexcept;
+// The first P7 selection can enable the locked hook without a development
+// environment switch. An explicit GPVST3_ENABLE_P2_HOOK=0 still disables it.
+// Empty startup remains unpatched; all paths require host hash/prologue checks.
+State prepare(const host::Verification &verification, bool enableForSelection = false) noexcept;
 State snapshot() noexcept;
 void shutdown() noexcept;
 
@@ -141,7 +141,8 @@ void setTotalBypass(bool bypassed) noexcept;
 // Queues the current P7 checked list for control-thread preparation. The
 // audio callback only sees the atomically published chain and never touches
 // these strings or creates plug-in instances.
-bool setVst3Selection(const std::vector<Vst3SelectionEntry> &selection) noexcept;
+bool setVst3Selection(const std::vector<Vst3SelectionEntry> &selection,
+                      std::string *error = nullptr) noexcept;
 std::vector<Vst3SelectionEntry> captureVst3States();
 // Open the editor owned by the currently active processing instance. The
 // caller supplies a native Windows child HWND created on the Qt UI thread.

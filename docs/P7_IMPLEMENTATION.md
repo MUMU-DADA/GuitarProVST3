@@ -1,6 +1,10 @@
 # P7 实现记录
 
-P7 已完成本项目能够在锁定 Guitar Pro 8.1.1.17 中取得证据的范围。面板、自动清单、二态选择、实时多实例链、原生 VST3 editor bridge 和 opaque state 保存均已实现并通过隔离 MCP 宿主验证。作用域仍是已验证的 master 后处理位置；Guitar Pro 私有轨道级作用域没有可复用的公开契约，因此继续标记为宿主受限。
+P7 当前为**进行中（2026-09-10 按最新交互要求更新）**。已有面板、自动清单、二态实时链、原生 VST3 editor bridge 和 opaque state 保存实现及历史回归记录。原生 GUI 独立窗口、跨重启的扫描缓存、首次扫描按钮提示仍待实现和验收；完整剩余计划维护在 [实时实现计划 P7.8](REALTIME_IMPLEMENTATION_PLAN.md#p78-剩余实施计划2026-09-10)。
+
+当前 `NativeEditorWindow` 使用 `Qt::Widget` 并属于 `gpvst3P7Panel`，`g_cachedScan` 只保存在内存中，扫描子进程的临时 `catalog.json` 不会供下次启动复用；入口按钮目前固定显示 `VST3`。这些现状不满足最新三项要求。以下旧 editor 父级关系、状态文字和扫描回归保留为历史证据，不能据此宣称独立窗口、缓存提速或首次按钮反馈已完成。
+
+实际处理位置仍为已验证的 master 后处理点；轨道级作用域继续标记为宿主受限。
 
 ## 已实现和已验证
 
@@ -20,7 +24,7 @@ P7 已完成本项目能够在锁定 Guitar Pro 8.1.1.17 中取得证据的范�
 ./native/test/test-p7.ps1 -PluginPath .tools/native/plugins/imageformats/guitarpro_vst3_autoload.dll -ScanTimeoutSeconds 90
 ```
 
-通过结果：
+历史回归结果（本轮计划调整尚未执行新增验收）：
 
 - `test-p7-ui.ps1`：P7 catalog UI、`enabled` 语义和隔离 editor 边界通过。
 - `test-p2-runtime.ps1`：P2/P3 实时 VST3 processing 通过。
@@ -33,6 +37,27 @@ P7 已完成本项目能够在锁定 Guitar Pro 8.1.1.17 中取得证据的范�
 - 第三方 bundle 的完整生命周期仍可能因插件自己的扫描行为超出隔离进程限时；超时插件不会显示为可启用效果器，结果记录在扫描状态中。标准目录元数据清单和显式测试路径不受该限制影响。
 - `IPlugView`/HWND、参数回传和 state 保存已在锁定 MCP Guitar Pro 副本中验证；未对每一个已安装插件声称 editor 兼容性。没有 editor 或不支持 HWND 的插件会在名称点击时报告不可用并保持旁路安全。
 - 未运行真实声学听感、设备切换和外部输入监听验收；这些沿用 P2/P4 的宿主受限边界。
+
+## 正常启动后的勾选修复（2026-09-10）
+
+已确认用户安装目录中的两项问题：默认启动没有设置 `GPVST3_ENABLE_P2_HOOK`，选择在创建实例前即被拒绝；`Program Files` 路径含空格时，`QProcess` 把 DLL 路径和 `,Gpvst3Scan` 一起加引号，导致 `rundll32` 未执行扫描入口，所有 bundle 返回 `scan_worker_failed`，界面只能显示 sidecar 中的旧记录。
+
+已实现：第一次启用 P7 插件（包括恢复已启用的 sidecar）会重新校验宿主哈希，再按既有 prologue 门控安装实时接入。没有启用项的默认启动仍保持无 hook、旁路；显式 `GPVST3_ENABLE_P2_HOOK=0` 继续禁止启用。默认启动也注册后续接入需要的观测和退出清理。勾选失败会回滚，并区分宿主不兼容、启动配置禁用、接入失败、插件缺失和状态恢复失败，具体错误码保留在提示的 tooltip 中。扫描命令改为只给 DLL 路径加引号。
+
+已验证：旧 DLL 在默认启动 MCP 回归中复现勾选失败；修复后，在含空格的隔离 Guitar Pro 路径中，不设置 hook/扫描开发开关即可发现 12 个兼容效果器，并完成 ParametricOD/Gateway 单实例、双实例串联、原生 editor、全部停用及状态恢复。本次扫描有一个第三方 bundle 超时；扫描成功不代表全部插件的处理或 GUI 兼容性。显式禁用配置及 UI 错误回滚也已通过专项回归。
+
+Archetype Mateus Asato 的专项回归另发现：组件 `setState` 成功后，控制器 `setComponentState` 返回 `kNotImplemented`，旧实现因此拒绝再次启用。已修复为允许控制器不实现该复制步骤，组件恢复及其他控制器错误仍严格检查；恢复失败 tooltip 包含具体步骤和原始返回值。使用显式路径的真实宿主回归已通过该插件的启用、串联处理、原生 editor、停用和再次恢复。其标准目录扫描仍可能触发 10 秒超时，不承诺每次扫描均发现该插件。
+
+```powershell
+./native/test/test-p7-mcp.ps1 -HookMode default -StandardScan
+./native/test/test-p7-mcp.ps1 -HookMode disabled
+./native/test/test-p7-mcp.ps1 -HookMode default -Vst3Root 'Neural DSP/Archetype Mateus Asato.vst3;Gateway.vst3'
+./native/test/test-p7-ui.ps1
+```
+
+证据：`artifacts/mcp-p7-744c6f82a6fa460a8a50a937de122e49/verification.json`、`artifacts/mcp-p7-b143fbb5e3894fecbeec3e0b20dfce30/verification.json`、`artifacts/mcp-p7-ba41f7526091478fb1c3b05aea5b84ff/verification.json`。宿主哈希不匹配拒绝接入的回归通过，证据为 `artifacts/p0-f5a1f326b4ea4579947b60905f798f6f/verification.json`。真实扬声器听感未验证。
+
+最终 DLL 的默认启动和标准目录复核通过，证据为 `artifacts/mcp-p7-68f61605223a4540b9465b4d825c7018/verification.json`；本次 Guitar Rig 7 和 Mateus Asato 扫描超时，其余清单及 ParametricOD/Gateway 回归通过。回归脚本等待侧栏实际挂接完成，避免恰好在 500 ms 重建定时器执行前断言。已在 Guitar Pro 关闭后备份并更新本机安装 DLL，安装文件与验证构建的 SHA-256 一致；安装记录位于 `artifacts/installed-selection-fix-62fe9f2097494a4999501536a9e16104/verification.json`。
 
 ## 变更范围
 

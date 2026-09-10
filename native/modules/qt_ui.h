@@ -11,7 +11,7 @@ namespace gpvst3::ui {
 
 using RealtimeBypassControl = void (*)(bool) noexcept;
 using Vst3SelectionEntry = gpvst3::hook::Vst3SelectionEntry;
-using Vst3SelectionControl = bool (*)(const std::vector<Vst3SelectionEntry> &) noexcept;
+using Vst3SelectionControl = bool (*)(const std::vector<Vst3SelectionEntry> &, std::string *) noexcept;
 using Vst3StateControl = std::vector<Vst3SelectionEntry> (*)();
 using Vst3EditorControl = bool (*)(const Vst3SelectionEntry &, void *) noexcept;
 using Vst3EditorCloseControl = void (*)() noexcept;
