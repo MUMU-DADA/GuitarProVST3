@@ -156,6 +156,24 @@ function Invoke-P6Workflow {
         }
         $p6Context.evidence += @{name='device_matrix';configured=$deviceBefore.configuration;choices=$deviceBefore.choices;results=$deviceResults;sample_rate='not_exposed_by_gp_audio_device';pause='not_exposed_by_gp_playback'}
 
+        # Verify restoration while the original application is still alive.
+        # A finally block after clean exit cannot repair persisted preferences.
+        $restoreProperties = @('audioDevice','audioOutput','audioInput','audioOutputChannels','audioBuffersSize')
+        foreach ($property in $restoreProperties) {
+            if (-not $deviceBefore.configuration.PSObject.Properties.Name.Contains($property)) { continue }
+            $currentDevice = Invoke-McpTool $Session gp_audio_device
+            if ($currentDevice.configuration.$property -ne $deviceBefore.configuration.$property) {
+                Invoke-McpTool $Session gp_audio_device @{operation='set';property=$property;value=$deviceBefore.configuration.$property} | Out-Null
+            }
+        }
+        $restoredDevice = Invoke-McpTool $Session gp_audio_device
+        foreach ($property in $restoreProperties) {
+            if ($deviceBefore.configuration.PSObject.Properties.Name.Contains($property)) {
+                Check-P6 ($restoredDevice.configuration.$property -eq $deviceBefore.configuration.$property) "P6 audio preference was not restored: $property"
+            }
+        }
+        $p6Context.evidence += @{name='device_preferences_restored';configuration=$restoredDevice.configuration}
+
         foreach ($id in @($p6Context.owned | Where-Object { $_ -ne $p6Context.current })) { Close-P6 $id }
         $afterDocuments = @((Invoke-McpTool $Session gp_documents).documents | Sort-Object id | Select-Object id,dirty,opened_path,save_path)
         Check-P6 ((Json-P6 $afterDocuments) -eq (Json-P6 $beforeDocuments)) 'P6 workflow changed an unrelated document.'
@@ -164,7 +182,14 @@ function Invoke-P6Workflow {
         $main = @($window.objects | Where-Object class -eq 'gp::gui::MainWindow')
         Check-P6 ($main.Count -ge 1) 'P6 main window was not discoverable for clean exit.'
         try { Invoke-McpTool $Session gp_close_window @{snapshot=$window.snapshot;id=$main[0].id} | Out-Null } catch { }
-        Check-P6 ($Process.WaitForExit(30000)) 'P6 host did not exit after closing the main window.'
+        # Match GuitarProMCP/test/test-shutdown.ps1: observe a real exit,
+        # allowing the host's background shutdown work up to 60 seconds.
+        $exitTimer = [Diagnostics.Stopwatch]::StartNew()
+        $exited = $Process.WaitForExit(15000)
+        if (-not $exited) { $exited = $Process.WaitForExit(45000) }
+        $p6Context.evidence += @{name='clean_exit';exited=$exited;elapsed_ms=$exitTimer.ElapsedMilliseconds;exit_code=$(if ($exited) { $Process.ExitCode } else { $null })}
+        $p6Context.evidence | ConvertTo-Json -Depth 20 | Set-Content -LiteralPath (Join-Path $RunDirectory 'workflow.json') -Encoding UTF8
+        Check-P6 $exited 'P6 host did not exit after closing the main window.'
         Check-P6 ($Process.ExitCode -eq 0) "P6 host exited with code $($Process.ExitCode)."
         return [pscustomobject]@{complete=$true;checks=$p6Context.checks;evidence=$p6Context.evidence;exit_code=$Process.ExitCode;device_matrix=$deviceResults}
     } finally {

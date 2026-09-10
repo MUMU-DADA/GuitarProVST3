@@ -35,28 +35,24 @@ int main(int argc, char **argv) {
         if (!check(manifestFiles.value(it.key()).toString().compare(QString::fromLatin1(it.value()), Qt::CaseInsensitive) == 0,
                    "manifest and runtime hash table agree")) return 1;
     }
-    QTemporaryDir directory;
-    if (!check(directory.isValid(), "temporary directory")) return 1;
-
-    for (auto it = expected.cbegin(); it != expected.cend(); ++it) {
-        const QString input = QDir(source).filePath(it.key());
-        const QString output = QDir(directory.path()).filePath(it.key());
-        if (!check(QFile::exists(input) && QFile::copy(input, output),
-                   "copy locked host file")) return 1;
-    }
-
-    const auto valid = gpvst3::host::verifyDirectory(directory.path());
+    const auto valid = gpvst3::host::verifyDirectory(source);
     if (!check(valid.supported, "matching host hashes accepted")) return 1;
     for (auto it = valid.files.cbegin(); it != valid.files.cend(); ++it)
         if (!check(it.value(), "every locked file matched")) return 1;
 
-    QFile tampered(QDir(directory.path()).filePath(QStringLiteral("GuitarPro.exe")));
-    if (!check(tampered.open(QIODevice::Append), "open copied executable")) return 1;
-    if (!check(tampered.write("p6") == 2, "tamper copied executable")) return 1;
-    tampered.close();
-    const auto invalid = gpvst3::host::verifyDirectory(directory.path());
-    if (!check(!invalid.supported && !invalid.files.value("GuitarPro.exe"),
-               "changed host hash rejected")) return 1;
-    std::cout << "PASS: P6 host hash gate accepts the locked image and rejects a changed image.\n";
+    for (auto it = expected.cbegin(); it != expected.cend(); ++it) {
+        auto mismatched = expected;
+        mismatched[it.key()] = QByteArray(64, '0');
+        const auto invalid = gpvst3::host::verifyDirectory(source, mismatched);
+        if (!check(!invalid.supported && !invalid.files.value(it.key()),
+                   "each mismatched host hash rejected")) return 1;
+        for (auto file = expected.cbegin(); file != expected.cend(); ++file)
+            if (!check(invalid.files.value(file.key()) == (file.key() != it.key()),
+                       "unrelated host hashes still match")) return 1;
+    }
+    QTemporaryDir missing;
+    if (!check(missing.isValid() && !gpvst3::host::verifyDirectory(missing.path()).supported,
+               "missing host files rejected")) return 1;
+    std::cout << "PASS: P6 original host hashes accepted; five mismatches and missing files rejected without copying or writing host files.\n";
     return 0;
 }

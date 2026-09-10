@@ -28,13 +28,9 @@ function Get-PeArchitecture([string]$path) {
 }
 
 $run = Join-Path $root ('artifacts/p7-' + [guid]::NewGuid().ToString('N'))
-$hostCopy = Join-Path $root ('.tools/p7-host-' + [guid]::NewGuid().ToString('N'))
-New-Item -ItemType Directory -Force -Path $run, $hostCopy | Out-Null
-Get-ChildItem -LiteralPath $HostDirectory -File | Where-Object { $_.Extension -in '.dll','.conf' -or $_.Name -eq 'GuitarPro.exe' } | Copy-Item -Destination $hostCopy
-Copy-Item -LiteralPath (Join-Path $HostDirectory 'Plugins') -Destination $hostCopy -Recurse
-$imageDir = Join-Path $hostCopy 'Plugins/imageformats'
-New-Item -ItemType Directory -Force -Path $imageDir | Out-Null
-Copy-Item -LiteralPath $PluginPath -Destination (Join-Path $imageDir 'guitarpro_vst3_autoload.dll')
+New-Item -ItemType Directory -Force -Path $run | Out-Null
+. (Join-Path $PSScriptRoot 'host-session.ps1')
+$before = Get-Gpvst3HostSnapshot $HostDirectory
 
 $names = @('GuitarPro.exe','GPCore.dll','GPRSE.dll','AMAudio.dll','AMOverloud.dll')
 $hostFiles = [ordered]@{}
@@ -50,18 +46,11 @@ foreach ($name in $names) {
     }
 }
 
-$saved = @{}
-foreach ($name in @('GPVST3_DATA_DIR','GPVST3_VST3_PATHS','GPVST3_VST3_ROOT','GPVST3_ENABLE_P2_HOOK','GPVST3_ENABLE_P2_EFFECT','TEMP','TMP')) {
-    $saved[$name] = [Environment]::GetEnvironmentVariable($name, 'Process')
-}
 $process = $null
 try {
-    Remove-Item Env:GPVST3_VST3_PATHS,Env:GPVST3_VST3_ROOT,Env:GPVST3_ENABLE_P2_HOOK,Env:GPVST3_ENABLE_P2_EFFECT -ErrorAction SilentlyContinue
-    if ($Vst3Root) { $env:GPVST3_VST3_ROOT = $Vst3Root }
-    $env:GPVST3_DATA_DIR = $run
-    $env:TEMP = $run
-    $env:TMP = $run
-    $process = Start-Process -FilePath (Join-Path $hostCopy 'GuitarPro.exe') -WorkingDirectory $hostCopy -WindowStyle Hidden -PassThru
+    $environment = @{}
+    if ($Vst3Root) { $environment.GPVST3_VST3_ROOT = $Vst3Root }
+    $process = Start-Gpvst3TestHost -HostDirectory $HostDirectory -PluginPath $PluginPath -RunDirectory $run -Environment $environment
     $statusPath = Join-Path $run 'status.json'
     $deadline = [DateTime]::UtcNow.AddSeconds(90)
     while (-not (Test-Path -LiteralPath $statusPath) -and [DateTime]::UtcNow -lt $deadline) {
@@ -70,6 +59,7 @@ try {
         if ($process.HasExited) { throw "Guitar Pro exited before P7 status publication ($($process.ExitCode))." }
     }
     if (-not (Test-Path -LiteralPath $statusPath)) { throw 'P7 status was not published.' }
+    $identity = Get-Gpvst3TestIdentity $process $HostDirectory $PluginPath $statusPath
     $scanDeadline = [DateTime]::UtcNow.AddSeconds($ScanTimeoutSeconds)
     do {
         $status = Get-Content -LiteralPath $statusPath -Raw | ConvertFrom-Json
@@ -88,6 +78,7 @@ try {
     if ([int]$status.vst3_host.modules_discovered -lt 1) { throw 'P7 standard-directory scan found no VST3 bundle.' }
     $evidence = [ordered]@{
         complete = $false
+        identity = $identity
         host_files = $hostFiles
         host_directory = (Resolve-Path -LiteralPath $HostDirectory).Path
         scan = [ordered]@{
@@ -109,13 +100,6 @@ try {
     $evidence | ConvertTo-Json -Depth 20 | Set-Content -LiteralPath (Join-Path $run 'verification.json') -Encoding UTF8
     Write-Output "PASS: P7 automatic catalog, host lock baseline and explicit host-limited boundaries. Evidence: $run"
 } finally {
-    if ($process -and -not $process.HasExited) {
-        if (-not $KeepHost) { try { $process.CloseMainWindow() | Out-Null } catch { } }
-        if (-not $KeepHost -and -not $process.WaitForExit(5000)) { Stop-Process -Id $process.Id -Force }
-    }
-    foreach ($name in $saved.Keys) {
-        $value = $saved[$name]
-        if ($null -eq $value) { Remove-Item "Env:$name" -ErrorAction SilentlyContinue }
-        else { Set-Item "Env:$name" $value }
-    }
+    try { Stop-Gpvst3TestHost $process -KeepHost:$KeepHost -RunDirectory $run }
+    finally { Assert-Gpvst3HostUnchanged $before $HostDirectory $run }
 }

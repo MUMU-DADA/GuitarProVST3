@@ -25,7 +25,7 @@ P1 在 P0 自动加载 DLL 内增加了最小 VST3 Host。模块扫描和实例�
 ./native/test/test-p1.ps1
 ```
 
-显式目录的 P1 生命周期验证仍覆盖 Gateway、ParametricOD 和 NAM Rig；标准目录清单在 P7 中通过真实宿主隔离启动验证。第三方 bundle 的完整生命周期探测不在默认宿主进程内执行，以避免不兼容插件破坏宿主启动。
+P1 通过[原软件免安装入口](P0_IMPLEMENTATION.md#原软件免安装测试2026-09-10)验证显式目录中 Gateway、ParametricOD 和 NAM Rig 的生命周期；标准目录清单由 P7 验证。第三方 bundle 的完整生命周期探测不在默认宿主进程内执行，以避免不兼容插件破坏宿主启动。
 
 ## 边界
 

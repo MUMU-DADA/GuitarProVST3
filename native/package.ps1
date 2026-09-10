@@ -23,7 +23,7 @@ Copy-Item -LiteralPath $PluginPath -Destination (Join-Path $staging 'plugins/ima
 Copy-Item -LiteralPath (Join-Path $root 'native/vst3-autoload.json') -Destination (Join-Path $staging 'plugins/imageformats/vst3-autoload.json')
 Copy-Item -LiteralPath (Join-Path $root 'native/host_manifest.json') -Destination (Join-Path $staging 'config/host_manifest.json')
 Copy-Item -LiteralPath (Join-Path $root 'native/effect-chain.template.json') -Destination (Join-Path $staging 'config/effect-chain.template.json')
-Copy-Item -LiteralPath (Join-Path $root 'docs/INSTALL.md'), (Join-Path $root 'docs/P6_IMPLEMENTATION.md'), (Join-Path $root 'docs/P7_IMPLEMENTATION.md'), (Join-Path $root 'LICENSE') -Destination (Join-Path $staging 'docs')
+Copy-Item -LiteralPath (Join-Path $root 'docs/INSTALL.md'), (Join-Path $root 'docs/P0_IMPLEMENTATION.md'), (Join-Path $root 'docs/P6_IMPLEMENTATION.md'), (Join-Path $root 'docs/P7_IMPLEMENTATION.md'), (Join-Path $root 'LICENSE') -Destination (Join-Path $staging 'docs')
 Copy-Item -LiteralPath (Join-Path $root 'third_party/vst3sdk/LICENSE.txt') -Destination (Join-Path $staging 'docs/VST3-SDK-LICENSE.txt')
 Copy-Item -LiteralPath (Join-Path $root 'native/install.ps1'), (Join-Path $root 'native/uninstall.ps1') -Destination $staging
 

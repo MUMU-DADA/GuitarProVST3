@@ -1,7 +1,9 @@
 param(
     [string]$QtDir = '',
     [string]$OutputRoot = '',
-    [string]$Vst3SdkDir = ''
+    [string]$Vst3SdkDir = '',
+    [ValidateSet('', 'GuitarPro.exe', 'GPCore.dll', 'GPRSE.dll', 'AMAudio.dll', 'AMOverloud.dll')]
+    [string]$RejectHostFile = ''
 )
 
 $ErrorActionPreference = 'Stop'
@@ -23,6 +25,10 @@ if (-not (Test-Path -LiteralPath (Join-Path $Vst3SdkDir 'pluginterfaces/base/fun
 }
 $Vst3SdkDir = (Resolve-Path -LiteralPath $Vst3SdkDir).Path
 
+if ($RejectHostFile -and (-not $OutputRoot -or
+    [IO.Path]::GetFullPath($OutputRoot).TrimEnd('\', '/') -ieq (Join-Path $projectRoot '.tools/native'))) {
+    throw 'A negative-test DLL requires a separate -OutputRoot.'
+}
 if (-not $OutputRoot) { $OutputRoot = Join-Path $projectRoot '.tools/native' }
 $buildDir = Join-Path $OutputRoot 'build'
 $pluginDir = Join-Path $OutputRoot 'plugins/imageformats'
@@ -65,6 +71,11 @@ $sources = @(
     (Join-Path $Vst3SdkDir 'public.sdk/source/common/memorystream.cpp'),
     (Join-Path $Vst3SdkDir 'public.sdk/source/vst/vstinitiids.cpp')
 )
-& cl /nologo /std:c++17 /EHsc /MD /O2 /utf-8 /LD /DQT_NO_DEBUG /DQT_PLUGIN /DUNICODE /D_UNICODE @clIncludeArgs @sources "/Fo$buildDir/" "/Fd$buildDir/guitarpro_vst3_autoload.pdb" "/Fe$pluginDir/guitarpro_vst3_autoload.dll" /link /Brepro "/LIBPATH:$QtDir/lib" Qt5Core.lib Qt5Gui.lib Qt5Widgets.lib Ole32.lib User32.lib "/IMPLIB:$buildDir/guitarpro_vst3_autoload.lib"
+$testDefines = @()
+if ($RejectHostFile) {
+    $index = @('GUITARPRO.EXE','GPCORE.DLL','GPRSE.DLL','AMAUDIO.DLL','AMOVERLOUD.DLL').IndexOf($RejectHostFile.ToUpperInvariant())
+    $testDefines += "/DGPVST3_TEST_REJECT_HOST_INDEX=$index"
+}
+& cl /nologo /std:c++17 /EHsc /MD /O2 /utf-8 /LD /DQT_NO_DEBUG /DQT_PLUGIN /DUNICODE /D_UNICODE @testDefines @clIncludeArgs @sources "/Fo$buildDir/" "/Fd$buildDir/guitarpro_vst3_autoload.pdb" "/Fe$pluginDir/guitarpro_vst3_autoload.dll" /link /Brepro "/LIBPATH:$QtDir/lib" Qt5Core.lib Qt5Gui.lib Qt5Widgets.lib Ole32.lib User32.lib "/IMPLIB:$buildDir/guitarpro_vst3_autoload.lib"
 if ($LASTEXITCODE) { throw 'P0 plugin compilation failed.' }
 Write-Output "Built $pluginDir/guitarpro_vst3_autoload.dll"

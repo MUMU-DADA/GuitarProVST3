@@ -46,6 +46,6 @@ foreach ($property in $manifest.files.PSObject.Properties) { $expected[$property
 if ($expected.Count -ne 5) { throw 'P6 host manifest must contain five locked files.' }
 $actual = @{}
 foreach ($name in $expected.Keys) { $actual[$name] = (Get-FileHash -LiteralPath (Join-Path $HostDirectory $name) -Algorithm SHA256).Hash }
-@{passed=$true;host_directory=(Resolve-Path $HostDirectory).Path;manifest=$expected;actual=$actual;negative_case='GuitarPro.exe appended bytes';test_sha256=(Get-FileHash $source).Hash} |
+@{passed=$true;host_directory=(Resolve-Path $HostDirectory).Path;manifest=$expected;actual=$actual;negative_case='five mismatched expected hashes and missing files; original host read-only';test_sha256=(Get-FileHash $source).Hash} |
     ConvertTo-Json -Depth 8 | Set-Content -LiteralPath (Join-Path $OutputRoot 'verification.json') -Encoding UTF8
 Write-Output "PASS: P6 host hash gate positive/negative verification. Evidence: $OutputRoot"

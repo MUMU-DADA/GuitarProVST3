@@ -1,4 +1,4 @@
-param(
+﻿param(
     [string]$HostDirectory = 'C:\Program Files\Arobas Music\Guitar Pro 8',
     [string]$McpRoot = 'C:\Users\mumu\source\GuitarProMCP',
     [string]$PluginPath = '',
@@ -13,65 +13,40 @@ $ErrorActionPreference = 'Stop'
 $root = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
 if (-not $PluginPath) { $PluginPath = Join-Path $root '.tools/native/plugins/imageformats/guitarpro_vst3_autoload.dll' }
 $mcpGeneric = Join-Path $McpRoot '.tools/native/plugins/generic/guitarpro_mcp.dll'
-$mcpAutoload = Join-Path $McpRoot '.tools/native/plugins/imageformats/guitarpro_mcp_autoload.dll'
 $mcpClient = Join-Path $McpRoot 'native/mcp-client.ps1'
-foreach ($path in @((Join-Path $HostDirectory 'GuitarPro.exe'), $PluginPath, $mcpGeneric, $mcpAutoload, $mcpClient)) {
+foreach ($path in @((Join-Path $HostDirectory 'GuitarPro.exe'), $PluginPath, $mcpGeneric, $mcpClient)) {
     if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { throw "P7 MCP prerequisite not found: $path" }
 }
 
 $run = Join-Path $root ('artifacts/mcp-p7-' + [guid]::NewGuid().ToString('N'))
-$hostCopy = Join-Path $root ('.tools/mcp p7 host-' + [guid]::NewGuid().ToString('N'))
-New-Item -ItemType Directory -Force -Path $run, $hostCopy | Out-Null
-Get-ChildItem -LiteralPath $HostDirectory -File |
-    Where-Object { $_.Extension -in '.dll','.conf' -or $_.Name -eq 'GuitarPro.exe' } |
-    Copy-Item -Destination $hostCopy
-Copy-Item -LiteralPath (Join-Path $HostDirectory 'Plugins') -Destination $hostCopy -Recurse
-$imageDir = Join-Path $hostCopy 'Plugins/imageformats'
-$genericDir = Join-Path $hostCopy 'Plugins/generic'
-New-Item -ItemType Directory -Force -Path $imageDir, $genericDir | Out-Null
-Copy-Item -LiteralPath $PluginPath -Destination (Join-Path $imageDir 'guitarpro_vst3_autoload.dll')
-Copy-Item -LiteralPath $mcpAutoload -Destination (Join-Path $imageDir 'guitarpro_mcp_autoload.dll')
-Copy-Item -LiteralPath $mcpGeneric -Destination (Join-Path $genericDir 'guitarpro_mcp.dll')
+New-Item -ItemType Directory -Force -Path $run | Out-Null
+. (Join-Path $PSScriptRoot 'host-session.ps1')
+$before = Get-Gpvst3HostSnapshot $HostDirectory
+$dataDirectory = Join-Path $run 'data'
 $fixtureSource = Join-Path $McpRoot 'native/testdata/minimal.gp'
 if (-not (Test-Path -LiteralPath $fixtureSource)) { $fixtureSource = Join-Path $McpRoot 'test/testdata/minimal.gp' }
 if (-not (Test-Path -LiteralPath $fixtureSource)) { throw "P7 MCP fixture not found under $McpRoot." }
 $fixture = Join-Path $run 'p7-runtime.gp'
 Copy-Item -LiteralPath $fixtureSource -Destination $fixture
 
-$saved = @{}
-foreach ($name in @('GPVST3_DATA_DIR','GPVST3_ENABLE_P2_HOOK','GPVST3_ENABLE_P2_EFFECT',
-                    'GPVST3_RUNTIME_VST3','GPVST3_VST3_ROOT','GPVST3_VST3_PATHS','GPMCP_DATA_DIR',
-                    'GPMCP_SESSION_FILE','GPMCP_BACKGROUND','GPMCP_DEVELOPMENT','TEMP','TMP')) {
-    $saved[$name] = [Environment]::GetEnvironmentVariable($name, 'Process')
-}
 $process = $null
 $session = $null
 try {
-    $env:GPVST3_DATA_DIR = Join-Path $run 'data'
-    if ($HookMode -eq 'default') { Remove-Item Env:GPVST3_ENABLE_P2_HOOK -ErrorAction SilentlyContinue }
-    else { $env:GPVST3_ENABLE_P2_HOOK = if ($HookMode -eq 'disabled') { '0' } else { '1' } }
+    $environment = @{GPVST3_DATA_DIR=$dataDirectory}
+    if ($HookMode -ne 'default') { $environment.GPVST3_ENABLE_P2_HOOK = if ($HookMode -eq 'disabled') { '0' } else { '1' } }
     # P7 owns its selected processors; leave the legacy single-effect probe
     # disabled so this test exercises the list-driven lifecycle in isolation.
-    $env:GPVST3_ENABLE_P2_EFFECT = '0'
+    $environment.GPVST3_ENABLE_P2_EFFECT = '0'
     $programFiles = if ($env:ProgramW6432) { $env:ProgramW6432 } else { $env:ProgramFiles }
     $vst3Paths = @($Vst3Root -split ';' | Where-Object { $_ } |
         ForEach-Object { Join-Path $programFiles ('Common Files/VST3/' + $_) })
-    Remove-Item Env:GPVST3_VST3_PATHS -ErrorAction SilentlyContinue
-    if ($StandardScan) {
-        Remove-Item Env:GPVST3_RUNTIME_VST3,Env:GPVST3_VST3_ROOT -ErrorAction SilentlyContinue
-    } else {
-        $env:GPVST3_RUNTIME_VST3 = $vst3Paths[0]
-        $env:GPVST3_VST3_ROOT = $vst3Paths -join ';'
+    if (-not $StandardScan) {
+        $environment.GPVST3_RUNTIME_VST3 = $vst3Paths[0]
+        $environment.GPVST3_VST3_ROOT = $vst3Paths -join ';'
     }
-    $env:GPMCP_DATA_DIR = Join-Path $run 'mcp'
-    $env:GPMCP_SESSION_FILE = Join-Path $run 'mcp/native-session.json'
-    $env:GPMCP_BACKGROUND = '1'
-    $env:GPMCP_DEVELOPMENT = '1'
-    $env:TEMP = $run
-    $env:TMP = $run
-    $process = Start-Process -FilePath (Join-Path $hostCopy 'GuitarPro.exe') -WorkingDirectory $hostCopy -WindowStyle Hidden -PassThru
+    $process = Start-Gpvst3TestHost -HostDirectory $HostDirectory -PluginPath $PluginPath -RunDirectory $run -McpRoot $McpRoot -Environment $environment
     $statusPath = Join-Path $run 'data/status.json'
-    $sessionPath = $env:GPMCP_SESSION_FILE
+    $sessionPath = Join-Path $run 'mcp/native-session.json'
     $deadline = [DateTime]::UtcNow.AddSeconds(30)
     while ((-not (Test-Path -LiteralPath $statusPath) -or -not (Test-Path -LiteralPath $sessionPath)) -and
            [DateTime]::UtcNow -lt $deadline) {
@@ -82,6 +57,9 @@ try {
     if (-not (Test-Path -LiteralPath $statusPath) -or -not (Test-Path -LiteralPath $sessionPath)) {
         throw 'MCP/P7 startup files were not published.'
     }
+    $identity = Get-Gpvst3TestIdentity $process $HostDirectory $PluginPath $statusPath $McpRoot
+    $descriptor = Get-Content -LiteralPath $sessionPath -Raw | ConvertFrom-Json
+    if ($descriptor.pid -ne $process.Id) { throw 'MCP session belongs to another process.' }
     . $mcpClient
     $session = New-McpSession -SessionFile $sessionPath
     $opened = Invoke-McpTool $session gp_open @{path=$fixture}
@@ -112,6 +90,7 @@ try {
     $panel = Invoke-McpTool $session gp_objects @{query='gpvst3P7Panel';limit=30}
     $entry = Invoke-McpTool $session gp_objects @{query='gpvst3SoundEffectChainButton';limit=30}
     $result = [ordered]@{
+        identity = $identity
         hook_mode = $HookMode
         standard_scan = [bool]$StandardScan
         startup = $scan
@@ -161,7 +140,7 @@ try {
         if ($noticeJson -notmatch 'realtime_disabled_by_environment') {
             throw "Disabled hook failure did not explain the actual cause: $noticeJson"
         }
-        $persisted = Get-Content -LiteralPath (Join-Path $env:GPVST3_DATA_DIR 'effect-chain.json') -Raw | ConvertFrom-Json
+        $persisted = Get-Content -LiteralPath (Join-Path $dataDirectory 'effect-chain.json') -Raw | ConvertFrom-Json
         if (@($persisted.effects | Where-Object enabled).Count) { throw 'Rejected selection was saved as enabled.' }
         $result | ConvertTo-Json -Depth 30 | Set-Content -LiteralPath (Join-Path $run 'verification.json') -Encoding UTF8
         Write-Output "PASS: P7 explicitly disabled hook rejects selection with its actual cause. Evidence: $run"
@@ -170,7 +149,7 @@ try {
     Start-Sleep -Seconds 2
     $play = Invoke-McpTool $session gp_playback @{operation='play';document=$operation.operation.document}
     Start-Sleep -Seconds 2
-    $observationPath = Join-Path $env:GPVST3_DATA_DIR 'p2-observation.json'
+    $observationPath = Join-Path $dataDirectory 'p2-observation.json'
     if (-not (Test-Path -LiteralPath $observationPath)) { throw 'P7 realtime observation was not written.' }
     $observation = Get-Content -LiteralPath $observationPath -Raw | ConvertFrom-Json
     $hook = $observation.gp_hook
@@ -256,7 +235,7 @@ try {
         $disabledObservation.gp_hook.chain_active_slot -ne -1) {
         throw "P7 disabling all items did not return to direct bypass: $($disabledObservation.gp_hook | ConvertTo-Json -Depth 12 -Compress)"
     }
-    $sidecarPath = Join-Path $env:GPVST3_DATA_DIR 'effect-chain.json'
+    $sidecarPath = Join-Path $dataDirectory 'effect-chain.json'
     if (-not (Test-Path -LiteralPath $sidecarPath)) { throw 'P7 sidecar was not written.' }
     $sidecar = Get-Content -LiteralPath $sidecarPath -Raw | ConvertFrom-Json
     $savedStates = @($sidecar.effects | Where-Object { $_.component_state })
@@ -304,24 +283,6 @@ try {
 }
 finally {
     if ($session) { try { Close-McpSession $session } catch {} }
-    if ($process) {
-        $process.Refresh()
-        if (-not $process.HasExited) {
-            if (-not $KeepHost) { Stop-Process -Id $process.Id -Force }
-        }
-        if (-not $KeepHost) { $process.WaitForExit(5000) | Out-Null }
-        $process.Dispose()
-    }
-    foreach ($name in $saved.Keys) {
-        if ($null -eq $saved[$name]) { Remove-Item "Env:$name" -ErrorAction SilentlyContinue }
-        else { Set-Item "Env:$name" $saved[$name] }
-    }
-    if (-not $KeepHost) {
-        $full = (Resolve-Path -LiteralPath $hostCopy -ErrorAction SilentlyContinue).Path
-        $toolsRoot = [IO.Path]::GetFullPath((Join-Path $root '.tools')) + [IO.Path]::DirectorySeparatorChar
-        if ($full -and $full.StartsWith($toolsRoot, [StringComparison]::OrdinalIgnoreCase) -and
-            ([IO.Path]::GetFileName($full) -like 'mcp p7 host-*')) {
-            Remove-Item -LiteralPath $full -Recurse -Force -ErrorAction SilentlyContinue
-        }
-    }
+    try { Stop-Gpvst3TestHost $process -KeepHost:$KeepHost -RunDirectory $run }
+    finally { Assert-Gpvst3HostUnchanged $before $HostDirectory $run }
 }

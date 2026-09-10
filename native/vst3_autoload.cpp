@@ -3,12 +3,25 @@
 #include <QtCore/QTimer>
 #include <QtGui/QImageIOPlugin>
 
+#define WIN32_LEAN_AND_MEAN
+#define NOMINMAX
+#include <windows.h>
+
 #include "modules/bootstrap.h"
 #include "modules/gp_hook.h"
 #include "modules/qt_ui.h"
 #include "modules/state_manager.h"
 
 namespace {
+
+QString pluginPath() {
+    HMODULE module = nullptr;
+    wchar_t path[32768]{};
+    if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                           reinterpret_cast<LPCWSTR>(&pluginPath), &module)) return {};
+    const DWORD length = GetModuleFileNameW(module, path, 32768);
+    return length && length < 32768 ? QString::fromWCharArray(path, static_cast<int>(length)) : QString{};
+}
 
 void writeObservation() {
     const auto hook = gpvst3::bootstrap::hookSnapshot();
@@ -38,6 +51,7 @@ public:
         auto *application = qApp;
         QTimer::singleShot(0, application, [application] {
             auto status = gpvst3::bootstrap::initialize();
+            status.insert("plugin_path", pluginPath());
             gpvst3::state::writeStatus(status);
             gpvst3::ui::showEffectChainPanel();
             gpvst3::ui::syncVst3Selection();

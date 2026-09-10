@@ -6,7 +6,8 @@ param(
     [switch]$RequireP2,
     [switch]$RequireP2Hook,
     [ValidateSet('', 'GuitarPro.exe', 'GPCore.dll', 'GPRSE.dll', 'AMAudio.dll', 'AMOverloud.dll')]
-    [string]$TamperHostFile = ''
+    [string]$RejectHostFile = '',
+    [string]$QtDir = ''
 )
 
 $ErrorActionPreference = 'Stop'
@@ -16,49 +17,38 @@ if (-not (Test-Path -LiteralPath $PluginPath)) { throw 'Build the plugin first w
 if (-not (Test-Path -LiteralPath (Join-Path $HostDirectory 'GuitarPro.exe'))) { throw "Host not found: $HostDirectory" }
 
 $run = Join-Path $root ('artifacts/p0-' + [guid]::NewGuid().ToString('N'))
-$hostCopy = Join-Path $root ('.tools/autoload-host-' + [guid]::NewGuid().ToString('N'))
-New-Item -ItemType Directory -Force -Path $run,$hostCopy | Out-Null
-Get-ChildItem -LiteralPath $HostDirectory -File | Where-Object { $_.Extension -in '.dll','.conf' -or $_.Name -eq 'GuitarPro.exe' } | Copy-Item -Destination $hostCopy
-Copy-Item -LiteralPath (Join-Path $HostDirectory 'Plugins') -Destination $hostCopy -Recurse
-if (Test-Path -LiteralPath (Join-Path $HostDirectory 'translations')) { Copy-Item -LiteralPath (Join-Path $HostDirectory 'translations') -Destination $hostCopy -Recurse }
-if ($TamperHostFile) {
-    $tampered = Join-Path $hostCopy $TamperHostFile
-    if (-not (Test-Path -LiteralPath $tampered -PathType Leaf)) { throw "Cannot tamper missing host file: $tampered" }
-    # Appending bytes to a copied PE/DLL changes its SHA-256 while leaving the
-    # executable image loadable, which gives the gate a real negative test.
-    $stream = [IO.File]::Open($tampered, [IO.FileMode]::Append, [IO.FileAccess]::Write, [IO.FileShare]::Read)
-    try { $stream.WriteByte(0x50); $stream.WriteByte(0x36) } finally { $stream.Dispose() }
+New-Item -ItemType Directory -Force -Path $run | Out-Null
+. (Join-Path $PSScriptRoot 'host-session.ps1')
+$before = Get-Gpvst3HostSnapshot $HostDirectory
+if ($RejectHostFile) {
+    $negativeBuild = Join-Path $run 'rejected host plugin'
+    # Keep the compiler environment out of the parent regression process.
+    $buildArguments = @('-NoProfile', '-File', (Join-Path $root 'native/build.ps1'),
+                        '-OutputRoot', $negativeBuild, '-RejectHostFile', $RejectHostFile)
+    if ($QtDir) { $buildArguments += @('-QtDir', $QtDir) }
+    & (Get-Process -Id $PID).Path @buildArguments | Out-Host
+    if ($LASTEXITCODE) { throw 'Negative host-gate plugin build failed.' }
+    $PluginPath = Join-Path $negativeBuild 'plugins/imageformats/guitarpro_vst3_autoload.dll'
 }
-$imageDir = Join-Path $hostCopy 'Plugins/imageformats'
-Remove-Item -LiteralPath (Join-Path $imageDir 'guitarpro_mcp_autoload.dll') -Force -ErrorAction SilentlyContinue
-$installedPlugin = Join-Path $imageDir 'guitarpro_vst3_autoload.dll'
-Copy-Item -LiteralPath $PluginPath -Destination $installedPlugin
-$statusPath = Join-Path $run 'status.json'
-$exe = Join-Path $hostCopy 'GuitarPro.exe'
-$shortcutPath = Join-Path $run 'Guitar Pro P0.lnk'
-$shell = New-Object -ComObject WScript.Shell
-$shortcut = $shell.CreateShortcut($shortcutPath)
-$shortcut.TargetPath = $exe
-$shortcut.WorkingDirectory = $hostCopy
-$shortcut.Save()
-
-$saved = @{}
-foreach ($name in @('QT_PLUGIN_PATH','QT_QPA_GENERIC_PLUGINS','GPVST3_DATA_DIR','GPVST3_ENABLE_P2_HOOK','GPVST3_ENABLE_P2_EFFECT','GPVST3_RUNTIME_VST3','GPVST3_TOTAL_BYPASS','GPVST3_FORCE_P3_ERROR','GPVST3_ENABLE_P4_INPUT','GPVST3_P4_ROUTE','TEMP','TMP')) { $saved[$name] = [Environment]::GetEnvironmentVariable($name, 'Process') }
 $results = @()
+$passed = $false
+$environment = @{}
+if ($RequireP2Hook -or $RejectHostFile) { $environment.GPVST3_ENABLE_P2_HOOK = '1' }
+if ($RejectHostFile) {
+    $environment.GPVST3_ENABLE_P2_EFFECT = '1'
+    $environment.GPVST3_ENABLE_P4_INPUT = '1'
+    $environment.GPVST3_P4_ROUTE = 'bus_mix'
+}
+if ($RequireP1 -or $RequireP2) {
+    $programFiles = if ($env:ProgramW6432) { $env:ProgramW6432 } else { $env:ProgramFiles }
+    $environment.GPVST3_VST3_ROOT = (@('Gateway.vst3','ParametricOD.vst3','NAM Rig.vst3') |
+        ForEach-Object { Join-Path $programFiles ('Common Files/VST3/' + $_) }) -join ';'
+}
 try {
-    Remove-Item Env:QT_PLUGIN_PATH,Env:QT_QPA_GENERIC_PLUGINS -ErrorAction SilentlyContinue
-    $env:GPVST3_DATA_DIR = $run
-    if ($RequireP2Hook -or $TamperHostFile) { $env:GPVST3_ENABLE_P2_HOOK = '1' } else { Remove-Item Env:GPVST3_ENABLE_P2_HOOK -ErrorAction SilentlyContinue }
-    if ($TamperHostFile) { $env:GPVST3_ENABLE_P2_EFFECT = '1'; $env:GPVST3_ENABLE_P4_INPUT = '1'; $env:GPVST3_P4_ROUTE = 'bus_mix' }
-    else { Remove-Item Env:GPVST3_ENABLE_P2_EFFECT,Env:GPVST3_ENABLE_P4_INPUT,Env:GPVST3_P4_ROUTE -ErrorAction SilentlyContinue }
-    Remove-Item Env:GPVST3_RUNTIME_VST3,Env:GPVST3_TOTAL_BYPASS,Env:GPVST3_FORCE_P3_ERROR -ErrorAction SilentlyContinue
-    $env:TEMP = $run
-    $env:TMP = $run
     foreach ($variant in @('direct','shortcut')) {
-        Remove-Item -LiteralPath $statusPath -Force -ErrorAction SilentlyContinue
-        $launch = @{FilePath=$exe; WorkingDirectory=$hostCopy; WindowStyle='Hidden'; PassThru=$true}
-        if ($variant -eq 'shortcut') { $launch.FilePath = $shortcutPath }
-        $process = Start-Process @launch
+        $variantRun = Join-Path $run $variant
+        $statusPath = Join-Path $variantRun 'status.json'
+        $process = Start-Gpvst3TestHost -HostDirectory $HostDirectory -PluginPath $PluginPath -RunDirectory $variantRun -Environment $environment -Shortcut:($variant -eq 'shortcut')
         try {
             # P7 scans all standard VST3 bundles once on first launch; large
             # installations can take longer than the P0 three-plugin probe.
@@ -67,10 +57,21 @@ try {
                 Start-Sleep -Milliseconds 200
                 $process.Refresh()
             } while (-not (Test-Path -LiteralPath $statusPath) -and -not $process.HasExited -and [DateTime]::UtcNow -lt $deadline)
-            if (-not (Test-Path -LiteralPath $statusPath)) { throw "P0 automatic loading failed for $variant." }
+            if (-not (Test-Path -LiteralPath $statusPath)) { throw "P0 development loading failed for $variant." }
+            $identity = Get-Gpvst3TestIdentity $process $HostDirectory $PluginPath $statusPath
             $status = Get-Content -LiteralPath $statusPath -Raw | ConvertFrom-Json
+            if ($RequireP1 -or $RequireP2) {
+                while ($status.vst3_host.scan_pending -and [DateTime]::UtcNow -lt $deadline) {
+                    Start-Sleep -Milliseconds 200
+                    $status = Get-Content -LiteralPath $statusPath -Raw | ConvertFrom-Json
+                }
+                if ($status.vst3_host.scan_pending) { throw 'VST3 lifecycle scan did not finish.' }
+            }
             if (-not $status.loaded -or -not $status.bypassed -or $process.HasExited -or $status.pid -ne $process.Id) { throw "Unexpected P0 status for $variant." }
-            if ($TamperHostFile) {
+            if ($RejectHostFile) {
+                foreach ($file in $status.host_files.PSObject.Properties) {
+                    if ($file.Value -ne ($file.Name -ne $RejectHostFile)) { throw "Unexpected host hash result: $($file.Name)" }
+                }
                 if ($status.host_supported -or $status.status -ne 'host_unsupported' -or
                     $status.gp_hook.installed -or $status.gp_hook.enabled -or $status.gp_hook.runtime_processor_ready -or
                     $status.gp_hook.runtime_effect_enabled -or $status.gp_hook.input_route_enabled -or
@@ -101,7 +102,7 @@ try {
                     throw "Unexpected P2 GP hook status for $variant."
                 }
             }
-            $observationPath = Join-Path $run 'p2-observation.json'
+            $observationPath = Join-Path $variantRun 'p2-observation.json'
             $observation = $null
             if ($RequireP2Hook) {
                 $observationDeadline = [DateTime]::UtcNow.AddSeconds(3)
@@ -109,36 +110,36 @@ try {
                 if (-not (Test-Path -LiteralPath $observationPath)) { throw "P2 observation snapshot was not written for $variant." }
                 $observation = Get-Content -LiteralPath $observationPath -Raw | ConvertFrom-Json
             }
-            $results += [pscustomobject]@{variant=$variant;pid=$process.Id;status=$status.status;host_supported=$status.host_supported;bypassed=$status.bypassed;vst3_host=$status.vst3_host;audio_adapter=$status.audio_adapter;gp_hook=$status.gp_hook;p2_observation=$observation}
+            $results += [pscustomobject]@{variant=$variant;identity=$identity;pid=$process.Id;status=$status.status;host_supported=$status.host_supported;bypassed=$status.bypassed;vst3_host=$status.vst3_host;audio_adapter=$status.audio_adapter;gp_hook=$status.gp_hook;p2_observation=$observation}
         } finally {
-            if (-not $process.HasExited) { Stop-Process -Id $process.Id -Force; $process.WaitForExit(5000) | Out-Null }
-            $process.Dispose()
+            Stop-Gpvst3TestHost $process -RunDirectory $variantRun
         }
     }
-    Remove-Item -LiteralPath $installedPlugin -Force
-    Remove-Item -LiteralPath $statusPath -Force -ErrorAction SilentlyContinue
-    $process = Start-Process -FilePath $exe -WorkingDirectory $hostCopy -WindowStyle Hidden -PassThru
-    Start-Sleep -Seconds 3
-    if ((Test-Path -LiteralPath $statusPath) -or $process.HasExited) { throw 'Removing the plugin did not restore normal startup.' }
-    if (-not $process.HasExited) { Stop-Process -Id $process.Id -Force; $process.WaitForExit(5000) | Out-Null }
-    $results += [pscustomobject]@{variant='uninstalled';pid=$process.Id;status='not_loaded';host_supported=$false;bypassed=$true}
+    $process = Start-Gpvst3TestHost -HostDirectory $HostDirectory -RunDirectory (Join-Path $run 'without-development') -WithoutDevelopmentPlugin
+    try {
+        Start-Sleep -Seconds 3
+        $process.Refresh()
+        if ($process.HasExited) { throw 'Guitar Pro exited without the development loading environment.' }
+        $loaded = @($process.Modules | Where-Object ModuleName -EQ 'guitarpro_vst3_autoload.dll' | ForEach-Object FileName)
+        if ($loaded -icontains (Resolve-Path -LiteralPath $PluginPath).Path) { throw 'Development DLL is still loaded without its environment.' }
+        $installed = Join-Path $HostDirectory 'Plugins/imageformats/guitarpro_vst3_autoload.dll'
+        if (Test-Path -LiteralPath $installed) {
+            if ($loaded -inotcontains (Resolve-Path -LiteralPath $installed).Path) { throw 'Existing installed plugin did not resume normal loading.' }
+        } elseif ($loaded.Count) { throw 'An unexpected VST3 bootstrap loaded without the development environment.' }
+        $results += [pscustomobject]@{variant='without_development_environment';pid=$process.Id;executable=$process.Path;loaded_plugins=$loaded;development_plugin_loaded=$false}
+        $passed = $true
+    } finally { Stop-Gpvst3TestHost $process -KeepHost:$KeepHost -RunDirectory (Join-Path $run 'without-development') }
 } finally {
-    foreach ($name in $saved.Keys) { [Environment]::SetEnvironmentVariable($name, $saved[$name], 'Process') }
-    [pscustomobject]@{host_directory=$hostCopy;plugin_sha256=(Get-FileHash -LiteralPath $PluginPath).Hash;results=$results} |
+    Assert-Gpvst3HostUnchanged $before $HostDirectory $run
+    [pscustomobject]@{passed=$passed;mode='original_host_no_install';host_directory=(Resolve-Path -LiteralPath $HostDirectory).Path;rejected_host_file=$RejectHostFile;plugin_sha256=(Get-FileHash -LiteralPath $PluginPath).Hash;results=$results} |
         ConvertTo-Json -Depth 8 | Set-Content -LiteralPath (Join-Path $run 'verification.json')
-    if (-not $KeepHost) {
-        $full = (Resolve-Path -LiteralPath $hostCopy).Path
-        $toolsRoot = (Resolve-Path -LiteralPath (Join-Path $root '.tools')).Path.TrimEnd('\') + '\'
-        if (-not $full.StartsWith($toolsRoot, [StringComparison]::OrdinalIgnoreCase)) { throw "Refusing to remove host outside .tools: $full" }
-        Remove-Item -LiteralPath $full -Recurse -Force -ErrorAction SilentlyContinue
-    }
 }
-if ($TamperHostFile) {
+if ($RejectHostFile) {
     Write-Output "PASS: P0 host hash mismatch disabled hook and realtime mode. Evidence: $run"
 } elseif ($RequireP2) {
     Write-Output "PASS: P0/P1 plus P2 planar adapter, process probe and GP observation status. Evidence: $run"
 } elseif ($RequireP1) {
-    Write-Output "PASS: P0 automatic load plus P1 VST3 host lifecycle. Evidence: $run"
+    Write-Output "PASS: P0 development load plus P1 VST3 host lifecycle. Evidence: $run"
 } else {
-    Write-Output "PASS: P0 automatic load, default bypass and uninstall recovery. Evidence: $run"
+    Write-Output "PASS: P0 original-host development load, default bypass and environment removal. Evidence: $run"
 }

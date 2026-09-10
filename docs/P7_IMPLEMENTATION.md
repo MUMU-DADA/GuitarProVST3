@@ -16,6 +16,8 @@ P7 当前为**进行中（2026-09-10 按最新交互要求更新）**。已有�
 
 ## 验证命令
 
+当前 `test-p7.ps1` 和 `test-p7-mcp.ps1` 均通过[原软件免安装入口](P0_IMPLEMENTATION.md#原软件免安装测试2026-09-10)直接运行正式目录的 `GuitarPro.exe`，加载仓库中的开发 DLL，并校验安装目录文件保持不变。默认/显式启用/显式禁用、标准目录清单和现有 editor 生命周期的免安装回归已通过，汇总见 P0 验证记录；以下原有副本回归继续作为历史证据。该迁移不改变独立窗口、扫描缓存和首次按钮提示的待实现状态。
+
 ```powershell
 ./native/build.ps1 -QtDir C:/Users/mumu/source/GuitarProMCP/.tools/qt/5.15.2/msvc2019_64 -OutputRoot .tools/native
 ./native/test/test-p7-ui.ps1 -QtDir C:/Users/mumu/source/GuitarProMCP/.tools/qt/5.15.2/msvc2019_64

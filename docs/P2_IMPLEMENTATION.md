@@ -17,7 +17,7 @@ P2 已完成内部音频适配、VST3 实际块处理，以及针对 Guitar Pro 
   - 额外设置 `GPVST3_ENABLE_P2_EFFECT=1` 时，在原始 `Master::process` 调用后复用已预创建的 `ParametricOD` VST3 processor：GP `AudioBuffer` → planar `float32` → VST3 `process()` → 原 GP 通道缓冲。
   - 运行时 processor 就绪时状态中的 `observation_only=false`；只启用 hook 时仍为 `true`。
 - `native/test/test-p2-runtime.ps1`
-  - 使用旁项目的原生 MCP 驱动，在隔离 Guitar Pro 副本中打开最小 RSE 曲谱并播放，读取 `p2-observation.json` 验证真实回调和处理结果。
+  - 使用旁项目的原生 MCP 驱动，通过[原软件免安装入口](P0_IMPLEMENTATION.md#原软件免安装测试2026-09-10)启动 Guitar Pro，打开独立的最小 RSE 测试曲谱并播放，读取 `p2-observation.json` 验证真实回调和处理结果。
 
 ## 验证
 
@@ -26,9 +26,9 @@ P2 已完成内部音频适配、VST3 实际块处理，以及针对 Guitar Pro 
 ./native/test/test-p2.ps1
 ```
 
-`test-p2.ps1` 会先执行隔离启动回归，再调用 `native/test/test-p2-runtime.ps1` 完成真实播放处理验证；也可以单独运行后者复查运行时证据。
+`test-p2.ps1` 会先执行原软件免安装启动回归，再调用 `native/test/test-p2-runtime.ps1` 完成真实播放处理验证；也可以单独运行后者复查运行时证据。
 
-最近一次 `test-p2-runtime.ps1` 证据（写入被忽略的 `artifacts/` 目录）：
+迁移前的 `test-p2-runtime.ps1` 历史证据（写入被忽略的 `artifacts/` 目录，计数仅对应当时的运行）：
 
 - Guitar Pro 8.1.1.17 / Windows x64，隔离副本实际播放状态为 `playing=true`。
 - `Master::process` 调用 49 次，快照块为 44100 Hz、2021 帧、2 声道；宿主缓冲哈希在调用后变化。

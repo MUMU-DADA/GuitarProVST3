@@ -26,7 +26,7 @@ P3 在 P2 的哈希门控实时入口上增加了固定双槽效果器链。插�
 ./native/test/test-p3.ps1
 ```
 
-最近一次锁定的 Guitar Pro 8.1.1.17 / Windows x64 隔离宿主验证已通过：
+以下为迁移前锁定 Guitar Pro 8.1.1.17 / Windows x64 的历史验证；当前测试复用[原软件免安装入口](P0_IMPLEMENTATION.md#原软件免安装测试2026-09-10)：
 
 - 正常链：49 个播放块均处理，`chain_prepared_slots=2`、`chain_error_blocks=0`、`reconfiguration_passed=10`、`reconfiguration_failed=0`、`reconfiguration_validated=true`，处理耗时监控记录到约 2 ms 的最大值（运行时具体值以证据文件为准）。
 - 可检测错误回退：`chain_faulted=true`、`total_bypass=true`、`chain_error_blocks=1`、`chain_fallback_blocks=1`，后续块均旁路。

@@ -17,25 +17,15 @@ $root = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
 if (-not $McpRoot) { $McpRoot = Join-Path (Split-Path -Parent $root) 'GuitarProMCP' }
 if (-not $PluginPath) { $PluginPath = Join-Path $root '.tools/native/plugins/imageformats/guitarpro_vst3_autoload.dll' }
 $mcpGeneric = Join-Path $McpRoot '.tools/native/plugins/generic/guitarpro_mcp.dll'
-$mcpAutoload = Join-Path $McpRoot '.tools/native/plugins/imageformats/guitarpro_mcp_autoload.dll'
 $mcpClient = Join-Path $McpRoot 'native/mcp-client.ps1'
-foreach ($path in @($PluginPath, $mcpGeneric, $mcpAutoload, $mcpClient, (Join-Path $HostDirectory 'GuitarPro.exe'))) {
+foreach ($path in @($PluginPath, $mcpGeneric, $mcpClient, (Join-Path $HostDirectory 'GuitarPro.exe'))) {
     if (-not (Test-Path -LiteralPath $path)) { throw "Required runtime test file not found: $path" }
 }
 
 $run = Join-Path $root ('artifacts/p2-runtime-' + [guid]::NewGuid().ToString('N'))
-$hostCopy = Join-Path $root ('.tools/p2-runtime-host-' + [guid]::NewGuid().ToString('N'))
-New-Item -ItemType Directory -Force -Path $run,$hostCopy | Out-Null
-Get-ChildItem -LiteralPath $HostDirectory -File | Where-Object { $_.Extension -in '.dll','.conf' -or $_.Name -eq 'GuitarPro.exe' } | Copy-Item -Destination $hostCopy
-Copy-Item -LiteralPath (Join-Path $HostDirectory 'Plugins') -Destination $hostCopy -Recurse
-if (Test-Path -LiteralPath (Join-Path $HostDirectory 'translations')) { Copy-Item -LiteralPath (Join-Path $HostDirectory 'translations') -Destination $hostCopy -Recurse }
-$imageDir = Join-Path $hostCopy 'Plugins/imageformats'
-$genericDir = Join-Path $hostCopy 'Plugins/generic'
-New-Item -ItemType Directory -Force -Path $imageDir,$genericDir | Out-Null
-Remove-Item -LiteralPath (Join-Path $imageDir 'guitarpro_mcp_autoload.dll') -Force -ErrorAction SilentlyContinue
-Copy-Item -LiteralPath $PluginPath -Destination (Join-Path $imageDir 'guitarpro_vst3_autoload.dll')
-Copy-Item -LiteralPath $mcpAutoload -Destination (Join-Path $imageDir 'guitarpro_mcp_autoload.dll')
-Copy-Item -LiteralPath $mcpGeneric -Destination (Join-Path $genericDir 'guitarpro_mcp.dll')
+New-Item -ItemType Directory -Force -Path $run | Out-Null
+. (Join-Path $PSScriptRoot 'host-session.ps1')
+$before = Get-Gpvst3HostSnapshot $HostDirectory
 
 $fixture = Join-Path $run 'runtime.gp'
 $fixtureSource = Join-Path $McpRoot 'native/testdata/minimal.gp'
@@ -54,39 +44,22 @@ try {
     try { $writer.Write($gpif.OuterXml) } finally { $writer.Dispose() }
 } finally { $archive.Dispose() }
 
-$saved = @{}
-foreach ($name in @('QT_PLUGIN_PATH','QT_QPA_GENERIC_PLUGINS','GPVST3_DATA_DIR','GPVST3_ENABLE_P2_HOOK','GPVST3_ENABLE_P2_EFFECT','GPVST3_RUNTIME_VST3','GPVST3_TOTAL_BYPASS','GPVST3_FORCE_P3_ERROR','GPVST3_ENABLE_P4_INPUT','GPVST3_P4_ROUTE','GPMCP_DATA_DIR','GPMCP_SESSION_FILE','GPMCP_BACKGROUND','GPMCP_DEVELOPMENT','TEMP','TMP')) {
-    $saved[$name] = [Environment]::GetEnvironmentVariable($name, 'Process')
-}
 $process = $null
 $session = $null
 try {
-    Remove-Item Env:QT_PLUGIN_PATH,Env:QT_QPA_GENERIC_PLUGINS -ErrorAction SilentlyContinue
-    $env:GPVST3_DATA_DIR = $run
-    $env:GPVST3_ENABLE_P2_HOOK = '1'
-    $env:GPVST3_ENABLE_P2_EFFECT = '1'
+    $environment = @{GPVST3_ENABLE_P2_HOOK='1';GPVST3_ENABLE_P2_EFFECT='1'}
     if ($EnableP4) {
-        $env:GPVST3_ENABLE_P4_INPUT = '1'
-        $env:GPVST3_P4_ROUTE = $P4Route
-    } else {
-        Remove-Item Env:GPVST3_ENABLE_P4_INPUT,Env:GPVST3_P4_ROUTE -ErrorAction SilentlyContinue
+        $environment.GPVST3_ENABLE_P4_INPUT = '1'
+        $environment.GPVST3_P4_ROUTE = $P4Route
     }
-    if ($ExpectP3Fallback) { $env:GPVST3_FORCE_P3_ERROR = '1' }
-    else { Remove-Item Env:GPVST3_FORCE_P3_ERROR -ErrorAction SilentlyContinue }
-    if ($ExpectP3TotalBypass) { $env:GPVST3_TOTAL_BYPASS = '1' }
-    else { Remove-Item Env:GPVST3_TOTAL_BYPASS -ErrorAction SilentlyContinue }
+    if ($ExpectP3Fallback) { $environment.GPVST3_FORCE_P3_ERROR = '1' }
+    if ($ExpectP3TotalBypass) { $environment.GPVST3_TOTAL_BYPASS = '1' }
     $programFiles = if ($env:ProgramW6432) { $env:ProgramW6432 } else { $env:ProgramFiles }
-    if ($ExpectMissingPlugin) { $env:GPVST3_RUNTIME_VST3 = Join-Path $run 'missing/NoSuchEffect.vst3' }
-    else { $env:GPVST3_RUNTIME_VST3 = Join-Path $programFiles 'Common Files/VST3/ParametricOD.vst3' }
-    $env:GPMCP_DATA_DIR = Join-Path $run 'mcp'
-    $env:GPMCP_SESSION_FILE = Join-Path $run 'mcp/native-session.json'
-    $env:GPMCP_BACKGROUND = '1'
-    $env:GPMCP_DEVELOPMENT = '1'
-    $env:TEMP = $run
-    $env:TMP = $run
-    $process = Start-Process -FilePath (Join-Path $hostCopy 'GuitarPro.exe') -WorkingDirectory $hostCopy -WindowStyle Hidden -PassThru
+    if ($ExpectMissingPlugin) { $environment.GPVST3_RUNTIME_VST3 = Join-Path $run 'missing/NoSuchEffect.vst3' }
+    else { $environment.GPVST3_RUNTIME_VST3 = Join-Path $programFiles 'Common Files/VST3/ParametricOD.vst3' }
+    $process = Start-Gpvst3TestHost -HostDirectory $HostDirectory -PluginPath $PluginPath -RunDirectory $run -McpRoot $McpRoot -Environment $environment
     $statusPath = Join-Path $run 'status.json'
-    $sessionPath = $env:GPMCP_SESSION_FILE
+    $sessionPath = Join-Path $run 'mcp/native-session.json'
     $deadline = [DateTime]::UtcNow.AddSeconds(20)
     do {
         Start-Sleep -Milliseconds 200
@@ -94,6 +67,9 @@ try {
         if ($process.HasExited) { throw "Guitar Pro exited before P2 runtime observation started ($($process.ExitCode))." }
     } while ((-not (Test-Path -LiteralPath $statusPath) -or -not (Test-Path -LiteralPath $sessionPath)) -and [DateTime]::UtcNow -lt $deadline)
     if (-not (Test-Path -LiteralPath $statusPath) -or -not (Test-Path -LiteralPath $sessionPath)) { throw 'P2 runtime status/session was not published.' }
+    $identity = Get-Gpvst3TestIdentity $process $HostDirectory $PluginPath $statusPath $McpRoot
+    $descriptor = Get-Content -LiteralPath $sessionPath -Raw | ConvertFrom-Json
+    if ($descriptor.pid -ne $process.Id) { throw 'MCP session belongs to another process.' }
 
     . $mcpClient
     $session = New-McpSession -SessionFile $sessionPath
@@ -197,39 +173,24 @@ try {
     }
     $workflow = $null
     if ($P6Workflow) {
+        # A clean-exit assertion requires the asynchronous startup scan to have
+        # reached its terminal state; stopping mid-scan is a separate scenario.
+        $scanDeadline = [DateTime]::UtcNow.AddSeconds(90)
+        do {
+            $scan = (Get-Content -LiteralPath $statusPath -Raw | ConvertFrom-Json).vst3_host
+            if (-not $scan.scan_pending) { break }
+            Start-Sleep -Milliseconds 250
+        } while ([DateTime]::UtcNow -lt $scanDeadline)
+        if ($scan.scan_pending) { throw 'VST3 startup scan did not finish before the P6 clean-exit workflow.' }
         . (Join-Path $PSScriptRoot 'p6_workflow.ps1')
         $workflow = Invoke-P6Workflow -Session $session -Document $document -FixturePath $fixture -RunDirectory $run -Process $process
     }
-    @{status='passed';playback=$playback;gp_hook=$hook;p6_workflow=$workflow;host_sha256=(Get-FileHash -LiteralPath (Join-Path $hostCopy 'GuitarPro.exe')).Hash;plugin_sha256=(Get-FileHash -LiteralPath $PluginPath).Hash} |
+    @{status='passed';identity=$identity;playback=$playback;gp_hook=$hook;p6_workflow=$workflow;host_sha256=$identity.host_sha256;plugin_sha256=$identity.plugin_sha256} |
         ConvertTo-Json -Depth 20 | Set-Content -LiteralPath (Join-Path $run 'verification.json')
     $scope = if ($P6Workflow) { 'P6 VST3 processing and host workflow' } elseif ($ExpectMissingPlugin) { 'missing VST3 bypass fallback' } elseif ($ExpectP3Fallback) { 'detectable processing error fallback' } else { 'P2/P3 realtime VST3 processing' }
     Write-Output "PASS: $scope. Evidence: $run"
 } finally {
     if ($session) { try { Invoke-McpTool $session gp_playback @{operation='stop'} -AllowError | Out-Null } catch {} ; try { Close-McpSession $session } catch {} }
-    if ($process) {
-        $process.Refresh()
-        if (-not $process.HasExited) { Stop-Process -Id $process.Id -Force; $process.WaitForExit(5000) | Out-Null }
-        else { $process.WaitForExit(5000) | Out-Null }
-        $process.Dispose()
-    }
-    foreach ($name in $saved.Keys) { [Environment]::SetEnvironmentVariable($name, $saved[$name], 'Process') }
-    if (-not $KeepHost) {
-        $full = (Resolve-Path -LiteralPath $hostCopy -ErrorAction SilentlyContinue).Path
-        if ($full) {
-            $toolsRoot = (Resolve-Path -LiteralPath (Join-Path $root '.tools')).Path.TrimEnd('\') + '\'
-            if (-not $full.StartsWith($toolsRoot, [System.StringComparison]::OrdinalIgnoreCase)) {
-                throw "Refusing to remove a path outside the project .tools directory: $full"
-            }
-            $removed = $false
-            for ($attempt = 0; $attempt -lt 30 -and -not $removed; ++$attempt) {
-                try {
-                    [IO.Directory]::Delete($full, $true)
-                    $removed = $true
-                } catch {
-                    Start-Sleep -Seconds 1
-                }
-            }
-            if (-not $removed) { Write-Warning "Runtime host copy could not be removed; inspect and delete when no process holds it: $full" }
-        }
-    }
+    try { Stop-Gpvst3TestHost $process -KeepHost:$KeepHost -RunDirectory $run }
+    finally { Assert-Gpvst3HostUnchanged $before $HostDirectory $run }
 }

@@ -23,10 +23,10 @@ if ($LASTEXITCODE) { throw 'P6 host hash gate failed.' }
 $results += [pscustomobject]@{suite='host_lock';result=($gateOutput -join ' ')}
 
 & (Join-Path $PSScriptRoot 'test-p0.ps1') -HostDirectory $HostDirectory -PluginPath $PluginPath -KeepHost:$KeepHost | Tee-Object -Variable p0Output | Out-Host
-if ($LASTEXITCODE) { throw 'P6 positive startup/uninstall regression failed.' }
-$results += [pscustomobject]@{suite='startup_uninstall';result=($p0Output -join ' ')}
+if ($LASTEXITCODE) { throw 'P6 development startup/environment removal regression failed.' }
+$results += [pscustomobject]@{suite='startup_environment_removal';result=($p0Output -join ' ')}
 
-& (Join-Path $PSScriptRoot 'test-p0.ps1') -HostDirectory $HostDirectory -PluginPath $PluginPath -KeepHost:$KeepHost -TamperHostFile GuitarPro.exe | Tee-Object -Variable gateNegativeOutput | Out-Host
+& (Join-Path $PSScriptRoot 'test-p0.ps1') -HostDirectory $HostDirectory -PluginPath $PluginPath -KeepHost:$KeepHost -QtDir $QtDir -RejectHostFile GuitarPro.exe | Tee-Object -Variable gateNegativeOutput | Out-Host
 if ($LASTEXITCODE) { throw 'P6 negative host hash regression failed.' }
 $results += [pscustomobject]@{suite='hash_negative';result=($gateNegativeOutput -join ' ')}
 
@@ -49,7 +49,6 @@ if (-not $SkipRuntime) {
     if (-not $McpRoot) { $McpRoot = Join-Path (Split-Path -Parent $root) 'GuitarProMCP' }
     $runtimeFiles = @(
         (Join-Path $McpRoot '.tools/native/plugins/generic/guitarpro_mcp.dll'),
-        (Join-Path $McpRoot '.tools/native/plugins/imageformats/guitarpro_mcp_autoload.dll'),
         (Join-Path $McpRoot 'native/mcp-client.ps1'),
         (Join-Path $HostDirectory 'GuitarPro.exe')
     )
