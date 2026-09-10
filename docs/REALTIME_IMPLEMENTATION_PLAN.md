@@ -122,6 +122,8 @@ GP 继续负责音频设备、输入输出、采样率和流生命周期。插�
 
 **定位：新需求统一放在 P7；P0–P6 原有计划和 `docs/P5_IMPLEMENTATION.md` 保持不变。**
 
+**当前总状态：未完成。** 原生 VST3 GUI 尚未接入，清单驱动的多实例实时链和锁定 Guitar Pro 的同级 QWidget 插入仍未取得验收证据；启动阶段的全量 VST3 扫描还需要移出阻塞路径。
+
 ### P7.1 目标和固定交互
 
 P7 针对以下四项最终需求实施：
@@ -171,7 +173,7 @@ AMOverloud.dll
 
 ### P7.4 自动扫描和清单模型
 
-**状态：已实现标准目录元数据清单（2026-09-10）**。默认扫描不创建 processor，显式开发路径保留 P1 生命周期探针；证据见 [P7 实现记录](P7_IMPLEMENTATION.md)。
+**状态：已实现标准目录元数据清单（2026-09-10），启动时机待优化。** 默认扫描不创建 processor，显式开发路径保留 P1 生命周期探针；当前 bootstrap 仍会等待扫描完成后再继续，插件数量较多时可能拖慢 Guitar Pro 启动。证据见 [P7 实现记录](P7_IMPLEMENTATION.md)。
 
 - 去掉当前对 `ParametricOD.vst3`、`Gateway.vst3`、`NAM Rig.vst3` 的默认名称限制。
 - 工作线程递归扫描 Windows VST3 标准目录：`%ProgramFiles%/Common Files/VST3`、`%ProgramFiles(x86)%/Common Files/VST3`、`%LOCALAPPDATA%/Programs/Common/VST3`。加载 bundle 的 `GetPluginFactory`，枚举音频效果 class 的 class UID、名称、厂商、类别和模块路径。
@@ -195,7 +197,7 @@ AMOverloud.dll
 
 ### P7.6 原生 VST3 GUI
 
-**状态：宿主受限。** 名称点击入口和未启用提示已实现，锁定 GP 版本的 `IPlugView`/HWND ABI、参数消息和同实例 state 回传未验证。
+**状态：未实现，当前提示为 `host_limited`。** 名称点击入口和未启用提示已实现，但插件 component/controller 实例没有持续持有，锁定 GP 版本的 `IPlugView`/HWND ABI、参数消息和同实例 state 回传尚未完成。
 
 - 名称点击只对已启用项生效，从正在处理音频的同一实例取得 `IEditController` 和 `IPlugView`；不另建只用于显示的实例。
 - 在 Qt 主线程通过 HWND 承载 `IPlugView`，处理 `IPlugFrame` 尺寸回调、DPI、焦点、重复点击聚焦、窗口关闭和 GP 退出释放。
@@ -244,3 +246,15 @@ AMOverloud.dll
 6. **P7-F**：在真实 Guitar Pro 运行完整回归，新增 P7 实现记录，更新发布包和能力状态。
 
 P7 只有在 P7-B 至 P7-F 的真实宿主验收证据齐全后才标记为已实现；同级入口不可用、只能处理总输出、插件 GUI 参数未改变声音或只能依赖右侧 dock 时，分别标记为宿主受限或未实现。
+
+### P7.10 当前后续计划
+
+按“能不做就不做”的顺序推进，先解决会直接影响用户体验和验收结论的部分：
+
+1. **启动扫描解耦**：bootstrap 启动阶段不再等待全量 VST3 清单；先安装已验证 hook、创建入口并返回宿主。首次打开 P7 选区后，在工作线程执行标准目录元数据扫描，Qt 主线程只接收完成信号并刷新列表。
+2. **扫描期间可用**：面板打开时显示“扫描中”，不阻塞 Guitar Pro 主窗口；扫描失败只显示诊断状态，不影响宿主启动和旁路。
+3. **最小缓存**：进程内保留本次扫描结果；再次打开面板直接复用结果，仅当标准目录的目录时间或 bundle 清单变化时重新扫描。暂不增加用户扫描设置页或复杂后台服务。
+4. **原生 GUI 桥接**：为已启用条目持有同一 component/controller/processor 实例，接入 `IEditController::createView("editor")`、`IPlugView::attached(..., kPlatformTypeHWND)`、`IPlugFrame` 和 `IComponentHandler`，先在隔离宿主验证，再接入锁定 Guitar Pro。
+5. **实时链验收**：在 GUI 桥接之后，把复选框状态发布到 P3 双槽链，验证单插件、多插件串联、取消单项和全取消直通；没有真实处理和回归证据时继续标为未实现。
+
+完成以上工作并取得 P7-B 至 P7-F 的真实证据后，才允许把 P7 总状态改为“已完成”。
