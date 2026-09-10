@@ -12,16 +12,31 @@
 #include <cstdint>
 #include <cstring>
 #include <filesystem>
+#include <mutex>
+#include <string>
+#include <vector>
 
 #include "audio_adapter.h"
 #include "effect_chain.h"
+#include "vst3_parameters.h"
+#include "pluginterfaces/vst/ivstmessage.h"
+#include <memory>
 #include "portaudio_capture_abi.h"
 #include "pluginterfaces/base/funknownimpl.h"
 #include "pluginterfaces/base/ipluginbase.h"
 #include "pluginterfaces/vst/ivstaudioprocessor.h"
 #include "pluginterfaces/vst/ivstcomponent.h"
+#include "pluginterfaces/vst/ivsteditcontroller.h"
 #include "pluginterfaces/vst/ivsthostapplication.h"
+#include "pluginterfaces/vst/ivstparameterchanges.h"
 #include "pluginterfaces/vst/ivstpluginterfacesupport.h"
+#include "public.sdk/source/common/memorystream.h"
+#include "pluginterfaces/gui/iplugview.h"
+
+namespace Steinberg {
+DEF_CLASS_IID(IPlugView)
+DEF_CLASS_IID(IPlugFrame)
+}
 
 namespace gpvst3::hook {
 
@@ -83,6 +98,48 @@ using Steinberg::TUID;
 using Steinberg::tresult;
 using Steinberg::Vst::IComponent;
 using Steinberg::Vst::IAudioProcessor;
+using Steinberg::Vst::IComponentHandler;
+using Steinberg::Vst::IEditController;
+using Steinberg::Vst::IParamValueQueue;
+using Steinberg::Vst::IParameterChanges;
+using Steinberg::Vst::ParamID;
+using Steinberg::Vst::ParamValue;
+using Steinberg::ViewRect;
+
+struct RuntimeEffect;
+bool succeeded(tresult result) noexcept;
+
+class RuntimeComponentHandler final
+    : public Steinberg::U::Implements<Steinberg::U::Directly<IComponentHandler>> {
+public:
+    explicit RuntimeComponentHandler(RuntimeEffect *owner) : owner_(owner) {}
+    Steinberg::tresult PLUGIN_API beginEdit(ParamID) override;
+    Steinberg::tresult PLUGIN_API performEdit(ParamID, ParamValue) override;
+    Steinberg::tresult PLUGIN_API endEdit(ParamID) override;
+    Steinberg::tresult PLUGIN_API restartComponent(Steinberg::int32) override;
+
+private:
+    RuntimeEffect *owner_ = nullptr;
+};
+
+class RuntimePlugFrame final
+    : public Steinberg::U::Implements<Steinberg::U::Directly<Steinberg::IPlugFrame>> {
+public:
+    explicit RuntimePlugFrame(HWND hostWindow) : hostWindow_(hostWindow) {}
+    Steinberg::tresult PLUGIN_API resizeView(Steinberg::IPlugView *view,
+                                             ViewRect *newSize) override {
+        if (!newSize || !hostWindow_) return Steinberg::kInvalidArgument;
+        const int width = (std::max)(1, newSize->getWidth());
+        const int height = (std::max)(1, newSize->getHeight());
+        SetWindowPos(hostWindow_, nullptr, 0, 0, width, height,
+                     SWP_NOACTIVATE | SWP_NOMOVE | SWP_NOZORDER);
+        return view && succeeded(view->onSize(newSize)) ? Steinberg::kResultTrue
+                                                        : Steinberg::kResultFalse;
+    }
+
+private:
+    HWND hostWindow_ = nullptr;
+};
 
 bool succeeded(tresult result) noexcept {
     return result == Steinberg::kResultOk || result == Steinberg::kResultTrue;
@@ -125,6 +182,18 @@ fs::path runtimeModulePath() {
     return fs::u8path(std::string(programFiles) + "\\Common Files\\VST3\\ParametricOD.vst3");
 }
 
+std::string uidString(const Steinberg::TUID value) {
+    static constexpr char digits[] = "0123456789ABCDEF";
+    std::string result;
+    result.reserve(32);
+    for (int i = 0; i < 16; ++i) {
+        const auto byte = static_cast<unsigned char>(value[i]);
+        result.push_back(digits[byte >> 4]);
+        result.push_back(digits[byte & 0x0f]);
+    }
+    return result;
+}
+
 fs::path runtimeBinary(const fs::path &path) {
     std::error_code error;
     if (!fs::is_directory(path, error)) return path;
@@ -138,6 +207,19 @@ struct RuntimeEffect {
     IPtr<Steinberg::IPluginFactory> factory;
     IPtr<IComponent> component;
     FUnknownPtr<IAudioProcessor> processor;
+    IPtr<IEditController> controller;
+    bool separateControllerInitialized = false;
+    IPtr<Steinberg::IPlugView> editor;
+    IPtr<IComponentHandler> componentHandler;
+    IPtr<Steinberg::IPlugFrame> plugFrame;
+    vst3::ParameterChanges parameterChanges;
+    Vst3SelectionEntry identity;
+    FUnknownPtr<Steinberg::Vst::IConnectionPoint> componentConnection;
+    FUnknownPtr<Steinberg::Vst::IConnectionPoint> controllerConnection;
+    std::atomic<std::size_t> parameterEdits{0};
+    HWND editorParent = nullptr;
+    std::atomic<bool> editorAttached{false};
+    std::string editorError;
     RuntimeHostApplication host;
     audio::PlanarBuffer scratch;
     std::string name;
@@ -154,6 +236,21 @@ struct RuntimeEffect {
 
     void shutdown() noexcept {
         ready.store(false, std::memory_order_release);
+        closeEditor();
+        if (componentConnection && controllerConnection) {
+            componentConnection->disconnect(controllerConnection);
+            controllerConnection->disconnect(componentConnection);
+        }
+        componentConnection = nullptr;
+        controllerConnection = nullptr;
+        if (controller) controller->setComponentHandler(nullptr);
+        if (controller && separateControllerInitialized) controller->terminate();
+        separateControllerInitialized = false;
+        componentHandler = nullptr;
+        controller = nullptr;
+        plugFrame = nullptr;
+        parameterChanges.clear();
+        editorError.clear();
         outputWritten.store(false, std::memory_order_release);
         ownerObserved.store(false, std::memory_order_release);
         configuredRate.store(0, std::memory_order_release);
@@ -176,13 +273,15 @@ struct RuntimeEffect {
         }
     }
 
-    bool initialize(double sampleRate = 44100.0, std::size_t maxSamplesPerBlock = 16384) noexcept {
+    bool initialize(double sampleRate = 44100.0, std::size_t maxSamplesPerBlock = 16384,
+                    const fs::path &requestedPath = {}, const std::string &requestedClassId = {},
+                    const Vst3SelectionEntry *saved = nullptr) noexcept {
         shutdown();
         forceError = false;
         if (const char *forced = std::getenv("GPVST3_FORCE_P3_ERROR");
             forced && std::strcmp(forced, "1") == 0)
             forceError = true;
-        const auto path = runtimeBinary(runtimeModulePath());
+        const auto path = runtimeBinary(requestedPath.empty() ? runtimeModulePath() : requestedPath);
         std::error_code errorCode;
         if (path.empty() || !fs::is_regular_file(path, errorCode)) {
             error = "runtime_vst3_not_found";
@@ -215,6 +314,7 @@ struct RuntimeEffect {
             Steinberg::PClassInfo info{};
             if (!succeeded(factory->getClassInfo(index, &info))) continue;
             if (std::strcmp(info.category, "Audio Module Class") != 0) continue;
+            if (!requestedClassId.empty() && uidString(info.cid) != requestedClassId) continue;
             selected = info;
             found = true;
             break;
@@ -224,6 +324,7 @@ struct RuntimeEffect {
             return false;
         }
         name = selected.name;
+        identity = saved ? *saved : Vst3SelectionEntry{path.u8string(), uidString(selected.cid)};
         IComponent *rawComponent = nullptr;
         if (!succeeded(factory->createInstance(selected.cid, IComponent::iid,
                                                reinterpret_cast<void **>(&rawComponent))) || !rawComponent) {
@@ -233,6 +334,8 @@ struct RuntimeEffect {
         component = Steinberg::owned(rawComponent);
         auto *hostUnknown = static_cast<Steinberg::FUnknown *>(
             static_cast<Steinberg::Vst::IHostApplication *>(&host));
+        if (auto factory3 = FUnknownPtr<Steinberg::IPluginFactory3>(factory.get()))
+            factory3->setHostContext(hostUnknown);
         if (!succeeded(component->initialize(hostUnknown))) {
             error = "runtime_vst3_component_initialize_failed";
             return false;
@@ -246,9 +349,69 @@ struct RuntimeEffect {
                     component->activateBus(Steinberg::Vst::kAudio, direction, index, true);
             }
         }
+        Steinberg::MemoryStream componentState;
+        const bool componentStateReady = succeeded(component->getState(&componentState));
+        if (componentStateReady) {
+            componentState.seek(0, Steinberg::IBStream::kIBSeekSet, nullptr);
+            component->setState(&componentState);
+        }
         processor = FUnknownPtr<IAudioProcessor>(component.get());
         if (!processor) {
             error = "runtime_vst3_processor_missing";
+            return false;
+        }
+        // Initialize the optional controller before activating the component.
+        // This is the same lifecycle order used by the metadata probe and by
+        // controllers that reject initialization after processing starts.
+        TUID controllerClassId{};
+        if (succeeded(component->getControllerClassId(controllerClassId))) {
+            IEditController *rawController = nullptr;
+            if (succeeded(factory->createInstance(controllerClassId, IEditController::iid,
+                                                  reinterpret_cast<void **>(&rawController))) &&
+                rawController)
+                controller = Steinberg::owned(rawController);
+        }
+        const bool separateController = static_cast<bool>(controller);
+        if (!controller) controller = FUnknownPtr<IEditController>(component.get());
+        if (!controller) {
+            editorError = "runtime_vst3_controller_create_failed";
+        } else {
+            auto handler = Steinberg::owned(new RuntimeComponentHandler(this));
+            // Single-component plug-ins already initialized their controller
+            // through IComponent. Reinitializing returns kResultFalse.
+            const auto controllerInit = separateController ? controller->initialize(hostUnknown)
+                                                           : Steinberg::kResultOk;
+            separateControllerInitialized = separateController && succeeded(controllerInit);
+            if (succeeded(controllerInit)) {
+                if (handler && succeeded(controller->setComponentHandler(handler.get()))) {
+                    componentHandler = std::move(handler);
+                    if (separateController) {
+                        componentConnection = FUnknownPtr<Steinberg::Vst::IConnectionPoint>(component.get());
+                        controllerConnection = FUnknownPtr<Steinberg::Vst::IConnectionPoint>(controller.get());
+                        if (componentConnection && controllerConnection) {
+                            componentConnection->connect(controllerConnection);
+                            controllerConnection->connect(componentConnection);
+                        }
+                    }
+                    if (componentStateReady) {
+                        componentState.seek(0, Steinberg::IBStream::kIBSeekSet, nullptr);
+                        controller->setComponentState(&componentState);
+                    }
+                } else {
+                    editorError = "runtime_vst3_component_handler_failed";
+                }
+            } else {
+                controller = nullptr;
+                editorError = "runtime_vst3_controller_initialize_failed_" +
+                    std::to_string(static_cast<long>(controllerInit));
+            }
+        }
+        if (!parameterChanges.prepare(controller.get())) {
+            error = "runtime_vst3_parameter_setup_failed";
+            return false;
+        }
+        if (saved && !restoreState(*saved)) {
+            error = "runtime_vst3_state_restore_failed";
             return false;
         }
         Steinberg::Vst::ProcessSetup setup{};
@@ -256,8 +419,12 @@ struct RuntimeEffect {
         setup.symbolicSampleSize = Steinberg::Vst::kSample32;
         setup.maxSamplesPerBlock = static_cast<Steinberg::int32>(maxSamplesPerBlock);
         setup.sampleRate = sampleRate;
-        if (!succeeded(processor->setupProcessing(setup)) || !succeeded(component->setActive(true)) ||
-            !succeeded(processor->setProcessing(true)) || !scratch.prepare(2, maxSamplesPerBlock)) {
+        if (!succeeded(processor->setupProcessing(setup))) {
+            error = "runtime_vst3_processing_setup_failed";
+            return false;
+        }
+        if (!succeeded(component->setActive(true)) || !succeeded(processor->setProcessing(true)) ||
+            !scratch.prepare(2, maxSamplesPerBlock)) {
             error = "runtime_vst3_processing_setup_failed";
             return false;
         }
@@ -266,6 +433,102 @@ struct RuntimeEffect {
         configuredBlock.store(maxSamplesPerBlock, std::memory_order_release);
         error.clear();
         return true;
+    }
+
+    bool restoreState(const Vst3SelectionEntry &saved) {
+        if (!saved.componentState.empty()) {
+            Steinberg::MemoryStream stream(const_cast<unsigned char *>(saved.componentState.data()),
+                                           saved.componentState.size());
+            if (!succeeded(component->setState(&stream))) return false;
+            stream.seek(0, Steinberg::IBStream::kIBSeekSet, nullptr);
+            if (controller && !succeeded(controller->setComponentState(&stream))) return false;
+        }
+        if (!saved.controllerState.empty()) {
+            Steinberg::MemoryStream stream(const_cast<unsigned char *>(saved.controllerState.data()),
+                                           saved.controllerState.size());
+            if (!controller || !succeeded(controller->setState(&stream))) return false;
+        }
+        return true;
+    }
+
+    Vst3SelectionEntry captureState() {
+        auto result = identity;
+        Steinberg::MemoryStream stream;
+        if (component && succeeded(component->getState(&stream)) && stream.getSize() > 0)
+            result.componentState.assign(stream.getData(), stream.getData() + stream.getSize());
+        Steinberg::MemoryStream control;
+        if (controller && succeeded(controller->getState(&control))) {
+            result.controllerState.clear();
+            if (control.getSize() > 0)
+                result.controllerState.assign(control.getData(), control.getData() + control.getSize());
+        }
+        identity = result;
+        return result;
+    }
+
+    bool queueParameter(ParamID id, ParamValue value) noexcept {
+        if (!std::isfinite(value) || !parameterChanges.publish(id, value)) return false;
+        parameterEdits.fetch_add(1, std::memory_order_relaxed);
+        return true;
+    }
+
+    bool openEditor(HWND parentWindow) noexcept {
+        if (!ready.load(std::memory_order_acquire) || !controller || !parentWindow) {
+            editorError = editorError.empty() ? "editor_host_unavailable" : editorError;
+            return false;
+        }
+        if (editor && editorAttached.load(std::memory_order_acquire) && editorParent == parentWindow) {
+            editor->onFocus(true);
+            return true;
+        }
+        closeEditor();
+        Steinberg::IPlugView *rawView = controller->createView("editor");
+        if (!rawView) {
+            editorError = "editor_view_unavailable";
+            return false;
+        }
+        editor = Steinberg::owned(rawView);
+        if (!succeeded(editor->isPlatformTypeSupported(Steinberg::kPlatformTypeHWND))) {
+            editor = nullptr;
+            editorError = "editor_hwnd_unsupported";
+            return false;
+        }
+        auto frame = Steinberg::owned(new RuntimePlugFrame(parentWindow));
+        if (!frame || !succeeded(editor->setFrame(frame.get()))) {
+            editor = nullptr;
+            editorError = "editor_frame_failed";
+            return false;
+        }
+        ViewRect rect{};
+        if (!succeeded(editor->getSize(&rect))) {
+            rect = ViewRect(0, 0, 420, 260);
+        }
+        SetWindowPos(parentWindow, nullptr, 0, 0, (std::max)(1, rect.getWidth()),
+                     (std::max)(1, rect.getHeight()), SWP_NOACTIVATE | SWP_NOMOVE | SWP_NOZORDER);
+        if (!succeeded(editor->attached(reinterpret_cast<void *>(parentWindow),
+                                        Steinberg::kPlatformTypeHWND))) {
+            editor->setFrame(nullptr);
+            editor = nullptr;
+            editorError = "editor_attach_failed";
+            return false;
+        }
+        plugFrame = std::move(frame);
+        editorParent = parentWindow;
+        editor->onSize(&rect);
+        editorAttached.store(true, std::memory_order_release);
+        editorError.clear();
+        return true;
+    }
+
+    void closeEditor() noexcept {
+        editorParent = nullptr;
+        if (editor) {
+            if (editorAttached.exchange(false, std::memory_order_acq_rel))
+                editor->removed();
+            editor->setFrame(nullptr);
+            editor = nullptr;
+        }
+        plugFrame = nullptr;
     }
 
     bool reconfigure(double sampleRate, std::size_t maxSamplesPerBlock) noexcept {
@@ -304,7 +567,9 @@ struct RuntimeEffect {
             if (!input) return false;
         }
         if (processing.test_and_set(std::memory_order_acquire)) return false;
-        const auto result = audio::process(*processor, block, scratch, false);
+        parameterChanges.drain();
+        const auto result = audio::process(*processor, block, scratch, false, &parameterChanges);
+        parameterChanges.clear();
         processing.clear(std::memory_order_release);
         if (result.outputWritten) outputWritten.store(true, std::memory_order_release);
         if (result.ownerPointerObserved) ownerObserved.store(true, std::memory_order_release);
@@ -313,6 +578,101 @@ struct RuntimeEffect {
 
     static bool processCallback(void *context, const audio::BlockView &block) noexcept {
         return static_cast<RuntimeEffect *>(context)->processBlock(block);
+    }
+};
+
+Steinberg::tresult PLUGIN_API RuntimeComponentHandler::beginEdit(ParamID) {
+    return Steinberg::kResultTrue;
+}
+
+Steinberg::tresult PLUGIN_API RuntimeComponentHandler::performEdit(ParamID id,
+                                                                    ParamValue value) {
+    if (!owner_) return Steinberg::kResultFalse;
+    return owner_->queueParameter(id, value) ? Steinberg::kResultTrue : Steinberg::kResultFalse;
+}
+
+Steinberg::tresult PLUGIN_API RuntimeComponentHandler::endEdit(ParamID) {
+    return Steinberg::kResultTrue;
+}
+
+Steinberg::tresult PLUGIN_API RuntimeComponentHandler::restartComponent(Steinberg::int32 flags) {
+    if (!owner_ || !owner_->controller) return Steinberg::kResultFalse;
+    if (flags & Steinberg::Vst::kParamValuesChanged) {
+        for (int i = 0; i < owner_->controller->getParameterCount(); ++i) {
+            Steinberg::Vst::ParameterInfo info{};
+            if (succeeded(owner_->controller->getParameterInfo(i, info)))
+                owner_->queueParameter(info.id, owner_->controller->getParamNormalized(info.id));
+        }
+        return Steinberg::kResultOk;
+    }
+    return Steinberg::kNotImplemented;
+}
+
+// A selected P7 list is prepared as one immutable callback context. Each
+// processor writes into the next preallocated planar buffer; the final one
+// writes to the host buffer. Rebuilding happens off the audio callback.
+struct SelectionSlot {
+    static constexpr std::size_t kMaxEffects = 8;
+    std::shared_ptr<RuntimeEffect> effects[kMaxEffects];
+    audio::PlanarBuffer pipeline[2];
+    std::size_t count = 0;
+
+    void shutdown() noexcept {
+        for (auto &effect : effects) effect.reset();
+        count = 0;
+    }
+
+    bool prepare(const std::vector<Vst3SelectionEntry> &entries, double rate,
+                 std::size_t maxBlock, const SelectionSlot *previous) {
+        shutdown();
+        if (entries.empty()) return true;
+        if (entries.size() > kMaxEffects || !pipeline[0].prepare(2, maxBlock) ||
+            !pipeline[1].prepare(2, maxBlock)) return false;
+        for (std::size_t index = 0; index < entries.size(); ++index) {
+            if (previous) for (std::size_t old = 0; old < previous->count; ++old) {
+                const auto &effect = previous->effects[old];
+                if (effect->identity.module == entries[index].module &&
+                    effect->identity.classId == entries[index].classId)
+                    effects[index] = effect;
+            }
+            if (!effects[index]) {
+                effects[index] = std::make_shared<RuntimeEffect>();
+                if (!effects[index]->initialize(rate, maxBlock, fs::u8path(entries[index].module),
+                                                entries[index].classId, &entries[index])) {
+                    shutdown();
+                    return false;
+                }
+            }
+        }
+        count = entries.size();
+        return true;
+    }
+
+    bool processBlock(const audio::BlockView &block) noexcept {
+        if (count == 0 || block.channelCount == 0 || block.channelCount > 2 ||
+            block.frameCount == 0 || block.frameCount > pipeline[0].frameCapacity()) return false;
+        const float *const *source = block.generatedChannels ? block.generatedChannels
+            : (block.inputChannels ? block.inputChannels : block.channels);
+        if (!source) return false;
+        for (std::size_t index = 0; index < count; ++index) {
+            const bool last = index + 1 == count;
+            float **destination = last ? (block.outputChannels ? block.outputChannels : block.channels)
+                                       : pipeline[index & 1].outputChannels();
+            if (!destination) return false;
+            const audio::BlockView view{source, nullptr, destination, nullptr,
+                                        block.channelCount, block.frameCount,
+                                        block.sampleRate, block.blockSize, block.owner,
+                                        block.sequence, block.outputWritable};
+            if (effects[index]->configuredRate.load(std::memory_order_acquire) != static_cast<int>(block.sampleRate))
+                return false;
+            if (!effects[index]->processBlock(view)) return false;
+            if (!last) source = pipeline[index & 1].outputChannels();
+        }
+        return true;
+    }
+
+    static bool processCallback(void *context, const audio::BlockView &block) noexcept {
+        return static_cast<SelectionSlot *>(context)->processBlock(block);
     }
 };
 
@@ -367,6 +727,11 @@ struct Runtime {
     std::atomic<unsigned long> masterThread{0};
     std::atomic<unsigned long> dspThread{0};
     RuntimeEffect effects[2];
+    SelectionSlot selectionSlots[2];
+    std::mutex selectionMutex;
+    std::vector<Vst3SelectionEntry> requestedSelection;
+    std::atomic<bool> selectionMode{false};
+    std::atomic<bool> selectionPublished{false};
     effects::Chain chain;
     std::atomic<std::size_t> effectCalls{0};
     std::atomic<bool> effectProcessed{false};
@@ -474,9 +839,13 @@ void masterProcessHook(void *self, void *buffer, void *ticks, void *musicians,
                                      rate > 0 ? rate : 44100.0, frames, buffer, sequence, true};
         const auto effectBefore = bufferHash(buffer);
         const auto active = g_runtime.chain.snapshot().activeSlot;
-        const bool configurationMatches = active < 0 ||
-            (g_runtime.effects[active].configuredRate.load(std::memory_order_acquire) == rate &&
-             frames <= g_runtime.effects[active].configuredBlock.load(std::memory_order_acquire));
+        const bool selected = g_runtime.selectionPublished.load(std::memory_order_acquire);
+        const auto configuredRate = active < 0 || selected ? 0 :
+            g_runtime.effects[active].configuredRate.load(std::memory_order_acquire);
+        const auto configuredBlock = active < 0 || selected ? std::size_t{0} :
+            g_runtime.effects[active].configuredBlock.load(std::memory_order_acquire);
+        const bool configurationMatches = selected || active < 0 ||
+            (configuredRate == rate && frames <= configuredBlock);
         effects::Chain::ProcessResult chainResult;
         if (configurationMatches)
             chainResult = g_runtime.chain.process(block);
@@ -718,6 +1087,8 @@ EntryPointObservation observe(HMODULE module, const char *symbol) noexcept {
 
 } // namespace
 
+bool configureSelectedChain(const std::vector<Vst3SelectionEntry> &selection) noexcept;
+
 State prepare(const host::Verification &verification) noexcept {
     State result;
     result.hostSupported = verification.supported;
@@ -800,6 +1171,11 @@ State prepare(const host::Verification &verification) noexcept {
             g_runtime.effects[0].shutdown();
             g_runtime.effects[1].shutdown();
         }
+        {
+            std::lock_guard<std::mutex> lock(g_runtime.selectionMutex);
+            if (result.installed && !g_runtime.requestedSelection.empty())
+                (void)configureSelectedChain(g_runtime.requestedSelection);
+        }
         if (result.installed && inputFeatureEnabled()) configureInputRouter();
         else {
             g_runtime.inputRouter.setEnabled(false);
@@ -873,21 +1249,43 @@ State snapshot() noexcept {
     result.crossThreadObserved = result.masterProcess.threadId != 0 &&
         result.effectsChainProcessDsp.threadId != 0 &&
         result.masterProcess.threadId != result.effectsChainProcessDsp.threadId;
+    const bool selectionPublished = g_runtime.selectionPublished.load(std::memory_order_acquire);
     result.runtimeProcessorReady = chain.activeSlot >= 0 && chain.activeSlot < 2 &&
-        g_runtime.effects[chain.activeSlot].ready.load(std::memory_order_acquire);
+        (g_runtime.selectionMode.load(std::memory_order_acquire)
+             ? g_runtime.selectionSlots[chain.activeSlot].count > 0 &&
+                   g_runtime.selectionSlots[chain.activeSlot].effects[0]->ready.load(std::memory_order_acquire)
+             : (!selectionPublished && g_runtime.effects[chain.activeSlot].ready.load(std::memory_order_acquire)));
     result.runtimeProcessCount = g_runtime.effectCalls.load(std::memory_order_relaxed);
     result.runtimeConfigurationMismatchBlocks =
         g_runtime.configurationMismatchBlocks.load(std::memory_order_relaxed);
+    const auto activeRate = chain.activeSlot >= 0 && chain.activeSlot < 2
+        ? (g_runtime.selectionMode.load(std::memory_order_acquire)
+               ? g_runtime.selectionSlots[chain.activeSlot].effects[0]->configuredRate.load(std::memory_order_acquire)
+               : g_runtime.effects[chain.activeSlot].configuredRate.load(std::memory_order_acquire))
+        : 0;
+    const auto activeBlock = chain.activeSlot >= 0 && chain.activeSlot < 2
+        ? (g_runtime.selectionMode.load(std::memory_order_acquire)
+               ? g_runtime.selectionSlots[chain.activeSlot].effects[0]->configuredBlock.load(std::memory_order_acquire)
+               : g_runtime.effects[chain.activeSlot].configuredBlock.load(std::memory_order_acquire))
+        : std::size_t{0};
     result.runtimeConfigurationMatches = chain.activeSlot >= 0 && chain.activeSlot < 2 &&
-        g_runtime.effects[chain.activeSlot].configuredRate.load(std::memory_order_acquire) ==
-            g_runtime.rate.load(std::memory_order_relaxed) &&
-        g_runtime.frames.load(std::memory_order_relaxed) <=
-            g_runtime.effects[chain.activeSlot].configuredBlock.load(std::memory_order_acquire);
+        activeRate == g_runtime.rate.load(std::memory_order_relaxed) &&
+        g_runtime.frames.load(std::memory_order_relaxed) <= activeBlock;
     result.runtimeProcessObserved = g_runtime.effectProcessed.load(std::memory_order_relaxed);
     result.runtimeBufferWriteObserved = g_runtime.effectWriteObserved.load(std::memory_order_relaxed);
     const auto active = chain.activeSlot >= 0 && chain.activeSlot < 2 ? chain.activeSlot : 0;
-    result.runtimeEffectName = g_runtime.effects[active].name;
-    result.runtimeEffectError = g_runtime.effects[active].error;
+    if (g_runtime.selectionMode.load(std::memory_order_acquire)) {
+        result.runtimeEffectName = g_runtime.selectionSlots[active].effects[0]->name;
+        result.runtimeEffectError = !g_runtime.selectionSlots[active].effects[0]->editorError.empty()
+            ? g_runtime.selectionSlots[active].effects[0]->editorError
+            : g_runtime.selectionSlots[active].effects[0]->error;
+    } else if (!selectionPublished) {
+        result.runtimeEffectName = g_runtime.effects[active].name;
+        result.runtimeEffectError = g_runtime.effects[active].error;
+    } else {
+        result.runtimeEffectName.clear();
+        result.runtimeEffectError.clear();
+    }
     result.totalBypass = chain.bypassed;
     result.chainFaulted = chain.faulted;
     result.chainActiveSlot = chain.activeSlot;
@@ -902,8 +1300,13 @@ State snapshot() noexcept {
     result.totalProcessNanoseconds = chain.totalProcessNanoseconds;
     result.chainSwitchCount = chain.switchCount;
     result.runtimeEffectInstances = 0;
-    for (const auto &effect : g_runtime.effects)
-        if (effect.ready.load(std::memory_order_acquire)) ++result.runtimeEffectInstances;
+    if (g_runtime.selectionMode.load(std::memory_order_acquire)) {
+        if (chain.activeSlot >= 0 && chain.activeSlot < 2)
+            result.runtimeEffectInstances = g_runtime.selectionSlots[chain.activeSlot].count;
+    } else if (!selectionPublished) {
+        for (const auto &effect : g_runtime.effects)
+            if (effect.ready.load(std::memory_order_acquire)) ++result.runtimeEffectInstances;
+    }
     result.reconfigurationPassed = g_runtime.reconfigurationPassed.load(std::memory_order_acquire);
     result.reconfigurationFailed = g_runtime.reconfigurationFailed.load(std::memory_order_acquire);
     result.reconfigurationValidated = g_runtime.reconfigurationValidated.load(std::memory_order_acquire);
@@ -969,6 +1372,37 @@ State snapshot() noexcept {
     return result;
 }
 
+bool configureSelectedChain(const std::vector<Vst3SelectionEntry> &selection) noexcept {
+    if (!g_runtime.master.installed || selection.size() > SelectionSlot::kMaxEffects) return false;
+    const auto rate = callbackSampleRate();
+    const auto old = g_runtime.chain.snapshot().activeSlot;
+    const auto target = old == 0 ? 1U : 0U;
+    if (!g_runtime.chain.prepareSlot(target,
+            {&g_runtime.selectionSlots[target], &SelectionSlot::processCallback})) return false;
+    const auto *previous = g_runtime.selectionMode.load(std::memory_order_acquire) && old >= 0
+        ? &g_runtime.selectionSlots[old] : nullptr;
+    try {
+        if (!g_runtime.selectionSlots[target].prepare(selection, rate, 16384, previous)) return false;
+    } catch (...) {
+        g_runtime.selectionSlots[target].shutdown();
+        return false;
+    }
+    // Prepare before the handoff. Existing instances retain their GUI,
+    // parameters and DSP history. Release removed instances after draining.
+    g_runtime.chain.deactivate();
+    g_runtime.selectionMode.store(!selection.empty(), std::memory_order_release);
+    g_runtime.selectionPublished.store(true, std::memory_order_release);
+    if (!selection.empty()) {
+        g_runtime.chain.clearFault();
+        g_runtime.chain.activate(target);
+    }
+    g_runtime.chain.setBypassed(selection.empty());
+    if (old >= 0) g_runtime.selectionSlots[old].shutdown();
+    g_runtime.effects[0].shutdown();
+    g_runtime.effects[1].shutdown();
+    return true;
+}
+
 void reconfigureInputRouterIfNeeded() noexcept {
     if (!g_runtime.inputRouter.snapshot().enabled) return;
     const auto observedRate = g_runtime.inputObservedRate.load(std::memory_order_acquire);
@@ -1014,6 +1448,10 @@ void shutdown() noexcept {
     remove(g_runtime.master);
     g_runtime.effects[0].shutdown();
     g_runtime.effects[1].shutdown();
+    g_runtime.selectionSlots[0].shutdown();
+    g_runtime.selectionSlots[1].shutdown();
+    g_runtime.selectionMode.store(false, std::memory_order_release);
+    g_runtime.selectionPublished.store(false, std::memory_order_release);
 }
 
 std::uint64_t outputHash(const void *output, unsigned long frames) noexcept {
@@ -1101,6 +1539,49 @@ int streamCallbackHook(const void *input, void *output, unsigned long frames,
 void setTotalBypass(bool bypassed) noexcept {
     g_runtime.chain.setBypassed(bypassed);
     g_runtime.inputRouter.setBypassed(bypassed);
+}
+
+bool setVst3Selection(const std::vector<Vst3SelectionEntry> &selection) noexcept {
+    std::lock_guard<std::mutex> lock(g_runtime.selectionMutex);
+    if (!g_runtime.master.installed || !configureSelectedChain(selection)) return false;
+    g_runtime.requestedSelection = selection;
+    return true;
+}
+
+std::vector<Vst3SelectionEntry> captureVst3States() {
+    std::lock_guard<std::mutex> lock(g_runtime.selectionMutex);
+    std::vector<Vst3SelectionEntry> result;
+    const auto active = g_runtime.chain.snapshot().activeSlot;
+    if (active < 0 || !g_runtime.selectionMode.load(std::memory_order_acquire)) return result;
+    g_runtime.chain.deactivate();
+    auto &slot = g_runtime.selectionSlots[active];
+    for (std::size_t i = 0; i < slot.count; ++i) result.push_back(slot.effects[i]->captureState());
+    g_runtime.chain.activate(active);
+    return result;
+}
+
+bool openVst3Editor(const Vst3SelectionEntry &entry, void *parentWindow) noexcept {
+    std::lock_guard<std::mutex> lock(g_runtime.selectionMutex);
+    if (!parentWindow || !g_runtime.selectionMode.load(std::memory_order_acquire)) return false;
+    const int active = g_runtime.chain.snapshot().activeSlot;
+    if (active < 0 || active >= 2) return false;
+    auto &slot = g_runtime.selectionSlots[active];
+    for (std::size_t index = 0; index < slot.count; ++index) {
+        if (slot.effects[index]->name.empty()) continue;
+        // The immutable selection is held beside each slot; matching the
+        // module/class pair is performed against the requested list because
+        // RuntimeEffect deliberately stores only the loaded display name.
+        if (slot.effects[index]->identity.module == entry.module &&
+            slot.effects[index]->identity.classId == entry.classId)
+            return slot.effects[index]->openEditor(static_cast<HWND>(parentWindow));
+    }
+    return false;
+}
+
+void closeVst3Editors() noexcept {
+    std::lock_guard<std::mutex> lock(g_runtime.selectionMutex);
+    for (auto &slot : g_runtime.selectionSlots)
+        for (std::size_t index = 0; index < slot.count; ++index) slot.effects[index]->closeEditor();
 }
 
 bool processExternalInput(const input::CaptureView &capture,

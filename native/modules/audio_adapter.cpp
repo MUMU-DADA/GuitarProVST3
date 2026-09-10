@@ -118,7 +118,8 @@ bool bypass(const BlockView &block) noexcept {
 }
 
 ProcessResult process(Steinberg::Vst::IAudioProcessor &processor,
-                      const BlockView &block, PlanarBuffer &scratch, bool bypassed) noexcept {
+                      const BlockView &block, PlanarBuffer &scratch, bool bypassed,
+                      Steinberg::Vst::IParameterChanges *parameterChanges) noexcept {
     ProcessResult result;
     result.frames = block.frameCount;
     result.channels = block.channelCount;
@@ -166,6 +167,11 @@ ProcessResult process(Steinberg::Vst::IAudioProcessor &processor,
     data.numOutputs = block.channelCount == 0 ? 0 : 1;
     data.inputs = data.numInputs ? &inputBus : nullptr;
     data.outputs = data.numOutputs ? &outputBus : nullptr;
+    data.inputParameterChanges = parameterChanges;
+    data.outputParameterChanges = nullptr;
+    data.inputEvents = nullptr;
+    data.outputEvents = nullptr;
+    data.processContext = nullptr;
     const auto processResult = processor.process(data);
     if (processResult != Steinberg::kResultOk && processResult != Steinberg::kResultTrue) {
         result.error = "processor_process_failed";

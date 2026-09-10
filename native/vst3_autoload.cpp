@@ -35,9 +35,19 @@ public:
         qApp->setProperty("gpvst3P0Scheduled", true);
         auto *application = qApp;
         QTimer::singleShot(0, application, [application] {
-            const auto status = gpvst3::bootstrap::initialize();
+            auto status = gpvst3::bootstrap::initialize();
             gpvst3::state::writeStatus(status);
             gpvst3::ui::showEffectChainPanel();
+            gpvst3::ui::syncVst3Selection();
+            auto *scanTimer = new QTimer(application);
+            scanTimer->setInterval(100);
+            QObject::connect(scanTimer, &QTimer::timeout, scanTimer,
+                             [scanTimer, status]() mutable {
+                                 if (!gpvst3::bootstrap::pollVst3(status)) return;
+                                 scanTimer->stop();
+                                 scanTimer->deleteLater();
+                             });
+            scanTimer->start();
             const auto hook = status.value("gp_hook").toObject();
             if (!hook.value("enabled").toBool()) return;
             writeObservation();

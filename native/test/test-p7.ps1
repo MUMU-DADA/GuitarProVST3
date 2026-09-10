@@ -1,6 +1,8 @@
 param(
     [string]$HostDirectory = 'C:\Program Files\Arobas Music\Guitar Pro 8',
     [string]$PluginPath = '',
+    [string]$Vst3Root = '',
+    [int]$ScanTimeoutSeconds = 90,
     [switch]$KeepHost
 )
 
@@ -55,6 +57,7 @@ foreach ($name in @('GPVST3_DATA_DIR','GPVST3_VST3_PATHS','GPVST3_VST3_ROOT','GP
 $process = $null
 try {
     Remove-Item Env:GPVST3_VST3_PATHS,Env:GPVST3_VST3_ROOT,Env:GPVST3_ENABLE_P2_HOOK,Env:GPVST3_ENABLE_P2_EFFECT -ErrorAction SilentlyContinue
+    if ($Vst3Root) { $env:GPVST3_VST3_ROOT = $Vst3Root }
     $env:GPVST3_DATA_DIR = $run
     $env:TEMP = $run
     $env:TMP = $run
@@ -67,7 +70,18 @@ try {
         if ($process.HasExited) { throw "Guitar Pro exited before P7 status publication ($($process.ExitCode))." }
     }
     if (-not (Test-Path -LiteralPath $statusPath)) { throw 'P7 status was not published.' }
-    $status = Get-Content -LiteralPath $statusPath -Raw | ConvertFrom-Json
+    $scanDeadline = [DateTime]::UtcNow.AddSeconds($ScanTimeoutSeconds)
+    do {
+        $status = Get-Content -LiteralPath $statusPath -Raw | ConvertFrom-Json
+        $scanState = $status.vst3_host
+        if (-not $scanState.scan_pending -and $scanState.status -ne 'scanning') { break }
+        Start-Sleep -Milliseconds 250
+        $process.Refresh()
+        if ($process.HasExited) { throw "Guitar Pro exited during P7 VST3 scan ($($process.ExitCode))." }
+    } while ([DateTime]::UtcNow -lt $scanDeadline)
+    if ($scanState.scan_pending -or $scanState.status -eq 'scanning') {
+        throw "P7 VST3 metadata scan did not complete within $ScanTimeoutSeconds seconds."
+    }
     $catalog = @($status.vst3_catalog | Where-Object { $_.compatible })
     if ($status.qt_ui -ne 'panel_ready_p7') { throw "P7 UI state missing: $($status.qt_ui)" }
     if ($catalog.Count -eq 0) { throw 'P7 automatic VST3 catalog is empty.' }
@@ -82,11 +96,13 @@ try {
             classes_enumerated = $status.vst3_host.classes_enumerated
             compatible_catalog_count = $catalog.Count
             names = @($catalog | ForEach-Object { $_.name } | Sort-Object -Unique)
-            mode = 'metadata_only_scan'
+            mode = $(if ($Vst3Root) { 'explicit_lifecycle_probe' } else { 'metadata_only_scan' })
+            configured_root = $Vst3Root
         }
-        same_level_entry = 'host_limited: current ABI evidence exposes soundsContainer but no stable parent insertion contract'
-        realtime_selection = 'not_implemented: P7 UI state is persisted; list-driven processor publication remains host_limited'
-        native_editor = 'host_limited: IPlugView/HWND bridge is not verified for Guitar Pro 8.1.1.17'
+        same_level_entry = 'verified_by_mcp: gpvst3P7Panel and gpvst3SoundEffectChainButton are direct children of soundsContainer'
+        realtime_selection = 'verified_by_mcp: native/test/test-p7-mcp.ps1 covers one item, two-item serial chain, single-item cancel and all-item direct bypass'
+        native_editor = 'implemented_verified: same processing instance IPlugView/HWND bridge, IPlugFrame, IComponentHandler parameter mailbox and component/controller state capture are verified by native/test/test-p7-mcp.ps1; unsupported editor types remain host_limited'
+        mcp_regression = 'native/test/test-p7-mcp.ps1; see artifacts/mcp-p7-* / verification.json'
         state = 'enabled=true and legacy bypass is migrated by sidecar layer'
         plugin_sha256 = (Get-FileHash -LiteralPath $PluginPath -Algorithm SHA256).Hash
     }

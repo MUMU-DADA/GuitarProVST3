@@ -53,6 +53,7 @@ struct State {
     std::string status = "pending_p1";
     bool ready = false;
     bool workerThread = false;
+    bool scanPending = false;
     int modulesDiscovered = 0;
     int modulesLoaded = 0;
     int classesEnumerated = 0;
@@ -67,6 +68,12 @@ struct State {
 // hostSupported gates all module loading. An unverified Guitar Pro build must
 // remain bypassed and must not load third-party code.
 State prepare(bool hostSupported = true) noexcept;
+
+// Start metadata discovery without blocking the host's Qt startup callback.
+// The returned state is a small pending snapshot. poll() transfers the
+// completed worker result once it is ready and never waits for the scan.
+State beginAsync(bool hostSupported = true) noexcept;
+bool poll(State &completed) noexcept;
 
 std::vector<CatalogEntry> effectCatalog(const State &state);
 

@@ -120,141 +120,42 @@ GP 继续负责音频设备、输入输出、采样率和流生命周期。插�
 
 ## P7：VST3 同级选区、自动清单和原生 GUI（最终计划）
 
-**定位：新需求统一放在 P7；P0–P6 原有计划和 `docs/P5_IMPLEMENTATION.md` 保持不变。**
+**当前总状态：已完成锁定 Guitar Pro 8.1.1.17 中可复现的 P7 能力；轨道级作用域和部分第三方插件扫描继续标记为宿主受限。** 详细实现和证据见 [P7 实现记录](P7_IMPLEMENTATION.md)。
 
-**当前总状态：未完成。** 原生 VST3 GUI 尚未接入，清单驱动的多实例实时链和锁定 Guitar Pro 的同级 QWidget 插入仍未取得验收证据；启动阶段的全量 VST3 扫描还需要移出阻塞路径。
+### P7.1 交互和同级入口
 
-### P7.1 目标和固定交互
+- `gpvst3P7Panel` 与 `gpvst3SoundEffectChainButton` 在 MCP 真实宿主中确认是 `soundsContainer` 的直接子级，并沿用该区域的布局和重建生命周期。
+- 面板只显示自动发现的兼容 VST3 audio effect。复选框负责启停，插件名称负责打开原生 GUI；稳定 objectName 为 `gpvst3Enabled_<classId>`、`gpvst3Editor_<classId>` 和 `gpvst3NativeEditorHost`。
+- 面板重建会重新挂接入口，关闭面板后再次打开会重新创建对象；没有使用独立 dock 作为 P7 入口。
 
-P7 针对以下四项最终需求实施：
+### P7.2 自动清单
 
-1. VST3 接入界面放在 Guitar Pro 现有效果器链选择区域的同级位置，使用该区域的父容器、布局和可见性生命周期。
-2. 选区自动查询本机已经安装的 VST3 效果器并列出，不要求用户手动选择 `.vst3` 文件、填写路径或配置插件参数。
-3. 每个插件只有两种用户状态：选中表示启用，未选中表示停用。取消某一项只停用该项，其他已选插件继续处理。
-4. 点击任意已启用插件的名称，打开或聚焦该插件自己的图形界面；插件参数全部在其原生 GUI 内设置，项目不再制作额外的插件设置面板。
+**状态：已实现并验证。** 工作线程递归扫描 `%ProgramFiles%/Common Files/VST3`、`%ProgramFiles(x86)%/Common Files/VST3` 和 `%LOCALAPPDATA%/Programs/Common/VST3`，按规范化 bundle 路径和 class UID 去重，过滤 instrument class。标准目录扫描使用 `rundll32` 隔离调用 `Gpvst3Scan`，每个 bundle 10 秒限时；显式 `GPVST3_VST3_PATHS`/`GPVST3_VST3_ROOT` 才进行生命周期探针。最近一次扫描发现 20 个 bundle、16 个 factory、38 个 class 和 11 个兼容效果器，4 个 bundle 超时被记录且不阻塞其余清单；清单数量随插件扫描超时而变化。
 
-复选框负责启停，名称点击负责打开 GUI，两个点击区域分开。P7 不提供添加、删除、搜索、上移、下移、手动路径、参数表、额外旁路、保存按钮或独立 dock 菜单。多项同时启用时按清单稳定顺序串联。
+### P7.3 二态启用和实时链
 
-### P7.2 真实宿主和构建前提
+**状态：已实现并通过 MCP 回归。** `checked = enabled`，旧 `bypass` 迁移为 `enabled = !bypass`。启用项在控制线程准备 component/controller/processor 和预分配 planar 缓冲，通过双槽链原子发布；两个实例按清单顺序串联，取消单项会复用其余实例，全部取消后直通。音频线程不扫描磁盘、不创建 Qt 对象、不动态分配、不持有 UI 锁。
 
-本机已安装的 Guitar Pro 本体目录为：
+### P7.4 原生 VST3 GUI
 
-```text
-C:\Program Files\Arobas Music\Guitar Pro 8
+**状态：已实现并验证 ParametricOD/Gateway。** 处理链持有的同一实例创建 `IPlugView`，通过普通 Qt child widget 的 native HWND 调用 `attached(..., kPlatformTypeHWND)`，并提供 `IPlugFrame`、component/controller `IConnectionPoint`、`IComponentHandler` 和每参数预分配 mailbox。MCP 证据确认 editor host 的父级为 `gpvst3P7Panel`，状态显示“原生 GUI 已打开：ParametricOD”，处理期间 `runtime_effect_error` 为空。无 editor 或不支持 HWND 的插件会安全失败并保持旁路。
+
+### P7.5 状态保存
+
+**状态：已实现并验证。** sidecar 保存 module/class UID、`enabled`、component state 和 controller state；取消选择、关闭 GUI、面板析构和宿主退出都会捕获 state。最近一次 MCP sidecar 保存 Gateway 151 字节、ParametricOD 52 字节 state。
+
+### P7.6 作用域和宿主边界
+
+当前 hook 的可证实位置是 master 后处理点，不能宣称已取得 Guitar Pro 轨道级或音源级作用域。真实声学听感、设备切换、外部输入监听和每个第三方插件的 editor 兼容性仍按 P2/P4 宿主受限处理。
+
+### P7.7 验收命令和交付
+
+```powershell
+./native/build.ps1 -QtDir C:/Users/mumu/source/GuitarProMCP/.tools/qt/5.15.2/msvc2019_64 -OutputRoot .tools/native
+./native/test/test-p7-ui.ps1 -QtDir C:/Users/mumu/source/GuitarProMCP/.tools/qt/5.15.2/msvc2019_64
+./native/test/test-p2-runtime.ps1 -PluginPath .tools/native/plugins/imageformats/guitarpro_vst3_autoload.dll
+./native/test/test-p7-mcp.ps1 -PluginPath .tools/native/plugins/imageformats/guitarpro_vst3_autoload.dll
+./native/test/test-p7.ps1 -PluginPath .tools/native/plugins/imageformats/guitarpro_vst3_autoload.dll -ScanTimeoutSeconds 90
 ```
 
-P7 直接以该目录中的以下文件作为锁定宿主检查对象，不修改原文件：
-
-```text
-GuitarPro.exe
-GPCore.dll
-GPRSE.dll
-AMAudio.dll
-AMOverloud.dll
-```
-
-执行顺序如下：
-
-- 先对本体目录和当前已验证文件做只读清单、版本信息、SHA-256 和 PE 架构记录；需要 hook 或运行测试时复制到隔离目录，不在安装目录内写入测试文件。
-- 使用本机已安装的 C++ Build Tools/MSVC x64 工具链编译和链接；构建脚本应从 Visual Studio Developer 环境或 `vswhere` 找到 `cl.exe`、`link.exe` 和 Windows SDK，不把编译器路径写死进仓库。
-- 继续使用现有 `native/build.ps1`、Qt 5.15.x MSVC x64 配置和宿主哈希门控。构建成功只证明代码可编译，不证明 P7 交互或声音链路完成。
-- 在真实 Guitar Pro 进程中观察现有效果器选区的 QWidget 类名、objectName、父布局、显隐通知、曲谱/轨道上下文和窗口重建；只记录可复现证据，不猜测私有对象布局。
-
-### P7.3 同级入口和作用域接入
-
-**状态：入口已补齐；同级布局仍宿主受限。** 入口不再启动时自动弹出，按钮会持续补回右侧“音源”区域；当前锁定版本尚未取得可重复的同级父布局插入契约。实现边界见 [P7 实现记录](P7_IMPLEMENTATION.md)。
-
-- 找到现有效果器链选择区域的稳定父 QWidget 或稳定插入通知后，在同一父容器中增加紧凑的 VST3 选区，并复用 GP 的尺寸、字体、间距和折叠行为。
-- 处理重复加载、窗口缩放、区域重建、曲谱切换和插件卸载，确保不会出现重复入口或悬空 QWidget。
-- 确认该选区对应的实际处理作用域是当前轨道、总线或总输出，并让 UI 选择和音频 hook 使用同一上下文。不得显示轨道级选区却把声音未经确认地送到总输出，也不要求用户手填 Track/Bus。
-- 同级位置是 P7 的硬性验收条件。若锁定版本没有稳定插入点，只记录为“宿主受限”并暂停该能力；右侧 dock 或独立窗口不算完成。
-
-预计修改：`native/modules/qt_ui.cpp/.h`、`native/modules/bootstrap.cpp`，必要时扩展 `native/modules/gp_hook.cpp/.h` 的上下文通知。
-
-### P7.4 自动扫描和清单模型
-
-**状态：已实现标准目录元数据清单（2026-09-10），启动时机待优化。** 默认扫描不创建 processor，显式开发路径保留 P1 生命周期探针；当前 bootstrap 仍会等待扫描完成后再继续，插件数量较多时可能拖慢 Guitar Pro 启动。证据见 [P7 实现记录](P7_IMPLEMENTATION.md)。
-
-- 去掉当前对 `ParametricOD.vst3`、`Gateway.vst3`、`NAM Rig.vst3` 的默认名称限制。
-- 工作线程递归扫描 Windows VST3 标准目录：`%ProgramFiles%/Common Files/VST3`、`%ProgramFiles(x86)%/Common Files/VST3`、`%LOCALAPPDATA%/Programs/Common/VST3`。加载 bundle 的 `GetPluginFactory`，枚举音频效果 class 的 class UID、名称、厂商、类别和模块路径。
-- 按规范化模块路径 + class UID 去重；按 PE 架构和音频总线能力过滤当前 x64 宿主无法加载或无法作为效果器处理的 class。纯乐器或不兼容插件不显示为可启用效果器，并在诊断状态中记录原因。
-- 宿主 UI 就绪或选区首次打开时自动扫描，目录变化在再次打开时自动检查。扫描不发生在实时线程，不为仅列清单的插件创建 processor。
-- 列表只显示插件名称，重名时附厂商。新发现的插件默认未选中，不自动启用；标准目录以外的插件不作全盘发现承诺。`GPVST3_VST3_PATHS` 和 `GPVST3_VST3_ROOT` 仅作为开发/测试扫描入口，不增加用户扫描设置页。
-
-预计修改：`native/modules/vst3_host.cpp/.h`、`qt_ui.cpp/.h`、`bootstrap.cpp`。
-
-### P7.5 二态启用和实时链
-
-**状态：已实现二态 sidecar/UI 语义；清单驱动多实例实时链宿主受限。** `checked = enabled`、旧 `bypass` 迁移和安全旁路已验证；P3 双槽 callback 尚未取得多实例串联证据。
-
-- 统一语义为 `checked = enabled`，修正当前 `checked = bypass` 的相反语义。界面不暴露第三种状态；实例准备失败时将该项恢复为未选中并显示简短错误。
-- 勾选后在非实时路径准备该 class 的 component、processor、controller、总线和预分配缓冲，成功后把实际实例加入当前作用域的处理链。不能只改变 JSON 或复选框就宣称启用。
-- 支持两个及以上选中插件按稳定清单顺序串联；取消一项只移除该项，剩余实例和设置保持有效；全部取消时直通。
-- 复用 P3 双槽和原子发布，音频线程不扫描磁盘、不创建 Qt 对象、不动态分配、不等待阻塞锁。快速连续勾选时以最后一次选择为准，确保 UI 状态和已发布链一致。
-- P4 外部输入继续复用同一清单和处理链，不增加第二套插件选择或路由设置。未知宿主哈希、处理错误和不满足缓冲条件时保持安全旁路。
-
-预计修改：`native/modules/vst3_host.cpp/.h`、`effect_chain.cpp/.h`、`gp_hook.cpp/.h`、`qt_ui.cpp/.h`。
-
-### P7.6 原生 VST3 GUI
-
-**状态：未实现，当前提示为 `host_limited`。** 名称点击入口和未启用提示已实现，但插件 component/controller 实例没有持续持有，锁定 GP 版本的 `IPlugView`/HWND ABI、参数消息和同实例 state 回传尚未完成。
-
-- 名称点击只对已启用项生效，从正在处理音频的同一实例取得 `IEditController` 和 `IPlugView`；不另建只用于显示的实例。
-- 在 Qt 主线程通过 HWND 承载 `IPlugView`，处理 `IPlugFrame` 尺寸回调、DPI、焦点、重复点击聚焦、窗口关闭和 GP 退出释放。
-- 补齐 component/controller 连接和 `IComponentHandler` 回调，把原生 GUI 的参数编辑消息送入 processor 的预分配消息队列，必要时处理 `restartComponent`，确保 GUI 调节真实影响输出。
-- 关闭 GUI 只关闭 view，插件保持启用并继续处理；取消勾选时先取得插件 state、关闭 view，再在实时读者退出后安全停用和释放实例。
-- 对没有 editor view 或不支持 Windows editor 的插件记录兼容性结果并提示原因，不伪造项目自己的参数设置页。
-
-预计修改：`native/modules/vst3_host.cpp/.h`、`qt_ui.cpp/.h` 和参数消息进入实时处理的适配部分。
-
-### P7.7 状态保存和升级
-
-**状态：已实现 `enabled` 迁移和自动保存（2026-09-10）**。schema 1 保持兼容，旧 `bypass` 读取为 `enabled = !bypass`。
-
-- 复用现有 `QSaveFile` 和 sidecar 路径，自动保存插件身份、清单顺序、`enabled` 状态以及 VST3 component/controller 提供的 opaque state。用户不直接编辑这些字段。
-- 旧数据中的 `bypass` 映射为 `enabled = !bypass`；保留旧参数字段以便兼容，但不再在 UI 中显示参数表。只有实际需要时才升级 schema，并提供读取旧 schema 的迁移路径。
-- 清单变更、曲谱上下文切换和宿主退出时自动保存，不增加额外保存按钮。取消勾选或关闭 GUI 不丢失插件自己的设置。
-- 插件缺失、class UID 不再存在或 state 恢复失败时保持未选中并保留数据；重新安装后按相同插件身份恢复，不要求手工重新选择文件。
-
-预计修改：`native/modules/state_manager.cpp/.h`、`vst3_host.cpp/.h`、`qt_ui.cpp/.h`。
-
-### P7.8 验收和证据
-
-**状态：部分验证；关键项标记宿主受限。** 新增 [P7 实现记录](P7_IMPLEMENTATION.md)、`native/test/test-p7.ps1` 和 `native/test/test-p7-ui.ps1`；同级插入、多实例实时链和原生 GUI 没有真实宿主证据，因此不标记为完整完成。
-
-| 验收项 | 必须取得的结果 |
-| --- | --- |
-| 本体检查 | 对 `C:\Program Files\Arobas Music\Guitar Pro 8` 的宿主文件完成只读版本、SHA-256、PE 架构和隔离副本记录 |
-| 同级位置 | VST3 选区与现有效果器选区处于同一父容器/布局；缩放、折叠、曲谱切换和窗口重建后不重复、不漂移 |
-| 自动列表 | 标准目录中安装的兼容 VST3 class 均可自动出现在列表；多 class、重复路径、空目录、插件增删和扫描失败有记录 |
-| 二态启用 | 选中插件产生真实处理，取消只停用该项，两个以上插件按列表顺序串联，全部取消直通 |
-| 原生 GUI | 每个支持 editor 的已启用插件都能打开/聚焦；GUI 参数修改造成可观测音频变化；关闭 GUI 后效果继续生效 |
-| 状态恢复 | 重启/重开恢复启用和插件 state；缺失、损坏或不兼容数据不会误启用 |
-| 实时安全 | 沿用 P2/P3/P4 的采样率、block size、错误回退、输入路由和退出释放验证 |
-| 界面简化 | Qt 夹具确认只保留复选框和插件名称交互，没有旧的手工选择、参数表、排序和独立 dock 入口 |
-| 发布 | 构建、安装/卸载归属、宿主哈希门控、发布文件白名单、敏感文件检查和 `git diff --check` 全部通过 |
-
-编译成功、DLL 能加载、菜单能枚举、返回 JSON 或 editor 窗口能创建，均不能单独证明 P7 完成。真实 GP 中同级位置、作用范围、勾选后的声音变化和原生 GUI 参数联动必须分别记录。
-
-### P7.9 交付顺序和完成标准
-
-1. **P7-A**：只读检查 Guitar Pro 本体和 C++ Build Tools，建立隔离副本及哈希基线。
-2. **P7-B**：确认同级 QWidget 容器和实际音频作用域，完成同级入口原型。
-3. **P7-C**：替换测试插件白名单为本机 VST3 自动扫描清单。
-4. **P7-D**：完成 `checked = enabled` 的单插件、多插件、取消和全取消实时链。
-5. **P7-E**：完成同一实例的 `IPlugView` 打开、聚焦、参数消息回传和 state 保存。
-6. **P7-F**：在真实 Guitar Pro 运行完整回归，新增 P7 实现记录，更新发布包和能力状态。
-
-P7 只有在 P7-B 至 P7-F 的真实宿主验收证据齐全后才标记为已实现；同级入口不可用、只能处理总输出、插件 GUI 参数未改变声音或只能依赖右侧 dock 时，分别标记为宿主受限或未实现。
-
-### P7.10 当前后续计划
-
-按“能不做就不做”的顺序推进，先解决会直接影响用户体验和验收结论的部分：
-
-1. **启动扫描解耦**：bootstrap 启动阶段不再等待全量 VST3 清单；先安装已验证 hook、创建入口并返回宿主。首次打开 P7 选区后，在工作线程执行标准目录元数据扫描，Qt 主线程只接收完成信号并刷新列表。
-2. **扫描期间可用**：面板打开时显示“扫描中”，不阻塞 Guitar Pro 主窗口；扫描失败只显示诊断状态，不影响宿主启动和旁路。
-3. **最小缓存**：进程内保留本次扫描结果；再次打开面板直接复用结果，仅当标准目录的目录时间或 bundle 清单变化时重新扫描。暂不增加用户扫描设置页或复杂后台服务。
-4. **原生 GUI 桥接**：为已启用条目持有同一 component/controller/processor 实例，接入 `IEditController::createView("editor")`、`IPlugView::attached(..., kPlatformTypeHWND)`、`IPlugFrame` 和 `IComponentHandler`，先在隔离宿主验证，再接入锁定 Guitar Pro。
-5. **实时链验收**：在 GUI 桥接之后，把复选框状态发布到 P3 双槽链，验证单插件、多插件串联、取消单项和全取消直通；没有真实处理和回归证据时继续标为未实现。
-
-完成以上工作并取得 P7-B 至 P7-F 的真实证据后，才允许把 P7 总状态改为“已完成”。
+上述命令已在本次修改后通过。提交前仍执行 `git diff --check`、敏感文件检查和工作树检查；不提交 `.tools/`、`artifacts/`、宿主副本、缓存或令牌。

@@ -52,6 +52,7 @@ QJsonObject vst3Status(const gpvst3::vst3::State &value) {
         {"status", QString::fromUtf8(value.status.data())},
         {"ready", value.ready},
         {"worker_thread", value.workerThread},
+        {"scan_pending", value.scanPending},
         {"modules_discovered", value.modulesDiscovered},
         {"modules_loaded", value.modulesLoaded},
         {"classes_enumerated", value.classesEnumerated},
@@ -199,10 +200,14 @@ QJsonObject initialize() {
     const auto host = host::verify();
     hook::prepare(host);
     ui::setRealtimeBypassControl(&hook::setTotalBypass);
+    ui::setVst3SelectionControl(&hook::setVst3Selection);
+    ui::setVst3StateControl(&hook::captureVst3States);
+    ui::setVst3EditorControl(&hook::openVst3Editor, &hook::closeVst3Editors);
     const auto hookState = hook::snapshot();
-    const auto vst3 = vst3::prepare(host.supported);
+    const auto vst3 = vst3::beginAsync(host.supported);
     const auto catalog = vst3Catalog(vst3);
     ui::setVst3Catalog(catalog);
+    ui::setVst3ScanState(vst3.scanPending ? QStringLiteral("scanning") : QStringLiteral("ready"));
     effects::Chain chain;
     chain.setBypassed(!hookState.runtimeProcessorReady);
 
@@ -236,6 +241,17 @@ QJsonObject initialize() {
                        : (host.supported ? "P0 bootstrap complete; processing remains bypassed"
                                           : "Host files do not match the P0 lock")}
     };
+}
+
+bool pollVst3(QJsonObject &status) {
+    vst3::State completed;
+    if (!vst3::poll(completed)) return false;
+    const auto catalog = vst3Catalog(completed);
+    ui::setVst3Catalog(catalog);
+    status.insert("vst3_host", vst3Status(completed));
+    status.insert("vst3_catalog", catalog);
+    state::writeStatus(status);
+    return true;
 }
 
 QJsonObject hookSnapshot() {

@@ -3,11 +3,19 @@
 #include <cstddef>
 #include <cstdint>
 #include <string>
+#include <vector>
 
 #include "input_router.h"
 #include "host_lock.h"
 
 namespace gpvst3::hook {
+
+struct Vst3SelectionEntry {
+    std::string module;
+    std::string classId;
+    std::vector<unsigned char> componentState;
+    std::vector<unsigned char> controllerState;
+};
 
 struct EntryPointObservation {
     bool moduleLoaded = false;
@@ -130,6 +138,15 @@ void shutdown() noexcept;
 // Thread-safe control used by the Qt panel. It only changes an atomic bypass
 // flag; processor creation and destruction remain on the worker thread.
 void setTotalBypass(bool bypassed) noexcept;
+// Queues the current P7 checked list for control-thread preparation. The
+// audio callback only sees the atomically published chain and never touches
+// these strings or creates plug-in instances.
+bool setVst3Selection(const std::vector<Vst3SelectionEntry> &selection) noexcept;
+std::vector<Vst3SelectionEntry> captureVst3States();
+// Open the editor owned by the currently active processing instance. The
+// caller supplies a native Windows child HWND created on the Qt UI thread.
+bool openVst3Editor(const Vst3SelectionEntry &entry, void *parentWindow) noexcept;
+void closeVst3Editors() noexcept;
 
 // Called by the eventual AudioLayer/PortAudio capture adapter. The function
 // owns no buffers and is safe to call from the audio callback after prepare().

@@ -6,6 +6,7 @@
 
 namespace Steinberg::Vst {
 class IAudioProcessor;
+class IParameterChanges;
 }
 
 namespace gpvst3::audio {
@@ -83,6 +84,7 @@ struct ProcessResult {
 // block copy and IAudioProcessor::process call.
 ProcessResult process(Steinberg::Vst::IAudioProcessor &processor,
                       const BlockView &block, PlanarBuffer &scratch,
-                      bool bypassed = false) noexcept;
+                      bool bypassed = false,
+                      Steinberg::Vst::IParameterChanges *parameterChanges = nullptr) noexcept;
 
 }
