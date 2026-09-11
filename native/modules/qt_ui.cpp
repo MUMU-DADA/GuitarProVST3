@@ -47,6 +47,8 @@ RealtimeBypassControl g_realtimeBypassControl = nullptr;
 Vst3SelectionControl g_vst3SelectionControl = nullptr;
 Vst3TrackSelectionControl g_vst3TrackSelectionControl = nullptr;
 Vst3StateControl g_vst3StateControl = nullptr;
+Vst3TrackStateControl g_vst3TrackStateControl = nullptr;
+Vst3TrackEditorControl g_vst3TrackEditorControl = nullptr;
 Vst3EditorControl g_vst3EditorControl = nullptr;
 Vst3EditorCloseControl g_vst3EditorCloseControl = nullptr;
 Vst3EditorScaleControl g_vst3EditorScaleControl = nullptr;
@@ -60,11 +62,32 @@ void saveCurrentRuntimeState();
 QString g_vst3ScanState = QStringLiteral("pending");
 class P7Panel;
 P7Panel *g_p7Panel = nullptr;
+P7Panel *g_globalPanel = nullptr;
 QPointer<QTimer> g_panelAttachTimer;
 bool g_panelUsesP7 = true;
+bool g_trackExpanded = true, g_globalExpanded = true;
 
 constexpr int kPathRole = Qt::UserRole;
 constexpr int kUidRole = Qt::UserRole + 1;
+
+bool trackContextAvailable() {
+    return state::runtimeTrackContextAvailable() ||
+           !qEnvironmentVariable("GPVST3_TRACK").isEmpty();
+}
+
+int configuredTrackIndex() {
+    const auto runtimeIndex = state::runtimeTrackIndex();
+    if (runtimeIndex >= 0) return runtimeIndex;
+    bool ok = false;
+    const auto value = qEnvironmentVariable("GPVST3_TRACK").toInt(&ok);
+    return ok ? value : -1;
+}
+
+QString configuredTrackLabel() {
+    const auto index = configuredTrackIndex();
+    return index < 0 ? QStringLiteral("当前音轨：无法确认当前音轨")
+                     : QStringLiteral("当前音轨：Track %1").arg(index);
+}
 
 class ChainPanel final : public QWidget {
 public:
@@ -404,107 +427,102 @@ private:
 
 class P7Panel final : public QWidget {
 public:
-    P7Panel() {
-        setObjectName(QStringLiteral("gpvst3P7Panel"));
-        setAttribute(Qt::WA_DeleteOnClose);
+    explicit P7Panel(state::ScopeKind scope = state::ScopeKind::Track) : scope_(scope) {
+        setObjectName(scope == state::ScopeKind::Track ? QStringLiteral("gpvst3P7Panel")
+                                                       : QStringLiteral("gpvst3GlobalPanel"));
+        setProperty("gpvst3Scope", scope == state::ScopeKind::Track ? "track" : "global");
         setWindowTitle(QStringLiteral("音源 · VST3 效果器"));
         setSizePolicy(QSizePolicy::Preferred, QSizePolicy::Preferred);
-        setMinimumWidth(240);
-        resize(420, 360);
+        setMinimumWidth(0);
         auto *root = new QVBoxLayout(this);
+        root->setContentsMargins(0, 0, 0, 0);
         auto *heading = new QHBoxLayout;
-        heading->addWidget(new QLabel(QStringLiteral("VST3 效果器"), this), 1);
+        trackContext_ = new QLabel(scope == state::ScopeKind::Track ? configuredTrackLabel()
+            : QStringLiteral("全局 Master"), this);
+        trackContext_->setObjectName(QStringLiteral("gpvst3TrackContext"));
+        heading->addWidget(trackContext_, 1);
         auto *close = new QPushButton(QStringLiteral("×"), this);
-        close->setObjectName(QStringLiteral("gpvst3CloseSelectorButton"));
+        close->setObjectName(scope == state::ScopeKind::Track ? QStringLiteral("gpvst3CloseSelectorButton")
+                                                            : QStringLiteral("gpvst3GlobalCloseSelectorButton"));
         close->setToolTip(QStringLiteral("关闭选择区"));
         close->setFixedWidth(24);
         heading->addWidget(close);
         connect(close, &QPushButton::clicked, this, &QWidget::close);
         root->addLayout(heading);
-        scopeTabs_ = new QTabWidget(this);
-        auto *trackPage = new QWidget(scopeTabs_);
-        trackPage->setObjectName(QStringLiteral("gpvst3TrackScopePage"));
-        auto *trackLayout = new QVBoxLayout(trackPage);
-        trackLayout->setContentsMargins(4, 4, 4, 4);
-        const auto trackNumber = qEnvironmentVariable("GPVST3_TRACK");
-        auto *trackContext = new QLabel(trackNumber.isEmpty()
-            ? QStringLiteral("当前音轨：无法确认当前音轨")
-            : QStringLiteral("当前音轨：Track %1").arg(trackNumber), trackPage);
-        trackContext->setObjectName(QStringLiteral("gpvst3TrackContext"));
-        trackLayout->addWidget(trackContext);
-        trackLayout->addWidget(new QLabel(QStringLiteral("正在使用（从上到下为效果顺序）"), trackPage));
-        auto *trackDivider = new QFrame(trackPage);
-        trackDivider->setObjectName(QStringLiteral("gpvst3TrackScopeDivider"));
-        trackDivider->setFrameShape(QFrame::HLine);
-        trackDivider->setFrameShadow(QFrame::Sunken);
-        trackLayout->addWidget(trackDivider);
-        list_ = new QListWidget(trackPage);
-        list_->setObjectName(QStringLiteral("gpvst3TrackChainList"));
+        root->addWidget(new QLabel(QStringLiteral("正在使用（从上到下为效果顺序）"), this));
+        list_ = new QListWidget(this);
+        list_->setObjectName(scope == state::ScopeKind::Track ? QStringLiteral("gpvst3TrackChainList")
+                                                             : QStringLiteral("gpvst3GlobalChainList"));
         list_->setSelectionMode(QAbstractItemView::SingleSelection);
         list_->setDragDropMode(QAbstractItemView::InternalMove);
         list_->setDefaultDropAction(Qt::MoveAction);
-        trackLayout->addWidget(list_, 2);
-        trackLayout->addWidget(new QLabel(QStringLiteral("可用插件"), trackPage));
-        availableList_ = new QListWidget(trackPage);
-        availableList_->setObjectName(QStringLiteral("gpvst3AvailableList"));
+        list_->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
+        list_->setStyleSheet(QStringLiteral("QListWidget { padding:0; margin:0; } QListWidget::item { padding:0; margin:0; }"));
+        list_->setMinimumWidth(0);
+        list_->setMaximumHeight(150);
+        root->addWidget(list_);
+        root->addWidget(new QLabel(QStringLiteral("可用插件"), this));
+        availableList_ = new QListWidget(this);
+        availableList_->setObjectName(scope == state::ScopeKind::Track ? QStringLiteral("gpvst3AvailableList")
+                                                                      : QStringLiteral("gpvst3GlobalAvailableList"));
         availableList_->setSelectionMode(QAbstractItemView::NoSelection);
-        trackLayout->addWidget(availableList_, 1);
-        scopeTabs_->addTab(trackPage, QStringLiteral("当前音轨"));
-        auto *globalPage = new QWidget(scopeTabs_);
-        globalPage->setObjectName(QStringLiteral("gpvst3GlobalScopePage"));
-        auto *globalLayout = new QVBoxLayout(globalPage);
-        globalLayout->setContentsMargins(4, 4, 4, 4);
-        globalLayout->addWidget(new QLabel(QStringLiteral("正在使用（从上到下为效果顺序）"), globalPage));
-        auto *globalDivider = new QFrame(globalPage);
-        globalDivider->setObjectName(QStringLiteral("gpvst3GlobalScopeDivider"));
-        globalDivider->setFrameShape(QFrame::HLine);
-        globalDivider->setFrameShadow(QFrame::Sunken);
-        globalLayout->addWidget(globalDivider);
-        globalList_ = new QListWidget(globalPage);
-        globalList_->setObjectName(QStringLiteral("gpvst3GlobalChainList"));
-        globalList_->setSelectionMode(QAbstractItemView::SingleSelection);
-        globalList_->setDragDropMode(QAbstractItemView::InternalMove);
-        globalList_->setDefaultDropAction(Qt::MoveAction);
-        globalLayout->addWidget(globalList_, 1);
-        globalLayout->addWidget(new QLabel(QStringLiteral("可用插件"), globalPage));
-        globalAvailableList_ = new QListWidget(globalPage);
-        globalAvailableList_->setSelectionMode(QAbstractItemView::NoSelection);
-        globalLayout->addWidget(globalAvailableList_, 1);
-        scopeTabs_->addTab(globalPage, QStringLiteral("全局 Master"));
-        root->addWidget(scopeTabs_, 1);
-        // A track tab is safe only when the host supplies a stable track
-        // context. Without that key, keep the legacy global chain as the
-        // initial scope so existing selections continue to process through
-        // the verified Master hook; the unresolved track tab remains visible
-        // and explicitly bypassed until a context is provided.
-        if (qEnvironmentVariable("GPVST3_TRACK").isEmpty()) scope_ = state::ScopeKind::Global;
-        scopeTabs_->setCurrentIndex(scope_ == state::ScopeKind::Global ? 1 : 0);
+        availableList_->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
+        availableList_->setStyleSheet(list_->styleSheet());
+        availableList_->setMinimumWidth(0);
+        availableList_->setMaximumHeight(120);
+        root->addWidget(availableList_);
         status_ = new QLabel(this);
-        status_->setObjectName(QStringLiteral("gpvst3Status"));
+        status_->setObjectName(scope == state::ScopeKind::Track ? QStringLiteral("gpvst3Status")
+                                                               : QStringLiteral("gpvst3GlobalStatus"));
         status_->setWordWrap(true);
         root->addWidget(status_);
-        connect(scopeTabs_, &QTabWidget::currentChanged, this, [this](int index) {
-            saveRuntimeState();
-            scope_ = index == 0 ? state::ScopeKind::Track : state::ScopeKind::Global;
-            loadChain();
-        });
         connect(list_->model(), &QAbstractItemModel::rowsMoved, this,
                 [this] { syncOrderFromList(); });
-        connect(globalList_->model(), &QAbstractItemModel::rowsMoved, this,
-                [this] { syncOrderFromList(); });
+        list_->setContextMenuPolicy(Qt::ActionsContextMenu);
+        for (const int direction : {-1, 1}) {
+            auto *action = new QAction(direction < 0 ? QStringLiteral("上移效果器") : QStringLiteral("下移效果器"), list_);
+            const auto prefix = scope_ == state::ScopeKind::Track ? QStringLiteral("gpvst3") : QStringLiteral("gpvst3Global");
+            action->setObjectName(prefix + (direction < 0 ? "MoveUp" : "MoveDown"));
+            action->setShortcut(QKeySequence(Qt::ALT | (direction < 0 ? Qt::Key_Up : Qt::Key_Down)));
+            action->setShortcutContext(Qt::WidgetWithChildrenShortcut);
+            list_->addAction(action);
+            connect(action, &QAction::triggered, this, [this, direction] {
+                const int row = list_->currentRow(), target = row + direction;
+                if (row < 0 || target < 0 || target >= list_->count()) return;
+                if (list_->model()->moveRow({}, row, {}, direction > 0 ? target + 1 : target)) list_->setCurrentRow(target);
+            });
+        }
         loadChain();
-        g_p7Panel = this;
+        (scope == state::ScopeKind::Track ? g_p7Panel : g_globalPanel) = this;
     }
 
     ~P7Panel() override {
         saveRuntimeState();
         if (g_p7Panel == this) g_p7Panel = nullptr;
+        if (g_globalPanel == this) g_globalPanel = nullptr;
     }
 
     void refreshCatalog() {
         saveRuntimeState();
         loadChain();
-        if (scope_ == state::ScopeKind::Global) publishSelection();
+        if (scope_ == state::ScopeKind::Global || contextReady_) restoreSelection();
+    }
+
+    void reloadSavedSelection() { loadChain(); }
+
+    void refreshTrackContext() {
+        if (scope_ == state::ScopeKind::Global) return;
+        const auto nextKey = state::currentTrackKey();
+        const auto changed = nextKey != trackKey_ || trackContextAvailable() != contextReady_;
+        if (trackContext_) trackContext_->setText(configuredTrackLabel());
+        if (!changed) return;
+        saveRuntimeState();
+        if (scope_ == state::ScopeKind::Track) {
+            loadChain();
+            if (contextReady_) restoreSelection();
+        } else {
+            bindTrackContext();
+        }
     }
 
     void capture() { saveRuntimeState(); }
@@ -519,13 +537,37 @@ public:
         bool anyEnabled = false;
         for (const auto &value : effects_)
             anyEnabled |= value.toObject().value("enabled").toBool();
-        if (anyEnabled && scope_ == state::ScopeKind::Global) {
+        if (anyEnabled && (scope_ == state::ScopeKind::Global || contextReady_)) {
             selectionDirty_ = true;
-            publishSelection();
+            restoreSelection();
         }
     }
 
 private:
+    void restoreSelection() {
+        if (publishSelection()) return;
+        const auto error = status_->toolTip();
+        const auto live = scope_ == state::ScopeKind::Track
+            ? (g_vst3TrackStateControl ? g_vst3TrackStateControl(trackKey_.toStdString()) : std::vector<Vst3SelectionEntry>{})
+            : (g_vst3StateControl ? g_vst3StateControl() : std::vector<Vst3SelectionEntry>{});
+        for (int index = 0; index < effects_.size(); ++index) {
+            auto effect = effects_[index].toObject();
+            if (!effect.value("enabled").toBool() || !effect.value("identified").toBool()) continue;
+            const bool active = std::any_of(live.begin(), live.end(), [&](const Vst3SelectionEntry &entry) {
+                return entry.module == effect.value("module").toString().toStdString() &&
+                       entry.classId == effect.value("class_id").toString().toStdString();
+            });
+            if (!active) {
+                effect.insert("enabled", false);
+                effect.insert("bypass", true);
+                effect.insert("last_error", error);
+                effects_[index] = effect;
+            }
+        }
+        saveRuntimeState();
+        loadChain();
+    }
+
     static std::vector<unsigned char> stateBytes(const QJsonObject &effect, const char *field) {
         const auto bytes = QByteArray::fromBase64(effect.value(field).toString().toLatin1());
         return {bytes.begin(), bytes.end()};
@@ -536,7 +578,7 @@ private:
         std::vector<Vst3SelectionEntry> selection;
         for (const auto &value : effects_) {
             const auto effect = value.toObject();
-            if (!effect.value("enabled").toBool()) continue;
+            if (!effect.value("enabled").toBool() || !effect.value("identified").toBool()) continue;
             const auto module = effect.value("module").toString();
             const auto classId = effect.value("class_id").toString();
             if (module.isEmpty() || classId.isEmpty()) continue;
@@ -548,7 +590,7 @@ private:
         const bool accepted = scope_ == state::ScopeKind::Global
             ? (g_vst3SelectionControl ? g_vst3SelectionControl(selection, &error) : true)
             : (g_vst3TrackSelectionControl ? g_vst3TrackSelectionControl(
-                  state::currentTrackKey().toStdString(), selection, &error) : true);
+                  trackKey_.toStdString(), selection, &error) : true);
         if (accepted) return true;
         QString message = QStringLiteral("无法启用此插件：插件初始化失败。");
         if (error == "host_unsupported")
@@ -570,7 +612,11 @@ private:
     }
 
     void saveRuntimeState() {
-        if (g_vst3StateControl) for (const auto &saved : g_vst3StateControl()) {
+        if (scope_ == state::ScopeKind::Track && !contextReady_) return;
+        const auto runtimeStates = scope_ == state::ScopeKind::Track
+            ? (g_vst3TrackStateControl ? g_vst3TrackStateControl(trackKey_.toStdString()) : std::vector<Vst3SelectionEntry>{})
+            : (g_vst3StateControl ? g_vst3StateControl() : std::vector<Vst3SelectionEntry>{});
+        for (const auto &saved : runtimeStates) {
             for (int i = 0; i < effects_.size(); ++i) {
                 auto effect = effects_.at(i).toObject();
                 if (effect.value("module").toString().toStdString() != saved.module ||
@@ -589,8 +635,8 @@ private:
             if (!value.toObject().value("module").toString().isEmpty() &&
                 (!value.toObject().value("class_id").toString().isEmpty() ||
                  value.toObject().value("enabled").toBool())) savedEffects.append(value);
-        state::setScopeEffects(sidecar_, scope_, savedEffects, state::currentScoreKey(),
-                               state::currentTrackKey(), qEnvironmentVariable("GPVST3_TRACK").toInt(), {});
+        state::loadChain(sidecar_);
+        state::setScopeEffects(sidecar_, scope_, savedEffects, scoreKey_, trackKey_, trackIndex_, {});
         if (!state::writeChain(sidecar_) && status_)
             status_->setText(QStringLiteral("插件状态保存失败。"));
     }
@@ -608,10 +654,11 @@ private:
     }
 
     void loadChain() {
+        bindTrackContext();
         QString error;
         if (!state::loadChain(sidecar_, &error))
             status_->setText(QStringLiteral("状态恢复失败：%1").arg(error));
-        auto saved = state::scopeEffects(sidecar_, scope_, state::currentScoreKey(), state::currentTrackKey());
+        auto saved = state::scopeEffects(sidecar_, scope_, scoreKey_, trackKey_);
         QHash<QString, int> savedRows;
         for (int index = 0; index < saved.size(); ++index) {
             const auto effect = saved.at(index).toObject();
@@ -623,8 +670,8 @@ private:
             const auto entry = value.toObject();
             if ((entry.value("identified").toBool() || entry.value("compatible").toBool()) &&
                 !entry.value("class_id").toString().isEmpty() &&
-                entry.value("recognition_status").toString() != QStringLiteral("failed") &&
-                entry.value("recognition_status").toString() != QStringLiteral("timeout"))
+                (entry.value("recognition_status").toString().isEmpty() ||
+                 entry.value("recognition_status").toString() == QStringLiteral("ready")))
                 counts[entry.value("name").toString()]++;
         }
         QSet<QString> listed;
@@ -639,7 +686,7 @@ private:
             // and will be reconciled when a later scan reaches ready.
             const bool identified = (entry.value("identified").toBool() || entry.value("compatible").toBool()) &&
                 !entry.value("class_id").toString().isEmpty() &&
-                status != QStringLiteral("failed") && status != QStringLiteral("timeout");
+                (status.isEmpty() || status == QStringLiteral("ready"));
             if (!identified) continue;
             QJsonObject effect = savedRows.contains(entry.value("module").toString() +
                                                    QStringLiteral("\n") + entry.value("class_id").toString())
@@ -667,7 +714,9 @@ private:
                 listed.contains(key(effect))) continue;
             // Keep sidecar state opaque and ordered without exposing a stale
             // missing plug-in as a selectable entry.
-            preservedMissing.append(effect);
+            auto missing = effect;
+            missing.insert("identified", false);
+            preservedMissing.append(missing);
         }
         std::stable_sort(catalogEffects.begin(), catalogEffects.end(), [](const QJsonValue &a, const QJsonValue &b) {
             const auto left = a.toObject(), right = b.toObject();
@@ -679,8 +728,6 @@ private:
         });
         activeList()->clear();
         availableList_->clear();
-        globalAvailableList_->clear();
-        if (scope_ == state::ScopeKind::Global) globalList_->clear();
         effects_ = {};
         for (const auto &value : catalogEffects) {
             const auto effect = value.toObject();
@@ -691,7 +738,10 @@ private:
             appendRow(effect, displayName(effect, counts) + suffix);
         }
         for (const auto &value : preservedMissing) effects_.append(value);
-        state::setScopeEffects(sidecar_, scope_, effects_, state::currentScoreKey(), state::currentTrackKey());
+        const auto rowHeight = qMax(32, qRound(32 * devicePixelRatioF()));
+        list_->setFixedHeight(qMin(150, qMax(1, list_->count()) * rowHeight + 4));
+        availableList_->setFixedHeight(qMin(120, qMax(1, availableList_->count()) * rowHeight + 4));
+        state::setScopeEffects(sidecar_, scope_, effects_, scoreKey_, trackKey_, trackIndex_);
         scanFeedback();
     }
 
@@ -701,40 +751,49 @@ private:
         auto *targetList = effect.value("enabled").toBool() ? activeList() : activeAvailableList();
         auto *item = new QListWidgetItem(targetList);
         auto *row = new QWidget(targetList);
-        row->setMinimumHeight(qMax(24, qRound(24 * devicePixelRatioF())));
+        row->setMinimumHeight(qMax(32, qRound(32 * devicePixelRatioF())));
         auto *layout = new QHBoxLayout(row);
         layout->setContentsMargins(2, 1, 2, 1);
         layout->setSpacing(3);
         auto *check = new QCheckBox(row);
         const auto token = effect.value("class_id").toString();
-        check->setObjectName(QStringLiteral("gpvst3Enabled_") + token);
+        const auto prefix = scope_ == state::ScopeKind::Track ? QStringLiteral("gpvst3")
+                                                              : QStringLiteral("gpvst3Global");
+        row->setObjectName(prefix + QStringLiteral("EffectRow_") + token);
+        check->setObjectName(prefix + QStringLiteral("Enabled_") + token);
         check->setFixedWidth(20);
         const bool trackContextReady = scope_ != state::ScopeKind::Track ||
-            (!qEnvironmentVariable("GPVST3_TRACK").isEmpty() && g_vst3TrackSelectionControl);
+            (trackContextAvailable() && g_vst3TrackSelectionControl);
         check->setEnabled(trackContextReady);
         check->setToolTip(trackContextReady ? QString{} :
             QStringLiteral("音轨效果器暂不可用：等待宿主音轨上下文（track_scope_unresolved）。"));
         check->setAccessibleName(QStringLiteral("启用 %1").arg(effect.value("name").toString()));
         check->setChecked(effect.value("enabled").toBool());
         auto *name = new ElidedButton(row);
-        name->setObjectName(QStringLiteral("gpvst3Name_") + token);
+        name->setObjectName(prefix + QStringLiteral("Name_") + token);
         name->setFullText(label);
         name->setAccessibleName(effect.value("name").toString());
         const auto fullIdentity = key(effect);
         name->setToolTip(QStringLiteral("%1\n厂商：%2\nentry_id：%3")
             .arg(effect.value("name").toString(), effect.value("vendor").toString(), fullIdentity));
+        if (!effect.value("last_error").toString().isEmpty()) {
+            name->setToolTip(name->toolTip() + QStringLiteral("\n上次启用失败：") + effect.value("last_error").toString());
+            check->setToolTip(QStringLiteral("上次启用失败；重新勾选可重试。"));
+            check->setAccessibleDescription(effect.value("last_error").toString());
+        }
         auto *vendor = new QLabel(effect.value("vendor").toString(), row);
-        vendor->setObjectName(QStringLiteral("gpvst3Vendor_") + token);
+        vendor->setObjectName(prefix + QStringLiteral("Vendor_") + token);
         vendor->setAlignment(Qt::AlignLeft | Qt::AlignVCenter);
         vendor->setSizePolicy(QSizePolicy::Maximum, QSizePolicy::Preferred);
         vendor->setToolTip(effect.value("vendor").toString());
+        vendor->hide(); // Full vendor/identity remain available in the name tooltip.
         auto *handle = new QLabel(QStringLiteral("⋮⋮"), row);
-        handle->setObjectName(QStringLiteral("gpvst3DragHandle_") + token);
+        handle->setObjectName(prefix + QStringLiteral("DragHandle_") + token);
         handle->setAlignment(Qt::AlignCenter);
         handle->setFixedWidth(20);
         handle->setToolTip(QStringLiteral("拖动以调整处理顺序"));
         auto *editor = new QPushButton(QStringLiteral("GUI"), row);
-        editor->setObjectName(QStringLiteral("gpvst3Editor_") + token);
+        editor->setObjectName(prefix + QStringLiteral("Editor_") + token);
         editor->setFixedWidth(36);
         editor->setToolTip(QStringLiteral("打开 %1 的原生编辑器").arg(effect.value("name").toString()));
         editor->setAccessibleName(QStringLiteral("打开 %1 GUI").arg(effect.value("name").toString()));
@@ -743,7 +802,7 @@ private:
         layout->addWidget(vendor);
         layout->addWidget(handle);
         layout->addWidget(editor);
-        item->setSizeHint(row->sizeHint());
+        item->setSizeHint(QSize(0, row->minimumHeight()));
         targetList->setItemWidget(item, row);
         const auto identity = key(effect);
         row->setProperty("gpvst3EntryId", identity);
@@ -752,9 +811,19 @@ private:
             const int index = indexFor(identity); if (index < 0) return;
             auto effect = effects_.at(index).toObject();
             const auto previous = effect;
-            if (!enabled && g_editorWindow && g_editorWindow->openedKey == key(effect)) g_editorWindow->close();
+            const auto editorKey = (scope_ == state::ScopeKind::Global ? QStringLiteral("global") : trackKey_) + '\n' + key(effect);
+            if (!enabled && g_editorWindow && g_editorWindow->openedKey == editorKey) g_editorWindow->close();
             effect.insert("enabled", enabled);
             effect.insert("bypass", !enabled);
+            effect.remove("last_error");
+            effect.remove("desired_enabled");
+            if (enabled) {
+                int nextOrder = 0;
+                for (const auto &value : effects_)
+                    if (value.toObject().value("enabled").toBool())
+                        nextOrder = qMax(nextOrder, value.toObject().value("order").toInt() + 1);
+                effect.insert("order", nextOrder);
+            }
             effects_.replace(index, effect);
             if (!publishSelection()) {
                 effects_.replace(index, previous);
@@ -765,17 +834,17 @@ private:
             saveRuntimeState();
             status_->setToolTip(QString());
             status_->setText(enabled
-                ? (scope_ == state::ScopeKind::Track
+                ? (scope_ == state::ScopeKind::Track && !state::runtimeTrackContextAvailable()
                     ? QStringLiteral("已保存音轨链：等待宿主确认音轨上下文，当前保持旁路。")
                     : QStringLiteral("已启用：点击名称打开原生 GUI"))
                 : QStringLiteral("已停用：%1").arg(effect.value("name").toString()));
-            // The isolated P7 fixture keeps its legacy item widgets stable;
-            // the host path (with a track context) rebinds rows so enabled
-            // items move to the active section immediately.
-            if (!qEnvironmentVariable("GPVST3_TRACK").isEmpty())
-                QTimer::singleShot(0, this, [this] { loadChain(); });
+            // Rebuild after the current signal so enabled rows move immediately.
+            QTimer::singleShot(0, this, [this] { loadChain(); });
         });
         connect(editor, &QPushButton::clicked, this, [this, identity] {
+            const int index = indexFor(identity); if (index >= 0) openEditor(index);
+        });
+        connect(name, &QPushButton::clicked, this, [this, identity] {
             const int index = indexFor(identity); if (index >= 0) openEditor(index);
         });
     }
@@ -787,24 +856,29 @@ private:
             return;
         }
         auto *window = editorWindow();
-        if (window->openedKey == key(effect) && window->isVisible()) {
+        const auto editorKey = (scope_ == state::ScopeKind::Global ? QStringLiteral("global") : trackKey_) + '\n' + key(effect);
+        if (window->openedKey == editorKey && window->isVisible()) {
             window->showNormal(); window->raise(); window->activateWindow();
             return;
         }
         saveRuntimeState();
         if (g_vst3EditorCloseControl) g_vst3EditorCloseControl();
-        window->openedKey = key(effect);
+        window->openedKey = editorKey;
         window->setWindowTitle(effect.value("name").toString() + QStringLiteral(" · VST3"));
         window->show();
         const gpvst3::hook::Vst3SelectionEntry selection{
             effect.value("module").toString().toStdString(),
             effect.value("class_id").toString().toStdString()};
-        if (!g_vst3EditorControl) {
+        if (scope_ == state::ScopeKind::Global ? !g_vst3EditorControl : !g_vst3TrackEditorControl) {
             window->hide();
             status_->setText(QStringLiteral("原生 GUI 暂不可用：当前测试宿主未提供 IPlugView/HWND 桥接（host_limited）。"));
             return;
         }
-        if (!g_vst3EditorControl(selection, reinterpret_cast<void *>(window->host->winId()))) {
+        void *editorHost = reinterpret_cast<void *>(window->host->winId());
+        const bool opened = scope_ == state::ScopeKind::Global
+            ? g_vst3EditorControl(selection, editorHost)
+            : g_vst3TrackEditorControl(trackKey_.toStdString(), selection, editorHost);
+        if (!opened) {
             window->hide();
             status_->setText(QStringLiteral("原生 GUI 不可用：插件未提供可嵌入 editor 或初始化失败。"));
             return;
@@ -815,15 +889,16 @@ private:
 
     void closeEvent(QCloseEvent *event) override {
         saveRuntimeState();
+        (scope_ == state::ScopeKind::Track ? g_trackExpanded : g_globalExpanded) = false;
         QWidget::closeEvent(event);
     }
 
     QListWidget *activeList() const noexcept {
-        return scope_ == state::ScopeKind::Global ? globalList_ : list_;
+        return list_;
     }
 
     QListWidget *activeAvailableList() const noexcept {
-        return scope_ == state::ScopeKind::Global ? globalAvailableList_ : availableList_;
+        return availableList_;
     }
 
     int indexFor(const QString &identity) const {
@@ -852,7 +927,7 @@ private:
         int disabledOrder = ordered.size();
         for (const auto &value : effects_) {
             const auto effect = value.toObject();
-            if (effect.value("enabled").toBool() || moved.contains(key(effect))) continue;
+            if (moved.contains(key(effect))) continue;
             auto disabled = effect;
             disabled.insert("order", disabledOrder++);
             merged.append(disabled);
@@ -862,17 +937,28 @@ private:
         publishSelection();
     }
 
-    QListWidget *list_ = nullptr, *globalList_ = nullptr, *availableList_ = nullptr, *globalAvailableList_ = nullptr;
-    QTabWidget *scopeTabs_ = nullptr;
+    QListWidget *list_ = nullptr, *availableList_ = nullptr;
+    QLabel *trackContext_ = nullptr;
     QLabel *status_ = nullptr;
     QJsonObject sidecar_;
     QJsonArray effects_;
-    state::ScopeKind scope_ = state::ScopeKind::Track;
+    const state::ScopeKind scope_;
     bool selectionDirty_ = false;
+    QString scoreKey_, trackKey_;
+    int trackIndex_ = -1;
+    bool contextReady_ = false;
+
+    void bindTrackContext() {
+        scoreKey_ = state::currentScoreKey();
+        trackKey_ = state::currentTrackKey();
+        trackIndex_ = configuredTrackIndex();
+        contextReady_ = trackContextAvailable();
+    }
 };
 
 void saveCurrentRuntimeState() {
-    if (g_p7Panel) { g_p7Panel->capture(); return; }
+    if (g_p7Panel) g_p7Panel->capture();
+    if (g_globalPanel) { g_globalPanel->capture(); return; }
     if (!g_vst3StateControl) return;
     QJsonObject chain;
     if (!state::loadChain(chain)) return;
@@ -1070,6 +1156,11 @@ void setVst3StateControl(Vst3StateControl control) noexcept {
     g_vst3StateControl = control;
 }
 
+void setVst3TrackControls(Vst3TrackStateControl state, Vst3TrackEditorControl editor) noexcept {
+    g_vst3TrackStateControl = state;
+    g_vst3TrackEditorControl = editor;
+}
+
 void setVst3EditorControl(Vst3EditorControl open, Vst3EditorCloseControl close, Vst3EditorScaleControl scale) noexcept {
     g_vst3EditorControl = open;
     g_vst3EditorCloseControl = close;
@@ -1082,6 +1173,7 @@ void setVst3Catalog(const QJsonArray &catalog) {
     if (g_p7Panel) {
         g_p7Panel->refreshCatalog();
     }
+    if (g_globalPanel) g_globalPanel->refreshCatalog();
 }
 
 void setVst3DiscoveryControl(Vst3RefreshControl refresh, Vst3IdentifyControl identify) noexcept {
@@ -1116,6 +1208,7 @@ void setVst3ScanState(const QString &state, int checked, int total, bool cached,
         }
     }
     if (g_p7Panel) g_p7Panel->scanFeedback();
+    if (g_globalPanel) g_globalPanel->scanFeedback();
 }
 
 double nativeEditorScale(void *host) {
@@ -1140,22 +1233,21 @@ void shutdownEditors() {
 
 void syncVst3Selection() {
     if (g_p7Panel) g_p7Panel->syncSelection();
+    if (g_globalPanel) g_globalPanel->syncSelection();
+}
+
+void refreshVst3TrackContext() {
+    if (g_p7Panel) g_p7Panel->refreshTrackContext();
+}
+
+void reloadVst3Selections() {
+    if (g_p7Panel) g_p7Panel->reloadSavedSelection();
+    if (g_globalPanel) g_globalPanel->reloadSavedSelection();
 }
 
 void showEffectChainPanel(bool show) {
     if (!qApp) return;
-    if (auto *existing = qApp->property("gpvst3P5Panel").value<QWidget *>()) {
-        if (show) {
-            existing->setProperty("gpvst3ShowRequested", true);
-            if (existing->objectName() != "gpvst3P7Panel" || existing->parentWidget()) {
-                existing->show();
-                existing->raise();
-                existing->activateWindow();
-                existing->setProperty("gpvst3ShowRequested", false);
-            }
-        }
-        return;
-    }
+    if (show) g_trackExpanded = g_globalExpanded = true;
     QJsonObject chain;
     state::loadChain(chain);
     bool legacy = false;
@@ -1165,12 +1257,7 @@ void showEffectChainPanel(bool show) {
     // Keep the old isolated P5 fixture readable when no catalog is supplied;
     // a real P7 host always has a catalog and therefore uses the two-state UI.
     legacy = legacy && g_vst3Catalog.isEmpty();
-    QWidget *panel = legacy ? static_cast<QWidget *>(new ChainPanel)
-                            : static_cast<QWidget *>(new P7Panel);
     const bool useP7Panel = !legacy;
-    panel->setProperty("gpvst3ShowRequested", show);
-    qApp->setProperty("gpvst3P5Panel", QVariant::fromValue(static_cast<QWidget *>(panel)));
-    QObject::connect(panel, &QObject::destroyed, qApp, [] { qApp->setProperty("gpvst3P5Panel", QVariant()); });
 
     // Keep the maintenance timer owned by qApp rather than by the selector.
     // GP destroys and rebuilds the sidebar widgets during score/track changes;
@@ -1187,14 +1274,19 @@ void showEffectChainPanel(bool show) {
         if (!panel) {
             panel = g_panelUsesP7 ? static_cast<QWidget *>(new P7Panel)
                                   : static_cast<QWidget *>(new ChainPanel);
-            panel->setAttribute(Qt::WA_DeleteOnClose);
-            panel->setProperty("gpvst3ShowRequested", false);
             qApp->setProperty("gpvst3P5Panel", QVariant::fromValue(panel));
             QObject::connect(panel, &QObject::destroyed, qApp, [] {
                 qApp->setProperty("gpvst3P5Panel", QVariant());
             });
         }
         const bool useP7Panel = g_panelUsesP7;
+        if (useP7Panel && !g_globalPanel) {
+            auto *global = new P7Panel(state::ScopeKind::Global);
+            qApp->setProperty("gpvst3GlobalPanel", QVariant::fromValue(static_cast<QWidget *>(global)));
+            QObject::connect(global, &QObject::destroyed, qApp, [] {
+                qApp->setProperty("gpvst3GlobalPanel", QVariant());
+            });
+        }
         auto *soundHost = findSoundHost();
         bool soundEntryReady = soundHost != nullptr;
         QWidget *trackSection = nullptr;
@@ -1227,27 +1319,24 @@ void showEffectChainPanel(bool show) {
                 if (g_refreshControl) g_refreshControl();
             });
         }
-        if (useP7Panel && soundHost && panel->parentWidget() != soundHost) {
-            // The P7 selector belongs to the same QWidget hierarchy and
-            // layout as the host's sound section. Reparenting is repeated on
-            // every tick because GP rebuilds this area when the score or
-            // selected track changes.
-            const bool wasVisible = !panel->isHidden();
-            panel->setParent(soundHost, Qt::Widget);
-            soundHost->layout()->addWidget(panel);
-            panel->setWindowFlag(Qt::Tool, false);
-            panel->setWindowTitle(QString());
-            if (wasVisible) panel->show();
-            else panel->hide();
-            panel->setProperty("gpvst3TrackAnchorReady", trackSection != nullptr);
-            panel->setProperty("gpvst3GlobalAnchorReady", globalSection != nullptr);
-        } else if (useP7Panel && !soundHost && panel->parentWidget()) {
-            // If the private sound section is temporarily absent, detach the
-            // panel so the next section instance can adopt it safely.
-            const bool wasVisible = !panel->isHidden();
-            panel->setParent(nullptr, Qt::Tool);
-            if (wasVisible) panel->show();
-            else panel->hide();
+        if (useP7Panel) {
+            const auto mount = [](QWidget *content, QWidget *section, bool expanded) {
+                if (!content) return;
+                if (!section) {
+                    content->hide();
+                    content->setProperty("gpvst3AnchorReady", false);
+                    return;
+                }
+                if (content->parentWidget() != section) {
+                    content->setParent(section, Qt::Widget);
+                    section->layout()->addWidget(content);
+                }
+                content->setProperty("gpvst3AnchorReady", true);
+                content->setVisible(expanded);
+                section->show();
+            };
+            mount(panel, trackSection, g_trackExpanded);
+            mount(g_globalPanel, globalSection, g_globalExpanded);
         }
         bool dockReady = timer->property("dockReady").toBool();
         if (!useP7Panel) {
@@ -1294,10 +1383,6 @@ void showEffectChainPanel(bool show) {
         }
         if (!useP7Panel && !panel->parentWidget()) {
             panel->show(); panel->raise(); panel->activateWindow();
-        }
-        if (useP7Panel && soundHost && panel->property("gpvst3ShowRequested").toBool()) {
-            panel->show();
-            panel->setProperty("gpvst3ShowRequested", false);
         }
         timer->setProperty("dockReady", dockReady);
     };

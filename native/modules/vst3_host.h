@@ -109,7 +109,7 @@ State identifyBundle(const std::string &module, bool hostSupported) noexcept;
 
 // Read the small local cache first, then check files on one worker. poll()
 // delivers changed progress/catalog snapshots without waiting for the worker.
-State beginAsync(bool hostSupported = true) noexcept;
+State beginAsync(bool hostSupported = true, bool retryTimedOut = false) noexcept;
 bool poll(State &completed) noexcept;
 void shutdownScan() noexcept;
 void setRecognitionControl(RecognitionControl control) noexcept;

@@ -391,7 +391,7 @@ void persistRecognitionTimeout(const QString &module, long long deadline, const 
     if (output.write(bytes) == bytes.size()) output.commit();
 }
 
-State scan(const QStringList &paths, QJsonObject cache, State result) {
+State scan(const QStringList &paths, QJsonObject cache, State result, bool retryTimedOut) {
     QElapsedTimer elapsed;
     elapsed.start();
     const auto scope = scopeKey(paths);
@@ -419,7 +419,10 @@ State scan(const QStringList &paths, QJsonObject cache, State result) {
         QString error = record.value("error").toString();
         if (record.value("fingerprint").toString() == stamp && record.value("entries").isArray() &&
             validEntries(record.value("entries").toArray()) &&
-            (error.isEmpty() || now < record.value("retry_after").toDouble())) {
+            (error.isEmpty() || now < record.value("retry_after").toDouble() ||
+             record.value("recognition_status").toString() == "timeout" ||
+             (record.value("recognition_status").toString() == "ready" &&
+              record.value("recognition_source").toString() == "factory"))) {
             ++result.cacheReused;
         } else {
             const auto entries = inspect(module, result, error);
@@ -431,6 +434,12 @@ State scan(const QStringList &paths, QJsonObject cache, State result) {
                                  {"recognition_error", QString{}}, {"recognition_retry_after", 0.0},
                                  {"recognition_deadline_at", 0.0}, {"recognition_ignored_reason", QString{}},
                                  {"recognition_scanner_version", kScanner}};
+        }
+        if (retryTimedOut && record.value("recognition_status").toString() == "timeout") {
+            record.insert("recognition_status", "queued");
+            record.insert("recognition_error", QString{});
+            record.insert("recognition_ignored_reason", QString{});
+            record.insert("recognition_deadline_at", 0.0);
         }
         if (!record.contains("recognition_status")) {
             const auto cachedEntries = record.value("entries").toArray();
@@ -500,7 +509,7 @@ State scan(const QStringList &paths, QJsonObject cache, State result) {
 }
 } // namespace
 
-State beginAsync(bool hostSupported) noexcept {
+State beginAsync(bool hostSupported, bool retryTimedOut) noexcept {
     std::lock_guard<std::mutex> lock(scanMutex);
     if (stopping.load()) { State state; state.status = "scan_stopped"; return state; }
     if (!hostSupported) { State state; state.status = "host_unsupported"; return state; }
@@ -530,8 +539,8 @@ State beginAsync(bool hostSupported) noexcept {
     }
     snapshot = pending;
     ++revision;
-    scanFuture = std::async(std::launch::async, [paths, cache, pending] {
-        try { return scan(paths, cache, pending); }
+    scanFuture = std::async(std::launch::async, [paths, cache, pending, retryTimedOut] {
+        try { return scan(paths, cache, pending, retryTimedOut); }
         catch (...) {
             auto failed = pending;
             failed.status = "scan_failed";
@@ -615,14 +624,31 @@ bool poll(State &completed) noexcept {
         replacement.erase(std::remove_if(replacement.begin(), replacement.end(), [](const CatalogEntry &entry) {
             return !entry.identified || entry.category != "Audio Module Class";
         }), replacement.end());
+        int attempts = 1;
+        for (const auto &entry : snapshot.catalog)
+            if (entry.module == recognitionModule.toStdString()) attempts = std::max(attempts, entry.recognitionAttempts + 1);
+        for (auto &entry : replacement) {
+            entry.recognitionStatus = "ready";
+            entry.recognitionSource = "factory";
+            entry.recognitionAttempts = attempts;
+            entry.recognitionError.clear();
+            entry.recognitionIgnoredReason.clear();
+            entry.recognitionRetryAfter = entry.recognitionDeadlineAt = 0;
+        }
         if (!replacement.empty()) {
             snapshot.catalog.erase(std::remove_if(snapshot.catalog.begin(), snapshot.catalog.end(),
                 [&](const CatalogEntry &entry) { return entry.module == recognitionModule.toStdString(); }), snapshot.catalog.end());
             snapshot.catalog.insert(snapshot.catalog.end(), replacement.begin(), replacement.end());
         } else {
             const auto reason = identified.errors.empty() ? std::string("recognition_failed") : identified.errors.front();
-            for (auto &entry : snapshot.catalog)
-                if (entry.module == recognitionModule.toStdString()) entry.error = reason;
+            for (auto &entry : snapshot.catalog) {
+                if (entry.module != recognitionModule.toStdString()) continue;
+                entry.error = entry.recognitionError = reason;
+                entry.recognitionStatus = "failed";
+                entry.recognitionSource = "factory";
+                entry.recognitionAttempts = attempts;
+                entry.recognitionRetryAfter = QDateTime::currentSecsSinceEpoch() + 60;
+            }
         }
         std::sort(snapshot.catalog.begin(), snapshot.catalog.end(), [](const CatalogEntry &a, const CatalogEntry &b) {
             if (a.name != b.name) return a.name < b.name;
@@ -663,6 +689,7 @@ bool poll(State &completed) noexcept {
     }
     snapshot.recognitionCurrentModule = recognitionJob ? recognitionModule.toStdString() : std::string{};
     snapshot.recognitionWorker = static_cast<bool>(recognitionJob);
+    snapshot.recognitionPending = recognitionJob || !recognitionQueue.isEmpty();
     snapshot.recognitionWorkersStarted = recognitionWorkersStarted;
     snapshot.recognitionWorkersDetached = recognitionWorkersDetached;
     if (revision == delivered) return false;

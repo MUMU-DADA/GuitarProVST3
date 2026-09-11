@@ -54,7 +54,9 @@ int main(int argc, char **argv) {
     }
     if (!check(completed && result.recognitionAttempted == 1 && result.recognitionFailed == 0,
                "one background recognition attempt")) return 1;
-    if (!check(result.catalog.size() == 1 && result.catalog.front().identified,
+    if (!check(result.catalog.size() == 1 && result.catalog.front().identified &&
+               result.catalog.front().recognitionStatus == "ready" &&
+               result.catalog.front().recognitionSource == "factory" && result.catalog.front().recognitionAttempts == 1,
                "recognized catalog replaces candidate")) return 1;
     QFile cache(QDir(data).filePath("vst3-catalog-cache.json"));
     if (!check(cache.open(QIODevice::ReadOnly), "recognition cache written")) return 1;

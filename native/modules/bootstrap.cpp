@@ -1,6 +1,7 @@
 #include "bootstrap.h"
 
 #include "effect_chain.h"
+#include "gp_audio_runtime.h"
 #include "gp_hook.h"
 #include "host_lock.h"
 #include "qt_ui.h"
@@ -122,8 +123,8 @@ void scanFeedback(const gpvst3::vst3::State &scan) {
                                 scan.modulesDiscovered, scan.cacheHit, details.join('\n'));
 }
 
-void refreshCatalog() {
-    const auto pending = gpvst3::vst3::beginAsync(gpvst3::hook::snapshot().hostSupported);
+void refreshCatalog(bool retryTimedOut = false) {
+    const auto pending = gpvst3::vst3::beginAsync(gpvst3::hook::snapshot().hostSupported, retryTimedOut);
     scanFeedback(pending);
 }
 
@@ -161,6 +162,20 @@ QJsonObject hookStatus(const gpvst3::hook::State &value) {
             {"before_hash", QString::number(static_cast<qulonglong>(entry.beforeHash), 16)},
             {"after_hash", QString::number(static_cast<qulonglong>(entry.afterHash), 16)}};
     };
+    QJsonArray trackRuntimeEvidence;
+    for (const auto &track : value.trackRuntimeEvidence) {
+        trackRuntimeEvidence.append(QJsonObject{
+            {"track_key", QString::fromStdString(track.trackKey)},
+            {"track_id", QString::fromStdString(track.trackId)},
+            {"process_blocks", static_cast<qint64>(track.processBlocks)},
+            {"processed_blocks", static_cast<qint64>(track.processedBlocks)},
+            {"bypass_blocks", static_cast<qint64>(track.bypassBlocks)},
+            {"error_blocks", static_cast<qint64>(track.errorBlocks)},
+            {"configured_effects", static_cast<qint64>(track.configuredEffects)},
+            {"configured", track.configured},
+            {"processed", track.processed},
+            {"write_observed", track.writeObserved}});
+    }
     return QJsonObject{
         {"installed", value.installed},
         {"enabled", value.enabled},
@@ -202,6 +217,13 @@ QJsonObject hookStatus(const gpvst3::hook::State &value) {
         {"global_chain_enabled", value.globalChainEnabled},
         {"global_chain_process_blocks", static_cast<qint64>(value.globalChainProcessBlocks)},
         {"track_chain_process_blocks", static_cast<qint64>(value.trackChainProcessBlocks)},
+        {"track_chain_processed_blocks", static_cast<qint64>(value.trackChainProcessedBlocks)},
+        {"track_bindings_published", static_cast<qint64>(value.trackBindingsPublished)},
+        {"track_runtime_processed", value.trackRuntimeProcessed},
+        {"track_runtime_write_observed", value.trackRuntimeWriteObserved},
+        {"track_runtime_error", QString::fromStdString(value.trackRuntimeError)},
+        {"track_binding_source", QString::fromStdString(value.trackBindingSource)},
+        {"track_runtime_evidence", trackRuntimeEvidence},
         {"track_context_observed", value.trackContextObserved},
         {"track_context_stable", value.trackContextStable},
         {"track_scope_unresolved", value.trackScopeUnresolved},
@@ -222,6 +244,13 @@ QJsonObject hookStatus(const gpvst3::hook::State &value) {
         {"input_capture_path_located", value.inputCapturePathLocated},
         {"input_capture_observed", value.inputCaptureObserved},
         {"input_route_enabled", value.inputRouteEnabled},
+        {"input_after_original_blocks", qint64(value.inputAfterOriginalBlocks)},
+        {"input_post_original_hash", QString::number(value.inputPostOriginalHash, 16)},
+        {"input_post_route_hash", QString::number(value.inputPostRouteHash, 16)},
+        {"input_order_samples_observed", value.inputOrderSamplesObserved},
+        {"input_order_capture_sample", value.inputOrderCaptureSample},
+        {"input_order_generated_sample", value.inputOrderGeneratedSample},
+        {"input_order_output_sample", value.inputOrderOutputSample},
         {"input_processor_ready", value.inputProcessorReady},
         {"input_route", QString::fromUtf8(value.inputRoute.data())},
         {"input_route_reason", QString::fromUtf8(value.inputRouteReason.data())},
@@ -271,22 +300,35 @@ namespace gpvst3::bootstrap {
 
 QJsonObject initialize() {
     const auto host = host::verify();
+    gpvst3::gp_audio::initialize();
     hook::prepare(host);
+    hook::refreshTrackContext();
     ui::setRealtimeBypassControl(&hook::setTotalBypass);
     ui::setVst3SelectionControl(&hook::setGlobalVst3Selection);
     ui::setVst3TrackSelectionControl(&hook::setTrackVst3Selection);
     ui::setVst3StateControl(&hook::captureGlobalVst3States);
+    ui::setVst3TrackControls(&hook::captureTrackVst3States, &hook::openTrackVst3Editor);
     ui::setVst3EditorControl(&hook::openVst3Editor, &hook::closeVst3Editors, &hook::scaleVst3Editor);
     const auto hookState = hook::snapshot();
     vst3::setRecognitionControl(&vst3::identifyBundle);
-    ui::setVst3DiscoveryControl(&refreshCatalog, &identifyBundle);
+    ui::setVst3DiscoveryControl([] { refreshCatalog(true); }, &identifyBundle);
     auto *refreshTimer = new QTimer(QCoreApplication::instance());
     refreshTimer->setInterval(60000);
-    QObject::connect(refreshTimer, &QTimer::timeout, refreshTimer, &refreshCatalog);
+    QObject::connect(refreshTimer, &QTimer::timeout, refreshTimer, [] { refreshCatalog(); });
     refreshTimer->start();
+    auto *trackTimer = new QTimer(QCoreApplication::instance());
+    trackTimer->setInterval(250);
+    QObject::connect(trackTimer, &QTimer::timeout, trackTimer, [] {
+        hook::refreshTrackContext();
+        if (hook::consumeSelectionStateChanges()) ui::reloadVst3Selections();
+        ui::refreshVst3TrackContext();
+    });
+    trackTimer->start();
     const auto vst3 = qEnvironmentVariable("GPVST3_RUN_LIFECYCLE_PROBE") == "1"
         ? vst3::prepare(host.supported) : vst3::beginAsync(host.supported);
     const auto catalog = vst3Catalog(vst3);
+    hook::setVst3Catalog(catalog);
+    if (hook::consumeSelectionStateChanges()) ui::reloadVst3Selections();
     ui::setVst3Catalog(catalog);
     scanFeedback(vst3);
     effects::Chain chain;
@@ -328,6 +370,8 @@ bool pollVst3(QJsonObject &status) {
     vst3::State completed;
     if (!vst3::poll(completed)) return false;
     const auto catalog = vst3Catalog(completed);
+    hook::setVst3Catalog(catalog);
+    if (hook::consumeSelectionStateChanges()) ui::reloadVst3Selections();
     ui::setVst3Catalog(catalog);
     scanFeedback(completed);
     status.insert("vst3_host", vst3Status(completed));

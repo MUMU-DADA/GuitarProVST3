@@ -2,6 +2,8 @@ param(
     [string]$QtDir = '',
     [string]$OutputRoot = '',
     [string]$Vst3SdkDir = '',
+    [string]$GuitarProMcpRoot = '',
+    [switch]$ForceNativeAudioBindings,
     [ValidateSet('', 'GuitarPro.exe', 'GPCore.dll', 'GPRSE.dll', 'AMAudio.dll', 'AMOverloud.dll')]
     [string]$RejectHostFile = '',
     [ValidateRange(0, 5000)]
@@ -27,7 +29,7 @@ if (-not (Test-Path -LiteralPath (Join-Path $Vst3SdkDir 'pluginterfaces/base/fun
 }
 $Vst3SdkDir = (Resolve-Path -LiteralPath $Vst3SdkDir).Path
 
-if (($RejectHostFile -or $CatalogDelayMs) -and (-not $OutputRoot -or
+if (($RejectHostFile -or $CatalogDelayMs -or $ForceNativeAudioBindings) -and (-not $OutputRoot -or
     [IO.Path]::GetFullPath($OutputRoot).TrimEnd('\', '/') -ieq (Join-Path $projectRoot '.tools/native'))) {
     throw 'A negative-test DLL requires a separate -OutputRoot.'
 }
@@ -41,6 +43,10 @@ $vsInstall = & $vswhere -latest -products '*' -requires Microsoft.VisualStudio.C
 if (-not $vsInstall) { throw 'Visual Studio x64 C++ build tools are required.' }
 Import-Module (Join-Path $vsInstall 'Common7/Tools/Microsoft.VisualStudio.DevShell.dll')
 Enter-VsDevShell -VsInstallPath $vsInstall -SkipAutomaticLocation -DevCmdArguments '-arch=x64 -host_arch=x64'
+foreach ($module in @('gpcore', 'gprse')) {
+    & lib /nologo /machine:x64 "/def:$PSScriptRoot/$module-audio.def" "/out:$buildDir/$module.lib"
+    if ($LASTEXITCODE) { throw "Audio ABI import library failed: $module" }
+}
 
 $includeDirs = @(
     (Join-Path $QtDir 'include'),
@@ -65,6 +71,7 @@ $sources = @(
     (Join-Path $PSScriptRoot 'modules/audio_adapter.cpp'),
     (Join-Path $PSScriptRoot 'modules/input_router.cpp'),
     (Join-Path $PSScriptRoot 'modules/effect_chain.cpp'),
+    (Join-Path $PSScriptRoot 'modules/gp_audio_runtime.cpp'),
     (Join-Path $PSScriptRoot 'modules/gp_hook.cpp'),
     (Join-Path $PSScriptRoot 'modules/vst3_host.cpp'),
     (Join-Path $PSScriptRoot 'modules/vst3_catalog.cpp'),
@@ -75,11 +82,12 @@ $sources = @(
     (Join-Path $Vst3SdkDir 'public.sdk/source/vst/vstinitiids.cpp')
 )
 $testDefines = @()
+if ($ForceNativeAudioBindings) { $testDefines += '/DGPVST3_FORCE_NATIVE_AUDIO_BINDINGS' }
 if ($CatalogDelayMs) { $testDefines += "/DGPVST3_TEST_SCAN_DELAY_MS=$CatalogDelayMs" }
 if ($RejectHostFile) {
     $index = @('GUITARPRO.EXE','GPCORE.DLL','GPRSE.DLL','AMAUDIO.DLL','AMOVERLOUD.DLL').IndexOf($RejectHostFile.ToUpperInvariant())
     $testDefines += "/DGPVST3_TEST_REJECT_HOST_INDEX=$index"
 }
-& cl /nologo /std:c++17 /EHsc /MD /O2 /utf-8 /LD /DQT_NO_DEBUG /DQT_PLUGIN /DUNICODE /D_UNICODE @testDefines @clIncludeArgs @sources "/Fo$buildDir/" "/Fd$buildDir/guitarpro_vst3_autoload.pdb" "/Fe$pluginDir/guitarpro_vst3_autoload.dll" /link /Brepro "/LIBPATH:$QtDir/lib" Qt5Core.lib Qt5Gui.lib Qt5Widgets.lib Ole32.lib User32.lib "/IMPLIB:$buildDir/guitarpro_vst3_autoload.lib"
+& cl /nologo /std:c++17 /EHsc /MD /O2 /utf-8 /LD /DQT_NO_DEBUG /DQT_PLUGIN /DUNICODE /D_UNICODE @testDefines @clIncludeArgs @sources "/Fo$buildDir/" "/Fd$buildDir/guitarpro_vst3_autoload.pdb" "/Fe$pluginDir/guitarpro_vst3_autoload.dll" /link /Brepro "/LIBPATH:$QtDir/lib" "/LIBPATH:$buildDir" Qt5Core.lib Qt5Gui.lib Qt5Widgets.lib Ole32.lib User32.lib GPCore.lib GPRSE.lib "/IMPLIB:$buildDir/guitarpro_vst3_autoload.lib"
 if ($LASTEXITCODE) { throw 'P0 plugin compilation failed.' }
 Write-Output "Built $pluginDir/guitarpro_vst3_autoload.dll"

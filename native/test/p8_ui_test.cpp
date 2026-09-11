@@ -1,24 +1,51 @@
 #include "qt_ui.h"
 #include "state_manager.h"
-
-#include <QtCore/QCoreApplication>
-#include <QtCore/QJsonArray>
-#include <QtCore/QJsonObject>
 #include <QtCore/QTemporaryDir>
+#include <QtCore/QTimer>
 #include <QtWidgets/QApplication>
+#include <QtWidgets/QCheckBox>
 #include <QtWidgets/QFrame>
 #include <QtWidgets/QLabel>
 #include <QtWidgets/QListWidget>
 #include <QtWidgets/QPushButton>
-#include <QtWidgets/QTabWidget>
 #include <QtWidgets/QVBoxLayout>
-#include <QtCore/QTimer>
 #include <iostream>
+#include <memory>
 
 namespace {
 bool check(bool value, const char *message) {
     if (!value) std::cerr << "FAIL: " << message << '\n';
     return value;
+}
+std::vector<gpvst3::ui::Vst3SelectionEntry> globalSelection, trackSelection;
+std::string selectedTrack, editorScope;
+bool globalControl(const std::vector<gpvst3::ui::Vst3SelectionEntry> &entries, std::string *) noexcept {
+    globalSelection = entries; return true;
+}
+bool trackControl(const std::string &track, const std::vector<gpvst3::ui::Vst3SelectionEntry> &entries,
+                  std::string *) noexcept {
+    selectedTrack = track; trackSelection = entries; return true;
+}
+bool globalEditor(const gpvst3::ui::Vst3SelectionEntry &, void *) noexcept {
+    editorScope = "global"; return true;
+}
+bool trackEditor(const std::string &track, const gpvst3::ui::Vst3SelectionEntry &, void *) noexcept {
+    editorScope = track; return true;
+}
+std::unique_ptr<QWidget> host() {
+    auto result = std::make_unique<QWidget>();
+    result->setObjectName("soundsContainer");
+    auto *layout = new QVBoxLayout(result.get());
+    for (const auto &name : {"gpNativeInstrumentEffects", "gpMasterPostProcessing"}) {
+        auto *anchor = new QLabel(name, result.get());
+        anchor->setObjectName(name);
+        layout->addWidget(anchor);
+    }
+    result->show();
+    return result;
+}
+QString identity(QListWidget *list, int row) {
+    return list->itemWidget(list->item(row))->property("gpvst3EntryId").toString();
 }
 }
 
@@ -29,76 +56,95 @@ int main(int argc, char **argv) {
     qputenv("GPVST3_DATA_DIR", dir.path().toUtf8());
     qputenv("GPVST3_SCORE_PATH", "C:/scores/p8-ui.gp");
     qputenv("GPVST3_TRACK", "1");
+    QApplication::setAttribute(Qt::AA_EnableHighDpiScaling);
     QApplication app(argc, argv);
-    const QJsonArray catalog{
-        QJsonObject{{"module", "C:/VST3/A.vst3"}, {"class_id", "A"},
-                    {"name", "A very long effect name for a narrow Guitar Pro sidebar"},
-                    {"vendor", "Test Vendor"}, {"compatible", true}},
-        QJsonObject{{"module", "C:/VST3/B.vst3"}, {"class_id", "B"}, {"name", "B"}, {"vendor", "Test"}, {"compatible", true}},
-        QJsonObject{{"module", "C:/VST3/C.vst3"}, {"class_id", "C"}, {"name", "C"}, {"vendor", "Test"}, {"compatible", true}}};
-    if (!check(gpvst3::state::writeChain(QJsonObject{{"effects", QJsonArray{}}}), "seed state")) return 1;
-    QJsonObject chain; gpvst3::state::loadChain(chain);
-    gpvst3::state::setScopeEffects(chain, gpvst3::state::ScopeKind::Track,
-        QJsonArray{QJsonObject{{"module", "C:/VST3/B.vst3"}, {"class_id", "B"}, {"name", "B"}, {"enabled", true}}},
+    QJsonArray catalog;
+    for (const auto &id : {"A", "B", "C"}) catalog.append(QJsonObject{
+        {"module", QString("C:/VST3/%1.vst3").arg(id)}, {"class_id", id},
+        {"name", QString("%1 very long effect name for a narrow Guitar Pro sidebar").arg(id)},
+        {"vendor", "Test Vendor"}, {"compatible", true}, {"recognition_status", "ready"}});
+    for (const auto &status : {"queued", "running", "failed", "timeout"}) catalog.append(QJsonObject{
+        {"module", QString("C:/VST3/%1.vst3").arg(status)}, {"class_id", status},
+        {"name", status}, {"compatible", true}, {"recognition_status", status}});
+    auto enabled = [&](int index) { auto value = catalog[index].toObject(); value["enabled"] = true; return value; };
+    QJsonObject chain{{"effects", QJsonArray{}}};
+    gpvst3::state::setScopeEffects(chain, gpvst3::state::ScopeKind::Track, QJsonArray{enabled(1)},
         "C:/scores/p8-ui.gp", "C:/scores/p8-ui.gp#track-1", 1, "Guitar");
     gpvst3::state::setScopeEffects(chain, gpvst3::state::ScopeKind::Global,
-        QJsonArray{QJsonObject{{"module", "C:/VST3/C.vst3"}, {"class_id", "C"}, {"name", "C"}, {"enabled", true}},
-                   QJsonObject{{"module", "C:/VST3/A.vst3"}, {"class_id", "A"}, {"name", "A"}, {"enabled", true}}});
+        QJsonArray{enabled(2), enabled(0)});
     if (!check(gpvst3::state::writeChain(chain), "write scoped state")) return 1;
+    gpvst3::ui::setVst3SelectionControl(globalControl);
+    gpvst3::ui::setVst3TrackSelectionControl(trackControl);
+    gpvst3::ui::setVst3EditorControl(globalEditor, nullptr);
+    gpvst3::ui::setVst3TrackControls(nullptr, trackEditor);
     gpvst3::ui::setVst3Catalog(catalog);
+    auto soundHost = host();
     gpvst3::ui::showEffectChainPanel(true);
     QCoreApplication::processEvents();
-    auto *panel = qApp->property("gpvst3P5Panel").value<QWidget *>();
-    if (!check(panel && panel->objectName() == "gpvst3P7Panel", "P8 panel")) return 1;
-    auto *tabs = panel->findChild<QTabWidget *>();
-    if (!check(tabs && tabs->count() == 2 && tabs->tabText(0) == QStringLiteral("当前音轨") &&
-               tabs->tabText(1) == QStringLiteral("全局 Master"), "scope tabs")) return 1;
-    auto *track = panel->findChild<QListWidget *>("gpvst3TrackChainList");
-    auto *global = panel->findChild<QListWidget *>("gpvst3GlobalChainList");
-    auto *available = panel->findChild<QListWidget *>("gpvst3AvailableList");
-    if (!check(track && global && available, "scope list object names")) return 1;
-    if (!check(track->count() == 1 && available->count() == 2 && track->itemWidget(track->item(0)) != nullptr,
-               "track catalog rows")) return 1;
-    tabs->setCurrentIndex(1); QCoreApplication::processEvents();
-    if (!check(global->count() == 2, "global enabled rows")) return 1;
-    if (!check(global->itemWidget(global->item(0))->property("gpvst3EntryId").toString().endsWith("\nC"),
-               "enabled entries stay first in saved order")) return 1;
-    auto *nameButton = global->findChild<QPushButton *>("gpvst3Name_A");
-    if (!check(nameButton && nameButton->sizePolicy().horizontalPolicy() == QSizePolicy::Ignored &&
-               nameButton->toolTip().contains(QStringLiteral("A very long effect name")),
-               "long plugin names keep a left aligned, discoverable tooltip")) return 1;
-
-    QWidget soundHost;
-    soundHost.setObjectName(QStringLiteral("soundsContainer"));
-    auto *soundLayout = new QVBoxLayout(&soundHost);
-    auto *nativeSource = new QLabel(QStringLiteral("音源效果器"), &soundHost);
-    nativeSource->setObjectName(QStringLiteral("gpNativeInstrumentEffects"));
-    auto *nativeMaster = new QLabel(QStringLiteral("母带后期处理"), &soundHost);
-    nativeMaster->setObjectName(QStringLiteral("gpMasterPostProcessing"));
-    soundLayout->addWidget(nativeSource);
-    soundLayout->addWidget(nativeMaster);
-    soundHost.show();
-    for (auto *timer : qApp->findChildren<QTimer *>()) timer->setInterval(0);
-    QCoreApplication::processEvents(QEventLoop::AllEvents, 100);
-    auto *trackSection = soundHost.findChild<QWidget *>("gpvst3TrackVst3Section");
-    auto *globalSection = soundHost.findChild<QWidget *>("gpvst3GlobalVst3Section");
-    if (!check(trackSection && trackSection->parentWidget() == &soundHost &&
-               globalSection && globalSection->parentWidget() == &soundHost,
-               "host sections are mounted as owned wrappers")) return 1;
-    if (!check(trackSection->findChild<QFrame *>("gpvst3TrackVst3Divider") &&
-               globalSection->findChild<QFrame *>("gpvst3GlobalVst3Divider"),
-               "track and global sections have structural dividers")) return 1;
-    if (!check(soundLayout->indexOf(nativeSource) < soundLayout->indexOf(trackSection) &&
-               soundLayout->indexOf(nativeMaster) < soundLayout->indexOf(globalSection),
-               "sections follow their native host anchors")) return 1;
-    if (!check(soundHost.findChild<QLabel *>("gpNativeInstrumentEffects") == nativeSource &&
-               soundHost.findChild<QLabel *>("gpMasterPostProcessing") == nativeMaster,
-               "native source and master controls remain present")) return 1;
-    panel->close();
-    QJsonObject saved; gpvst3::state::loadChain(saved);
-    const auto reordered = gpvst3::state::scopeEffects(saved, gpvst3::state::ScopeKind::Global);
-    if (!check(reordered.size() == 3 && reordered.at(0).toObject().value("class_id") == "C" &&
-               reordered.at(1).toObject().value("class_id") == "A", "drag order persisted")) return 1;
-    std::cout << "PASS: P8 scope tabs, independent state and drag order.\n";
-    return 0;
+    auto *track = soundHost->findChild<QListWidget *>("gpvst3TrackChainList");
+    auto *global = soundHost->findChild<QListWidget *>("gpvst3GlobalChainList");
+    auto *trackSection = soundHost->findChild<QWidget *>("gpvst3TrackVst3Section");
+    auto *globalSection = soundHost->findChild<QWidget *>("gpvst3GlobalVst3Section");
+    if (!check(track && global && trackSection && globalSection && trackSection->isAncestorOf(track) &&
+               globalSection->isAncestorOf(global) && track->isVisible() && global->isVisible(),
+               "actual lists are visible inside their separate native sections")) return 1;
+    auto *layout = soundHost->layout();
+    if (!check(layout->indexOf(trackSection) == layout->indexOf(soundHost->findChild<QWidget *>("gpNativeInstrumentEffects")) + 1 &&
+               layout->indexOf(globalSection) == layout->indexOf(soundHost->findChild<QWidget *>("gpMasterPostProcessing")) + 1 &&
+               trackSection->findChild<QFrame *>("gpvst3TrackVst3Divider")->isVisible() &&
+               globalSection->findChild<QFrame *>("gpvst3GlobalVst3Divider")->isVisible(),
+               "sections and visible dividers immediately follow the untouched native controls")) return 1;
+    if (!check(track->count() == 1 && global->count() == 2 &&
+               soundHost->findChild<QListWidget *>("gpvst3AvailableList")->count() == 2 &&
+               soundHost->findChild<QListWidget *>("gpvst3GlobalAvailableList")->count() == 1,
+               "both scopes are populated and non-ready entries stay hidden")) return 1;
+    if (!check(identity(global, 0).endsWith("\nC") && identity(global, 1).endsWith("\nA"), "saved global order")) return 1;
+    if (!check(global->model()->moveRow({}, 1, {}, 0), "enabled list supports a real model move")) return 1;
+    if (!check(globalSelection.size() == 2 && globalSelection[0].classId == "A" && globalSelection[1].classId == "C",
+               "a list move publishes the exact processor order")) return 1;
+    trackSection->findChild<QCheckBox *>("gpvst3Enabled_A")->setChecked(true);
+    globalSection->findChild<QCheckBox *>("gpvst3GlobalEnabled_C")->setChecked(false);
+    QCoreApplication::processEvents();
+    if (!check(trackSelection.size() == 2 && selectedTrack == "C:/scores/p8-ui.gp#track-1" &&
+               globalSelection.size() == 1 && globalSelection[0].classId == "A" &&
+               track->count() == 2 && global->count() == 1,
+               "simultaneous controls publish only their fixed scope")) return 1;
+    trackSection->findChild<QPushButton *>("gpvst3Name_A")->click();
+    if (!check(editorScope == selectedTrack, "name opens the track processor editor")) return 1;
+    globalSection->findChild<QPushButton *>("gpvst3GlobalName_A")->click();
+    if (!check(editorScope == "global", "name opens the independent global editor")) return 1;
+    for (const int width : {260, 320, 420}) {
+        soundHost->setFixedWidth(width);
+        soundHost->resize(width, 1100);
+        QCoreApplication::processEvents();
+        for (auto *section : {trackSection, globalSection}) {
+            const QString prefix = section == trackSection ? "gpvst3" : "gpvst3Global"; auto *name = section->findChild<QPushButton *>(prefix + "Name_A");
+            auto *editor = section->findChild<QPushButton *>(prefix + "Editor_A");
+            auto *toggle = section->findChild<QCheckBox *>(prefix + "Enabled_A");
+            if (!check(name && name->text().startsWith("A") && name->width() >= 60 &&
+                       name->toolTip().contains("Test Vendor") && name->toolTip().contains("C:/VST3/A.vst3") &&
+                       toggle->geometry().right() < name->geometry().left() &&
+                       name->geometry().right() < editor->geometry().left() &&
+                       editor->geometry().right() < editor->parentWidget()->width(),
+                       "narrow/DPI layout preserves prefix, identity and nonoverlapping controls")) return 1;
+        }
+    }
+    qputenv("GPVST3_TRACK", "2");
+    gpvst3::ui::refreshVst3TrackContext();
+    if (!check(track->count() == 0 && global->count() == 1, "track change leaves global content active")) return 1;
+    qputenv("GPVST3_TRACK", "1");
+    gpvst3::ui::refreshVst3TrackContext();
+    if (!check(track->count() == 2 && global->count() == 1, "return restores the correct track")) return 1;
+    soundHost.reset();
+    soundHost = host();
+    gpvst3::ui::showEffectChainPanel();
+    gpvst3::ui::showEffectChainPanel();
+    QCoreApplication::processEvents();
+    if (!check(soundHost->findChildren<QListWidget *>("gpvst3TrackChainList").size() == 1 &&
+               soundHost->findChild<QListWidget *>("gpvst3TrackChainList")->count() == 2 &&
+               soundHost->findChildren<QListWidget *>("gpvst3GlobalChainList").size() == 1 &&
+               soundHost->findChild<QListWidget *>("gpvst3GlobalChainList")->count() == 1,
+               "sidebar destruction and repeated attach preserve both chains without duplicates")) return 1;
+    gpvst3::ui::shutdownEditors();
+    std::cout << "PASS: P8 actual section content, independent controls, real reorder, narrow/DPI and sidebar rebuild.\n";
 }

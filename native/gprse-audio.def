@@ -1,0 +1,12 @@
+LIBRARY GPRSE
+EXPORTS
+?index@EffectsChain@rse@gp@@QEBAIXZ
+?name@EffectsChain@rse@gp@@QEBAAEBV?$basic_string@DU?$char_traits@D@std@@V?$allocator@D@2@@std@@XZ
+?effectChain@Sound@rse@gp@@QEBAAEBV?$shared_ptr@VEffectsChain@rse@gp@@@std@@XZ
+?coreTrack@Musician@rse@gp@@QEBAAEBV?$shared_ptr@VTrack@core@gp@@@std@@XZ
+?soundAtIndex@Musician@rse@gp@@QEBA?AV?$shared_ptr@VSound@rse@gp@@@std@@I@Z
+?updateAll@Musician@rse@gp@@QEAAXXZ
+?musician@Conductor@rse@gp@@QEBAPEAVMusician@23@I@Z
+?sound@Conductor@rse@gp@@QEBA?AV?$shared_ptr@VSound@rse@gp@@@std@@II@Z
+?conductor@ConductorController@rse@gp@@QEBAAEBV?$shared_ptr@VConductor@rse@gp@@@std@@XZ
+?score@Conductor@rse@gp@@QEBAAEBV?$shared_ptr@VScore@core@gp@@@std@@XZ

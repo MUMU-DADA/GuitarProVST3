@@ -9,6 +9,7 @@
 #include <QtCore/QTemporaryDir>
 #include <QtCore/QThread>
 #include <chrono>
+#include <atomic>
 #include <iostream>
 #include <thread>
 
@@ -26,9 +27,8 @@ void write(const QString &path, const QByteArray &bytes) {
 QString binary(const QString &module) { return module + "/Contents/x86_64-win/" + QFileInfo(module).fileName(); }
 
 gpvst3::vst3::State recognize(const std::string &module, bool hostSupported) noexcept {
-    static bool slow = true;
-    if (slow) {
-        slow = false;
+    static std::atomic<bool> slow{true};
+    if (slow.exchange(false)) {
         std::this_thread::sleep_for(std::chrono::seconds(11));
     }
     gpvst3::vst3::State result;
@@ -90,6 +90,35 @@ int main(int argc, char **argv) {
                timeout.value("recognition_error").toString() == "recognition_timeout" &&
                timeout.value("recognition_deadline_at").toDouble() > 0,
                "timeout reason and deadline persist")) return 1;
+    cache.close();
+    // Expire the static metadata retry without waiting a minute. An unchanged
+    // timeout must survive automatic refresh; only an explicit retry requeues it.
+    cache.open(QIODevice::ReadOnly);
+    auto saved = QJsonDocument::fromJson(cache.readAll()).object();
+    cache.close();
+    auto cachedScopes = saved.value("scopes").toObject();
+    auto scope = cachedScopes.begin().value().toObject();
+    auto cachedModules = scope.value("modules").toObject();
+    for (auto it = cachedModules.begin(); it != cachedModules.end(); ++it) {
+        auto record = it.value().toObject();
+        record.insert("retry_after", 0.0);
+        it.value() = record;
+    }
+    scope.insert("modules", cachedModules);
+    cachedScopes.begin().value() = scope;
+    saved.insert("scopes", cachedScopes);
+    write(cache.fileName(), QJsonDocument(saved).toJson());
+    const auto settle = [&](bool manual) {
+        gpvst3::vst3::beginAsync(true, manual);
+        for (int i = 0; i < 5000; ++i) {
+            if (gpvst3::vst3::poll(result) && !result.scanPending && !result.recognitionPending) return true;
+            QThread::msleep(1);
+        }
+        return false;
+    };
+    if (!check(settle(false) && result.recognitionAttempted == 0, "automatic refresh never retries an unchanged timeout")) return 1;
+    if (!check(settle(true) && result.recognitionAttempted == 1 && result.catalog.size() == 2 &&
+               result.catalog[0].identified && result.catalog[1].identified, "manual refresh can recover a timed-out bundle")) return 1;
     gpvst3::vst3::shutdownScan();
     std::cout << "PASS: P8 recognition watchdog hides timed out bundles and advances the queue.\n";
     return 0;

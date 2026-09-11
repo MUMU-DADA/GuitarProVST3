@@ -1,0 +1,7 @@
+LIBRARY GPCore
+EXPORTS
+?sounds@Track@core@gp@@QEBAAEBV?$vector@V?$shared_ptr@VSound@core@gp@@@std@@V?$allocator@V?$shared_ptr@VSound@core@gp@@@std@@@2@@std@@XZ
+?cursor@Score@core@gp@@QEAAAEAVScoreCursor@23@XZ
+?modelPrivate@Score@core@gp@@QEBAAEBV?$shared_ptr@VScoreModel@core@gp@@@std@@XZ
+?trackIndex@ScoreCursor@core@gp@@QEBAHXZ
+?tracks@Score@core@gp@@QEBAAEBV?$vector@V?$shared_ptr@VTrack@core@gp@@@std@@V?$allocator@V?$shared_ptr@VTrack@core@gp@@@std@@@2@@std@@XZ

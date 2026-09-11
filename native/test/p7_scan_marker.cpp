@@ -26,4 +26,11 @@ BOOL WINAPI DllMain(HINSTANCE instance, DWORD reason, LPVOID) {
 }
 extern "C" __declspec(dllexport) bool InitDll() { mark(L"InitDll"); return true; }
 extern "C" __declspec(dllexport) bool ExitDll() { mark(L"ExitDll"); return true; }
-extern "C" __declspec(dllexport) void *GetPluginFactory() { mark(L"GetPluginFactory"); return nullptr; }
+extern "C" __declspec(dllexport) void *GetPluginFactory() {
+    mark(L"GetPluginFactory");
+#ifdef P8_SCAN_DELAY_MS
+    Sleep(P8_SCAN_DELAY_MS);
+    mark(L"FactoryReturned");
+#endif
+    return nullptr;
+}

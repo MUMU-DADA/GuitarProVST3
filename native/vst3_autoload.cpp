@@ -8,6 +8,7 @@
 #include <windows.h>
 
 #include "modules/bootstrap.h"
+#include "modules/gp_audio_runtime.h"
 #include "modules/gp_hook.h"
 #include "modules/qt_ui.h"
 #include "modules/state_manager.h"
@@ -26,8 +27,7 @@ QString pluginPath() {
 
 void writeObservation() {
     const auto hook = gpvst3::bootstrap::hookSnapshot();
-    if (hook.value("enabled").toBool())
-        gpvst3::state::writeRealtimeObservation(hook);
+    gpvst3::state::writeRealtimeObservation(hook);
     if (auto *application = QCoreApplication::instance())
         QTimer::singleShot(250, application, &writeObservation);
 }
@@ -37,6 +37,7 @@ void stopObservation() {
     gpvst3::state::writeRealtimeObservation(gpvst3::bootstrap::hookSnapshot());
     gpvst3::ui::shutdownEditors();
     gpvst3::hook::shutdown();
+    gpvst3::gp_audio::shutdown();
 }
 
 void initializePlugin() {
@@ -55,6 +56,7 @@ void initializePlugin() {
     // observation and shutdown lifecycle available in default launches.
     writeObservation();
     QObject::connect(application, &QCoreApplication::aboutToQuit, application, &gpvst3::ui::shutdownEditors);
+    QObject::connect(application, &QCoreApplication::aboutToQuit, application, &gpvst3::hook::saveVst3States);
     QObject::connect(application, &QCoreApplication::aboutToQuit, application, &gpvst3::vst3::shutdownScan);
     qAddPostRoutine(&stopObservation);
 }

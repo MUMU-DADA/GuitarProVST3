@@ -1,31 +1,31 @@
 # P8：音轨级与全局 VST3 效果器、后台识别和顺序编辑计划
 
-状态：阶段性实现，P8 未完成（2026-09-11）。P8.7、P8.9、P8.10、P8.11 已实现并验证；P8.8 仍为宿主受限，需取得稳定音轨映射后才能重新评估整体完成。
+状态：P8 六项补齐工作及交付验收已完成（2026-09-11，Guitar Pro 8.1.1.17 / Windows x64）。完整生命周期、实际列表挂载、独立 native 发现、无 MCP bridge 发布运行、P4 组合和发布包均有证据。逐项结果见 [P8 实现记录](P8_IMPLEMENTATION.md)。
 
-当前锁定宿主可通过 `EffectsChain::index()` 提供链实例索引观测，但该字段不代表 GP 音轨 ID；在取得稳定的 `self -> track ID` 映射和可写 `IAudioBuffer` 边界前，音轨链继续旁路。
+当前锁定宿主的真实 `self -> track ID` 映射可由 GuitarProMCP bridge 或本 DLL 的独立 native collector 提供，可写 `IAudioBuffer` 已在双轨播放中验证。`EffectsChain::index()` 仅提供链实例索引诊断；个别未解析上下文仍旁路，不影响已绑定音轨。
 
 本计划原有范围包括：启动后后台完成插件刷新/识别并更新缓存；区分音轨级和全局 VST3 链；启用项在列表前部显示；支持拖动排序且排序决定声音处理顺序。现根据宿主回归重新补齐六项未完成问题：识别中项目隐藏与 10 秒超时、音轨链真实可用、全局 UI 的母带后期处理位置、保留 GP 原生音源效果链、音轨 VST3 UI 的音源区位置，以及窄侧栏下的插件名称与布局适配。
 
-## 当前结论：已有实现不能视为 P8 完成
+## 六项补齐结果
 
-现有代码和夹具已证明目录缓存、schema 2、双 scope 数据模型、后台超时、区域挂载和窄宽度行布局；真实音轨处理仍未完成。状态如下：
+六项原始问题均已有实现和针对性证据。下文保留实施要求；证据路径、实际数值与交付核对以实现记录为准。
 
-| 编号 | 当前缺口 | 完成前的约束 |
+| 编号 | 原始问题 | 补齐结果 |
 | --- | --- | --- |
-| 1 | 识别中隐藏和 10 秒硬截止 | **已实现/已验证**：queued/running/failed/timeout 不进列表；超时写入 cache 并推进队列 |
-| 2 | 音轨链只保存 desired state，`processDSP` 没有稳定 track 映射时保持旁路 | **宿主受限/未完成**：真实播放可观测多个 `self`/`index`，但没有稳定 `self -> track_key`；继续旁路 |
-| 3 | global UI 锚点 | **已实现/已验证**：`gpvst3GlobalVst3Section` 位于 `soundMastering` 后并有独立 divider |
+| 1 | 识别中隐藏和 10 秒硬截止 | **已实现/已验证**：真实 11 秒 factory、末项超时终态、队列推进、识别后 ready、缓存重启及手动重试 |
+| 2 | 音轨链实际处理及生命周期 | **已实现/已验证**：双轨独立增益与写回、增删重排/撤销、首次保存/另存、关闭重开与全轨重启恢复；两种发现路径通过 |
+| 3 | global UI 锚点及内容 | **已实现/已验证**：实际 global 列表、操作和分界线位于 `soundMastering` 后 |
 | 4 | 保留 GP 原生音源效果链 | **已实现/已验证**：只插入自有 wrapper，不清空或替换宿主 layout；原生控件仍存在 |
-| 5 | track UI 锚点 | **已实现/已验证**：`gpvst3TrackVst3Section` 位于 `soundRack` 后并有独立 divider |
+| 5 | track UI 锚点及内容 | **已实现/已验证**：实际 track 列表、操作和分界线位于 `soundRack` 后 |
 | 6 | 窄侧栏名称和操作布局 | **已实现/已验证**：左对齐、省略 tooltip、固定 GUI/拖动入口和高 DPI 最小高度通过 Qt fixture |
 
 补齐阶段采用“宿主布局证据 + 运行时处理证据 + UI 回归”三类验收。仅有离屏 Qt 夹具、JSON 返回、菜单可枚举或 DLL 加载成功，均不能单独把上述问题标记为完成。
 
-## 当前实现和问题边界
+## 当前实现
 
 - `vst3_catalog.cpp` 在后台完成静态文件扫描和缓存；缺少静态元数据的候选项由 `poll()` 放入单 worker 主动识别队列。用户勾选或打开列表时不再调用 `g_identifyControl`，`vst3::identifyBundle()` 及其 `LoadLibrary`、`InitDll`、factory 枚举都在后台执行。
-- 当前 `P7Panel` 只有一套 `effects_` 和一个 `effect-chain.json` 链；`gp_hook` 只有一套实际运行的 `SelectionSlot`，VST3 处理位置是 `Master::process` 返回后的 master 后处理点。
-- `EffectsChain::processDSP` 当前只记录调用并转发到 GP 原函数，没有音轨标识到运行时链的映射。现有 `track` 字段只是 sidecar/UI 信息，不能证明实际作用域已是音轨级。
+- 两个固定 scope 的 `P7Panel` 复用行组件但分别持有 `effects_`，实际内容挂在两个宿主 section 中；global 和各轨的 `SelectionSlot`、参数、state 和 GUI 实例独立。
+- `EffectsChain::processDSP` 使用 MCP bridge 或 native collector 的真实链映射，在 GP 原函数返回后执行对应音轨 VST3 链。逐轨证据进入 `track_runtime_evidence`；保存重开、增删重排和全部音轨自动恢复已通过。
 - GP 运行时链使用 `am::overloud::Effect`，VST3 使用 `IComponent`/`IAudioProcessor`，不能把 VST3 实例直接塞进 GP 的私有效果器容器。音轨级实现应在 `processDSP` 的缓冲边界建立独立 VST3 链。
 
 ## 目标和明确边界
@@ -49,12 +49,12 @@
 
 ### 入口和作用域
 
-继续使用 `soundsContainer` 中现有的 `VST3` 入口作为选择入口，避免破坏 GP 现有入口。选择模型可以共用两个 scope tabs，但实际 global/track 内容必须按 P8.10 分别挂到宿主锚点，不能把一个尾部面板当成两个作用域的最终布局：
+继续使用 `soundsContainer` 中现有的 `VST3` 入口作为选择入口。实际 global/track 内容按 P8.10 分别挂到宿主锚点，通过 GP 原生音轨/曲谱侧栏页面显示各自区域：
 
 - `当前音轨`：默认页，标题显示当前曲谱、音轨索引和可取得的音轨名称；GP 切换选中音轨后面板重新绑定该音轨的链。
 - `全局 Master`：与选中音轨无关，显示作用于 GP 主混音的全局链。
 
-稳定 objectName 规划为 `gpvst3ScopeTrackTab`、`gpvst3ScopeGlobalTab`、`gpvst3TrackChainList`、`gpvst3GlobalChainList`、`gpvst3AvailableList`、`gpvst3TrackVst3Section` 和 `gpvst3GlobalVst3Section`。若 GP 后续提供稳定的 Master 区域入口，可增加快捷入口，但不改变两个 scope 的状态模型。
+稳定 objectName 为 `gpvst3TrackChainList`、`gpvst3GlobalChainList`、`gpvst3AvailableList`、`gpvst3GlobalAvailableList`、`gpvst3TrackVst3Section` 和 `gpvst3GlobalVst3Section`。早期选择面板的 scope tabs 已由两个固定作用域容器替代。
 
 ### 列表布局
 
@@ -109,7 +109,7 @@
 
 每个 effect 保留现有的 `module`、`class_id`、名称/厂商、`enabled`、`component_state`、`controller_state`、参数和错误信息。`entry_id` 由规范化 module 路径和 class UID 组成，不能由显示名称组成。
 
-音轨 key 优先使用未来可取得的 GP 稳定 track ID；在没有稳定 ID 的首版使用 `score_key + track_index`，同时保存 `track_name` 作为诊断信息。音轨重排、曲谱切换和 key 不确定时不自动复用其他音轨的状态。
+sidecar 使用生成的持久化 track key；首次打开时按保存的唯一 `track_index` 关联记录，同一会话的增删/重排/撤销跟随原生 track ID。运行时 key 含 document ID，防止文档间共享实例；Save As 复制记录并复用现有实例。不能把进程内 UUID 当成跨进程永久 ID。
 
 schema 1 的顶层 `effects` 全部迁移到 `global.effects`，因为现有运行时 hook 已证实是 master 后处理。迁移保留数组顺序、启用状态和 opaque state，并写入一次迁移标记；不删除旧字段直到 schema 2 成功提交。
 
@@ -219,7 +219,7 @@ schema 1 的顶层 `effects` 全部迁移到 `global.effects`，因为现有运�
 
 涉及 `qt_ui.cpp/.h`、Qt 夹具。
 
-- 将单一 `P7Panel` 拆为 scope tabs、启用列表和可用列表的共享模型。
+- 将单一 `P7Panel` 拆为两个固定 scope 的容器，复用启用列表、可用列表及行组件。
 - 拖动只改变当前 scope 的 enabled 数组顺序；保存、运行时发布和 editor key 使用同一 entry order。
 - 刷新目录、切换音轨和后台识别完成时合并 catalog，不重置用户排序或启用意图。
 
@@ -236,7 +236,7 @@ schema 1 的顶层 `effects` 全部迁移到 `global.effects`，因为现有运�
 
 ## P8 补齐计划：六项回归问题（P8.7–P8.12）
 
-P8.1–P8.6 作为已有基础继续保留。P8.7、P8.9、P8.10、P8.11 已通过对应夹具和真实宿主对象树；P8.8 的真实音轨映射仍未通过，因此 P8.12 联调尚不能把整体状态改为完成。实现时继续保持未知音轨上下文旁路，避免把旁路状态伪装成可用功能。
+P8.1–P8.6 作为已有基础继续保留。P8.7–P8.11 的识别、生命周期、原生链、实际分区域内容和窄侧栏已有验收，P8.12 汇总最终交付结果。以下保留原始要求，未知上下文旁路与已验证的真实音轨路径分开记录。
 
 ### P8.7：识别中隐藏和 10 秒超时
 

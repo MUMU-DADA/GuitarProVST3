@@ -26,12 +26,25 @@ using namespace Steinberg;
 using namespace Steinberg::Vst;
 namespace {
 const FUID cid(0x10203040, 0x50607080, 0x11223344, 0x55667788);
+#ifdef P8_ORDER_FIXTURE
+const FUID orderIds[]{FUID(0x10203041, 0x50607080, 0x11223344, 0x55667788),
+                      FUID(0x10203042, 0x50607080, 0x11223344, 0x55667788),
+                      FUID(0x10203043, 0x50607080, 0x11223344, 0x55667788)};
+const char *orderNames[]{"P8 A Offset", "P8 B Gain", "P8 C Offset"};
+#endif
+std::atomic<unsigned long long> processSequence{0};
 class Gain final : public U::Implements<U::Directly<IComponent, IAudioProcessor, IEditController>> {
 public:
+    int operation = -1;
+    explicit Gain(int stage = -1) : operation(stage) {
+        if (stage >= 0) { controlValue = stage == 0 ? 0.125 : (stage == 1 ? 0.5 : 0.25); gain.store(controlValue); }
+    }
     IPtr<IComponentHandler> handler;
     double controlValue = 1.0;
     std::atomic<double> gain{1.0}, inputEnergy{0}, outputEnergy{0};
     std::atomic<unsigned long long> edits{0}, blocks{0};
+    std::atomic<unsigned long long> inputHash{0}, outputHash{0}, lastSequence{0};
+    std::atomic<double> firstInput{0}, firstOutput{0}, sampleRate{0};
     tresult PLUGIN_API initialize(FUnknown *) override { return kResultOk; }
     tresult PLUGIN_API terminate() override { handler = nullptr; return kResultOk; }
     tresult PLUGIN_API getControllerClassId(TUID) override { return kNoInterface; }
@@ -63,7 +76,7 @@ public:
     }
     tresult PLUGIN_API canProcessSampleSize(int32 size) override { return size == kSample32 ? kResultOk : kResultFalse; }
     uint32 PLUGIN_API getLatencySamples() override { return 0; }
-    tresult PLUGIN_API setupProcessing(ProcessSetup &setup) override { return canProcessSampleSize(setup.symbolicSampleSize); }
+    tresult PLUGIN_API setupProcessing(ProcessSetup &setup) override { sampleRate.store(setup.sampleRate); return canProcessSampleSize(setup.symbolicSampleSize); }
     tresult PLUGIN_API setProcessing(TBool) override { return kResultOk; }
     tresult PLUGIN_API process(ProcessData &data) override {
         double value = gain.load();
@@ -76,14 +89,24 @@ public:
         }
         if (data.numInputs != 1 || data.numOutputs != 1) return kInvalidArgument;
         double input = 0, output = 0;
+        unsigned long long ih = 1469598103934665603ULL, oh = ih;
+        const auto hashSample = [](unsigned long long &hash, float value) {
+            unsigned bits = 0; std::memcpy(&bits, &value, sizeof(bits));
+            hash = (hash ^ bits) * 1099511628211ULL;
+        };
         for (int c = 0; c < data.outputs[0].numChannels; ++c) for (int32 i = 0; i < data.numSamples; ++i) {
             const float sample = data.inputs[0].channelBuffers32[c][i];
-            const float processed = sample * static_cast<float>(value);
+            const float processed = operation == 0 || operation == 2 ? sample + static_cast<float>(value)
+                                                                     : sample * static_cast<float>(value);
             data.outputs[0].channelBuffers32[c][i] = processed;
             input += double(sample) * sample; output += double(processed) * processed;
+            hashSample(ih, sample); hashSample(oh, processed);
+            if (c == 0 && i == 0) { firstInput.store(sample); firstOutput.store(processed); }
         }
         inputEnergy.store(inputEnergy.load() + input); outputEnergy.store(outputEnergy.load() + output);
         blocks.fetch_add(1);
+        inputHash.store(ih); outputHash.store(oh);
+        lastSequence.store(processSequence.fetch_add(1) + 1);
         return kResultOk;
     }
     uint32 PLUGIN_API getTailSamples() override { return 0; }
@@ -125,6 +148,7 @@ public:
         auto *layout = new QVBoxLayout(widget);
         auto *gain = new QDoubleSpinBox(widget);
         gain->setObjectName("gpvst3TestGain"); gain->setRange(0, 1); gain->setSingleStep(0.25); gain->setValue(owner.controlValue);
+        gain->setDecimals(3);
         layout->addWidget(gain);
         auto *status = new QLabel(widget); status->setObjectName("gpvst3TestProcessor"); status->setWordWrap(true); layout->addWidget(status);
         QObject::connect(gain, QOverload<double>::of(&QDoubleSpinBox::valueChanged), widget, [this](double value) {
@@ -137,11 +161,19 @@ public:
             if (frame) frame->resizeView(this, &size);
             widget->window()->move(widget->window()->pos() + QPoint(50, 30));
         });
+        auto *reset = new QPushButton("Reset measurements", widget); reset->setObjectName("gpvst3TestReset"); layout->addWidget(reset);
+        QObject::connect(reset, &QPushButton::clicked, widget, [this] {
+            owner.blocks.store(0); owner.inputEnergy.store(0); owner.outputEnergy.store(0);
+        });
         auto *timer = new QTimer(widget);
         QObject::connect(timer, &QTimer::timeout, widget, [this, status] {
             status->setText(QString::fromUtf8(QJsonDocument(QJsonObject{
                 {"instance", QString::number(reinterpret_cast<quintptr>(&owner), 16)}, {"gain", owner.gain.load()},
                 {"edits", qint64(owner.edits.load())}, {"blocks", qint64(owner.blocks.load())},
+                {"operation", owner.operation}, {"sample_rate", owner.sampleRate.load()},
+                {"last_sequence", qint64(owner.lastSequence.load())},
+                {"input_hash", QString::number(owner.inputHash.load(), 16)}, {"output_hash", QString::number(owner.outputHash.load(), 16)},
+                {"first_input", owner.firstInput.load()}, {"first_output", owner.firstOutput.load()},
                 {"input_energy", owner.inputEnergy.load()}, {"output_energy", owner.outputEnergy.load()}}).toJson(QJsonDocument::Compact)));
         });
         timer->start(100); widget->resize(size.getWidth(), size.getHeight()); widget->show(); return kResultOk;
@@ -162,19 +194,41 @@ IPlugView *Gain::createView(FIDString) { return new View(*this); }
 class Factory final : public U::Implements<U::Directly<IPluginFactory2>> {
 public:
     tresult PLUGIN_API getFactoryInfo(PFactoryInfo *info) override { if (!info) return kInvalidArgument; *info = {}; std::strcpy(info->vendor, "GuitarProVST3 Test"); return kResultOk; }
-    int32 PLUGIN_API countClasses() override { return 1; }
+    int32 PLUGIN_API countClasses() override {
+#ifdef P8_ORDER_FIXTURE
+        return 3;
+#else
+        return 1;
+#endif
+    }
     tresult PLUGIN_API getClassInfo(int32 index, PClassInfo *info) override {
-        if (index || !info) return kInvalidArgument;
+        if (index < 0 || index >= countClasses() || !info) return kInvalidArgument;
+#ifdef P8_ORDER_FIXTURE
+        *info = {}; orderIds[index].toTUID(info->cid); std::strcpy(info->category, "Audio Module Class"); std::strcpy(info->name, orderNames[index]); return kResultOk;
+#else
         *info = {}; cid.toTUID(info->cid); std::strcpy(info->category, "Audio Module Class"); std::strcpy(info->name, "P7 Gain Fixture"); return kResultOk;
+#endif
     }
     tresult PLUGIN_API getClassInfo2(int32 index, PClassInfo2 *info) override {
-        if (index || !info) return kInvalidArgument;
+        if (index < 0 || index >= countClasses() || !info) return kInvalidArgument;
+#ifdef P8_ORDER_FIXTURE
+        *info = {}; orderIds[index].toTUID(info->cid); std::strcpy(info->category, "Audio Module Class"); std::strcpy(info->name, orderNames[index]); std::strcpy(info->subCategories, "Fx"); return kResultOk;
+#else
         *info = {}; cid.toTUID(info->cid); std::strcpy(info->category, "Audio Module Class"); std::strcpy(info->name, "P7 Gain Fixture"); std::strcpy(info->subCategories, "Fx"); return kResultOk;
+#endif
     }
     tresult PLUGIN_API createInstance(FIDString classId, FIDString iid, void **object) override {
+#ifdef P8_ORDER_FIXTURE
+        for (int index = 0; index < 3; ++index) if (FUnknownPrivate::iidEqual(classId, orderIds[index])) {
+            auto effect = Steinberg::owned(new Gain(index));
+            return effect->queryInterface(iid, object);
+        }
+        return kNoInterface;
+#else
         if (!FUnknownPrivate::iidEqual(classId, cid)) return kNoInterface;
         auto effect = Steinberg::owned(new Gain);
         return effect->queryInterface(iid, object);
+#endif
     }
 };
 }

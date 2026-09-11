@@ -8,12 +8,36 @@
 #include <QtCore/QJsonArray>
 #include <QtCore/QJsonDocument>
 #include <QtCore/QSaveFile>
+#include <QtCore/QHash>
+#include <QtCore/QSet>
+#include <QtCore/QUuid>
 #include <QtCore/QStandardPaths>
+#include <mutex>
+#include <algorithm>
 
 namespace gpvst3::state {
 namespace {
 
 constexpr int kLegacySchema = 1;
+
+struct RuntimeTrackContext {
+    QString score;
+    QString track;
+    QString trackId;
+    int index = -1;
+    bool available = false;
+};
+
+RuntimeTrackContext g_runtimeTrackContext;
+std::mutex g_runtimeTrackContextMutex;
+struct DocumentTracks {
+    QString score;
+    QHash<QString, QString> persistentKeys;
+};
+struct TrackLocation { QString score, key; int index = -1; };
+QHash<QString, DocumentTracks> g_documentTracks;
+QHash<QString, TrackLocation> g_trackLocations;
+QString g_identitySignature;
 
 bool writeJson(const QString &path, const QJsonObject &object) {
     const QFileInfo info(path);
@@ -183,14 +207,56 @@ bool writeChain(const QJsonObject &input) {
 }
 
 QString currentScoreKey() {
+    {
+        std::lock_guard<std::mutex> lock(g_runtimeTrackContextMutex);
+        if (g_runtimeTrackContext.available && !g_runtimeTrackContext.score.isEmpty())
+            return g_runtimeTrackContext.score;
+    }
     const auto configured = qEnvironmentVariable("GPVST3_SCORE_PATH");
     return configured.isEmpty() ? QStringLiteral("unspecified") : QFileInfo(configured).absoluteFilePath();
 }
 
 TrackKey currentTrackKey(const ScoreKey &score) {
+    {
+        std::lock_guard<std::mutex> lock(g_runtimeTrackContextMutex);
+        if (g_runtimeTrackContext.available &&
+            (score.isEmpty() || score == g_runtimeTrackContext.score) &&
+            !g_runtimeTrackContext.track.isEmpty())
+            return g_runtimeTrackContext.track;
+    }
     bool ok = false;
     const int track = qEnvironmentVariable("GPVST3_TRACK").toInt(&ok);
     return (score.isEmpty() ? currentScoreKey() : score) + QStringLiteral("#track-") + QString::number(ok ? track : 0);
+}
+
+void setRuntimeTrackContext(const ScoreKey &score, const TrackKey &track,
+                            int trackIndex, const QString &trackId) {
+    std::lock_guard<std::mutex> lock(g_runtimeTrackContextMutex);
+    g_runtimeTrackContext.score = score;
+    g_runtimeTrackContext.track = track;
+    g_runtimeTrackContext.trackId = trackId;
+    g_runtimeTrackContext.index = trackIndex;
+    g_runtimeTrackContext.available = !score.isEmpty() && !track.isEmpty() && trackIndex >= 0;
+}
+
+void clearRuntimeTrackContext() {
+    std::lock_guard<std::mutex> lock(g_runtimeTrackContextMutex);
+    g_runtimeTrackContext = {};
+}
+
+bool runtimeTrackContextAvailable() {
+    std::lock_guard<std::mutex> lock(g_runtimeTrackContextMutex);
+    return g_runtimeTrackContext.available;
+}
+
+int runtimeTrackIndex() {
+    std::lock_guard<std::mutex> lock(g_runtimeTrackContextMutex);
+    return g_runtimeTrackContext.index;
+}
+
+QString runtimeTrackId() {
+    std::lock_guard<std::mutex> lock(g_runtimeTrackContextMutex);
+    return g_runtimeTrackContext.trackId;
 }
 
 QJsonArray scopeEffects(const QJsonObject &input, ScopeKind scope, const ScoreKey &score,
@@ -198,8 +264,11 @@ QJsonArray scopeEffects(const QJsonObject &input, ScopeKind scope, const ScoreKe
     QJsonObject chain = input;
     migrateToSchema2(chain);
     if (scope == ScopeKind::Global) return chain.value("global").toObject().value("effects").toArray();
-    const auto scoreObject = chain.value("scores").toObject().value(score.isEmpty() ? currentScoreKey() : score).toObject();
-    return scoreObject.value("tracks").toObject().value(track.isEmpty() ? currentTrackKey(score) : track).toObject().value("effects").toArray();
+    const auto requested = track.isEmpty() ? currentTrackKey(score) : track;
+    const auto location = g_trackLocations.value(requested,
+        {score.isEmpty() ? currentScoreKey() : score, requested, -1});
+    const auto scoreObject = chain.value("scores").toObject().value(location.score).toObject();
+    return scoreObject.value("tracks").toObject().value(location.key).toObject().value("effects").toArray();
 }
 
 void setScopeEffects(QJsonObject &chain, ScopeKind scope, const QJsonArray &effects,
@@ -213,8 +282,12 @@ void setScopeEffects(QJsonObject &chain, ScopeKind scope, const QJsonArray &effe
         chain.insert("effects", scopeObject.value("effects"));
         return;
     }
-    const auto scoreKey = score.isEmpty() ? currentScoreKey() : score;
-    const auto trackKey = track.isEmpty() ? currentTrackKey(scoreKey) : track;
+    const auto requested = track.isEmpty() ? currentTrackKey(score) : track;
+    const auto location = g_trackLocations.value(requested,
+        {score.isEmpty() ? currentScoreKey() : score, requested, trackIndex});
+    const auto scoreKey = location.score;
+    const auto trackKey = location.key;
+    if (location.index >= 0) trackIndex = location.index;
     auto scores = chain.value("scores").toObject();
     auto scoreObject = scores.value(scoreKey).toObject();
     auto tracks = scoreObject.value("tracks").toObject();
@@ -229,6 +302,88 @@ void setScopeEffects(QJsonObject &chain, ScopeKind scope, const QJsonArray &effe
     // Compatibility view used by P5/P7 readers follows the currently active
     // track scope. The canonical data remains under scores.
     chain.insert("effects", scopeObject.value("effects"));
+}
+
+bool reconcileTrackIdentities(std::vector<HostTrackIdentity> &bindings) {
+    // Called only on the Qt control thread, alongside UI state writes.
+    QStringList parts;
+    for (const auto &binding : bindings)
+        parts.append(binding.documentId + '\n' + binding.scoreKey + '\n' +
+                     binding.trackId + '\n' + QString::number(binding.index));
+    parts.removeDuplicates();
+    parts.sort();
+    const auto signature = parts.join('\t');
+    if (signature != g_identitySignature) {
+        QJsonObject chain;
+        if (!loadChain(chain)) return false;
+        auto sessions = g_documentTracks;
+        auto locations = g_trackLocations;
+        auto scores = chain.value("scores").toObject();
+        QSet<QString> documents;
+        for (const auto &binding : bindings) documents.insert(binding.documentId);
+        for (const auto &documentId : documents) {
+            if (documentId.isEmpty()) continue;
+            const bool reopened = !sessions.contains(documentId);
+            auto &session = sessions[documentId];
+            const auto first = std::find_if(bindings.begin(), bindings.end(),
+                [&](const HostTrackIdentity &binding) { return binding.documentId == documentId; });
+            const auto scoreKey = first->scoreKey;
+            if (!session.score.isEmpty() && session.score != scoreKey) {
+                // Save As keeps the live identity and copies state to the new
+                // score. The previous saved file retains its own record.
+                scores.insert(scoreKey, scores.value(session.score));
+            }
+            session.score = scoreKey;
+            auto score = scores.value(scoreKey).toObject();
+            auto tracks = score.value("tracks").toObject();
+            const auto previous = tracks;
+            for (auto it = tracks.begin(); it != tracks.end(); ++it) {
+                auto record = it.value().toObject();
+                record.insert("present", false);
+                it.value() = record;
+            }
+            for (const auto &binding : bindings) {
+                if (binding.documentId != documentId || binding.trackId.isEmpty() || binding.index < 0) continue;
+                auto key = session.persistentKeys.value(binding.trackId);
+                if (key.isEmpty() && reopened) {
+                    QStringList candidates;
+                    for (auto it = previous.begin(); it != previous.end(); ++it) {
+                        const auto record = it.value().toObject();
+                        if (record.value("present").toBool(true) && record.value("track_index").toInt(-1) == binding.index)
+                            candidates.append(it.key());
+                    }
+                    if (candidates.size() == 1 && !session.persistentKeys.values().contains(candidates.front()))
+                        key = candidates.front();
+                }
+                if (key.isEmpty()) key = QStringLiteral("track-") + QUuid::createUuid().toString(QUuid::WithoutBraces);
+                session.persistentKeys.insert(binding.trackId, key);
+                auto record = tracks.value(key).toObject();
+                record.insert("track_index", binding.index);
+                record.insert("present", true);
+                tracks.insert(key, record);
+                locations.insert(documentId + '#' + key, {scoreKey, key, binding.index});
+            }
+            score.insert("tracks", tracks);
+            scores.insert(scoreKey, score);
+        }
+        chain.insert("scores", scores);
+        if (!writeChain(chain)) return false;
+        g_documentTracks = std::move(sessions);
+        g_trackLocations = std::move(locations);
+        g_identitySignature = signature;
+    }
+    for (auto &binding : bindings) {
+        const auto key = g_documentTracks.value(binding.documentId).persistentKeys.value(binding.trackId);
+        if (key.isEmpty()) return false;
+        binding.runtimeKey = binding.documentId + '#' + key;
+    }
+    return true;
+}
+
+void resetTrackIdentities() {
+    g_documentTracks.clear();
+    g_trackLocations.clear();
+    g_identitySignature.clear();
 }
 
 bool writeStatus(const QJsonObject &input) {

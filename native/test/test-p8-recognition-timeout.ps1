@@ -7,7 +7,9 @@ New-Item -ItemType Directory -Force -Path $OutputRoot | Out-Null
 $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio/Installer/vswhere.exe'
 $vsInstall = & $vswhere -latest -products '*' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
 Import-Module (Join-Path $vsInstall 'Common7/Tools/Microsoft.VisualStudio.DevShell.dll')
-Enter-VsDevShell -VsInstallPath $vsInstall -SkipAutomaticLocation -DevCmdArguments '-arch=x64 -host_arch=x64'
+if ($env:VSCMD_ARG_TGT_ARCH -ne 'x64' -or -not (Get-Command cl.exe -ErrorAction SilentlyContinue)) {
+    Enter-VsDevShell -VsInstallPath $vsInstall -SkipAutomaticLocation -DevCmdArguments '-arch=x64 -host_arch=x64'
+}
 $include = @("/I$(Join-Path $QtDir 'include')", "/I$(Join-Path $QtDir 'include/QtCore')", "/I$(Join-Path $root 'native/modules')")
 $sources = @((Join-Path $root 'native/modules/state_manager.cpp'), (Join-Path $root 'native/modules/vst3_catalog.cpp'), (Join-Path $PSScriptRoot 'p8_recognition_timeout_test.cpp'))
 $exe = Join-Path $OutputRoot 'p8_recognition_timeout_test.exe'

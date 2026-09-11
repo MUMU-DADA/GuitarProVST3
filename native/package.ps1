@@ -1,6 +1,6 @@
 param(
     [ValidatePattern('^\d+\.\d+\.\d+([-.][A-Za-z0-9.]+)?$')]
-    [string]$Version = '0.6.0',
+    [string]$Version = '0.8.0',
     [string]$PluginPath = '',
     [string]$OutputDirectory = ''
 )
@@ -24,6 +24,7 @@ Copy-Item -LiteralPath (Join-Path $root 'native/vst3-autoload.json') -Destinatio
 Copy-Item -LiteralPath (Join-Path $root 'native/host_manifest.json') -Destination (Join-Path $staging 'config/host_manifest.json')
 Copy-Item -LiteralPath (Join-Path $root 'native/effect-chain.template.json') -Destination (Join-Path $staging 'config/effect-chain.template.json')
 Copy-Item -LiteralPath (Join-Path $root 'docs/INSTALL.md'), (Join-Path $root 'docs/P0_IMPLEMENTATION.md'), (Join-Path $root 'docs/P6_IMPLEMENTATION.md'), (Join-Path $root 'docs/P7_IMPLEMENTATION.md'), (Join-Path $root 'LICENSE') -Destination (Join-Path $staging 'docs')
+Copy-Item -LiteralPath (Join-Path $root 'docs/P8_IMPLEMENTATION.md'), (Join-Path $root 'docs/P8_TRACK_GLOBAL_VST3_PLAN.md'), (Join-Path $root 'docs/REALTIME_IMPLEMENTATION_PLAN.md') -Destination (Join-Path $staging 'docs')
 Copy-Item -LiteralPath (Join-Path $root 'third_party/vst3sdk/LICENSE.txt') -Destination (Join-Path $staging 'docs/VST3-SDK-LICENSE.txt')
 Copy-Item -LiteralPath (Join-Path $root 'native/install.ps1'), (Join-Path $root 'native/uninstall.ps1') -Destination $staging
 

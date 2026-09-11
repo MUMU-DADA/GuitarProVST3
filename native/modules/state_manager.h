@@ -3,6 +3,7 @@
 #include <QtCore/QJsonObject>
 #include <QtCore/QJsonArray>
 #include <QtCore/QString>
+#include <vector>
 
 namespace gpvst3::state {
 
@@ -23,6 +24,24 @@ void setScopeEffects(QJsonObject &chain, ScopeKind scope, const QJsonArray &effe
                      int trackIndex = -1, const QString &trackName = {});
 QString currentScoreKey();
 TrackKey currentTrackKey(const ScoreKey &score = {});
+// Runtime context published by the verified GuitarProMCP bridge. The
+// environment variables remain a fixture fallback when no host document is
+// connected.
+void setRuntimeTrackContext(const ScoreKey &score, const TrackKey &track,
+                            int trackIndex, const QString &trackId);
+void clearRuntimeTrackContext();
+bool runtimeTrackContextAvailable();
+int runtimeTrackIndex();
+QString runtimeTrackId();
+struct HostTrackIdentity {
+    QString documentId, scoreKey, trackId;
+    int index = -1;
+    TrackKey runtimeKey;
+};
+// Resolve session identities to sidecar records. Index is used only when a
+// document is first opened; subsequent inserts, moves and undo follow trackId.
+bool reconcileTrackIdentities(std::vector<HostTrackIdentity> &tracks);
+void resetTrackIdentities();
 bool writeStatus(const QJsonObject &status);
 bool writeRealtimeObservation(const QJsonObject &hookStatus);
 

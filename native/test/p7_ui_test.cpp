@@ -49,7 +49,7 @@ int main(int argc, char **argv) {
     gpvst3::ui::setVst3Catalog(catalog);
     gpvst3::ui::showEffectChainPanel(false);
     QCoreApplication::processEvents();
-    auto *panel = qApp->property("gpvst3P5Panel").value<QWidget *>();
+    auto *panel = qApp->property("gpvst3GlobalPanel").value<QWidget *>();
     if (!check(panel != nullptr, "P7 panel created")) return 1;
     if (!check(!panel->isVisible(), "P7 panel does not pop up at startup")) return 1;
     if (!check(panel->findChildren<QCheckBox *>().size() == 2, "catalog rows created")) return 1;
@@ -69,15 +69,16 @@ int main(int argc, char **argv) {
     auto *first = panel->findChildren<QCheckBox *>().first();
     first->setChecked(true);
     QCoreApplication::processEvents();
+    first = panel->findChild<QCheckBox *>("gpvst3GlobalEnabled_ONE");
     QJsonObject saved;
     if (!check(gpvst3::state::loadChain(saved), "load P7 sidecar")) return 1;
     const auto effect = saved.value("effects").toArray().first().toObject();
     if (!check(effect.value("enabled").toBool() && !effect.value("bypass").toBool(),
                "checked means enabled")) return 1;
     gpvst3::ui::setVst3SelectionControl(&rejectSelection);
-    auto *second = panel->findChild<QCheckBox *>("gpvst3Enabled_TWO");
+    auto *second = panel->findChild<QCheckBox *>("gpvst3GlobalEnabled_TWO");
     second->setChecked(true);
-    auto *status = panel->findChild<QLabel *>("gpvst3Status");
+    auto *status = panel->findChild<QLabel *>("gpvst3GlobalStatus");
     if (!check(!second->isChecked() && first->isChecked() &&
                    status->text().contains(QStringLiteral("兼容性校验")) &&
                    status->toolTip() == QStringLiteral("host_unsupported"),
@@ -86,7 +87,7 @@ int main(int argc, char **argv) {
                    !saved.value("effects").toArray().at(1).toObject().value("enabled").toBool(),
                "rejected selection is not persisted as enabled")) return 1;
     gpvst3::ui::setVst3SelectionControl(nullptr);
-    panel->findChild<QPushButton *>("gpvst3Editor_ONE")->click();
+    panel->findChild<QPushButton *>("gpvst3GlobalEditor_ONE")->click();
     QCoreApplication::processEvents();
     bool hostLimited = false;
     for (auto *label : panel->findChildren<QLabel *>())
@@ -94,7 +95,7 @@ int main(int argc, char **argv) {
     if (!check(hostLimited, "native editor boundary is explicit")) return 1;
 
     gpvst3::ui::setVst3EditorControl(&openEditor, &closeEditor);
-    panel->findChild<QPushButton *>("gpvst3Editor_ONE")->click();
+    panel->findChild<QPushButton *>("gpvst3GlobalEditor_ONE")->click();
     QWidget *window = nullptr;
     for (auto *widget : QApplication::topLevelWidgets())
         if (widget->objectName() == "gpvst3NativeEditorWindow") window = widget;
@@ -102,17 +103,23 @@ int main(int argc, char **argv) {
                    window->size() == QSize(640, 480) && window->parentWidget() != panel,
                "native view has an independent correctly sized nonmodal window")) return 1;
     const auto panelSize = panel->size();
-    panel->findChild<QPushButton *>("gpvst3Editor_ONE")->click();
+    panel->findChild<QPushButton *>("gpvst3GlobalEditor_ONE")->click();
     if (!check(opens == 1 && window->size() == QSize(640, 480), "repeated open reuses view")) return 1;
     window->move(100, 120);
     if (!check(panel->size() == panelSize, "moving editor leaves selector layout unchanged")) return 1;
     window->close();
     if (!check(!window->isVisible() && first->isChecked(), "closing editor keeps effect enabled")) return 1;
-    panel->findChild<QPushButton *>("gpvst3Editor_ONE")->click();
+    panel->findChild<QPushButton *>("gpvst3GlobalEditor_ONE")->click();
 
     QWidget soundHost;
     soundHost.setObjectName(QStringLiteral("soundsContainer"));
     soundHost.setLayout(new QVBoxLayout);
+    auto *source = new QLabel(QStringLiteral("音源效果器"), &soundHost);
+    source->setObjectName(QStringLiteral("gpNativeInstrumentEffects"));
+    soundHost.layout()->addWidget(source);
+    auto *master = new QLabel(QStringLiteral("母带后期处理"), &soundHost);
+    master->setObjectName(QStringLiteral("gpMasterPostProcessing"));
+    soundHost.layout()->addWidget(master);
     soundHost.show();
     for (auto *timer : qApp->findChildren<QTimer *>()) timer->setInterval(0);
     QCoreApplication::processEvents(QEventLoop::AllEvents, 50);
@@ -125,18 +132,21 @@ int main(int argc, char **argv) {
     auto *entry = soundHost.findChild<QPushButton *>("gpvst3SoundEffectChainButton");
     entry->click();
     QCoreApplication::processEvents();
-    auto *opened = qApp->property("gpvst3P5Panel").value<QWidget *>();
+    auto *opened = qApp->property("gpvst3GlobalPanel").value<QWidget *>();
     if (!check(opened != nullptr && opened->isVisible(),
                "entry opens the existing panel")) return 1;
     panel->close();
     if (!check(window->isVisible(), "selector close keeps editor alive")) return 1;
     QCoreApplication::sendPostedEvents(nullptr, QEvent::DeferredDelete);
-    if (!check(qApp->property("gpvst3P5Panel").value<QWidget *>() == nullptr,
-               "closed selector is actually destroyed before reopening")) return 1;
+    if (!check(!panel->isVisible(), "closed section remains collapsed")) return 1;
+    delete panel->parentWidget(); // A real sidebar rebuild destroys the owned section.
+    if (!check(qApp->property("gpvst3GlobalPanel").value<QWidget *>() == nullptr,
+               "sidebar destruction releases the global content")) return 1;
     QCoreApplication::processEvents(QEventLoop::AllEvents, 50);
     entry->click();
-    auto *reopened = qApp->property("gpvst3P5Panel").value<QWidget *>();
-    if (!check(reopened != nullptr && reopened->isVisible() && reopened->parentWidget() == &soundHost,
+    auto *reopened = qApp->property("gpvst3GlobalPanel").value<QWidget *>();
+    if (!check(reopened != nullptr && reopened->isVisible() &&
+               reopened->parentWidget()->objectName() == "gpvst3GlobalVst3Section",
                "one click synchronously recreates and shows selector after close")) return 1;
     if (!check(window->isVisible(), "selector rebuild keeps editor alive")) return 1;
     for (const auto &state : {QString("scanning"), QString("partial_failure"), QString("scan_failed"), QString("catalog_ready")}) {

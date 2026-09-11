@@ -7,8 +7,12 @@
 
 #include "input_router.h"
 #include "host_lock.h"
+#include <QtCore/QJsonArray>
 
 namespace gpvst3::hook {
+
+void setVst3Catalog(const QJsonArray &catalog);
+void saveVst3States();
 
 struct Vst3SelectionEntry {
     std::string module;
@@ -35,7 +39,21 @@ struct EntryPointObservation {
     std::uint64_t afterHash = 0;
 };
 
+struct TrackRuntimeEvidence {
+    std::string trackKey;
+    std::string trackId;
+    std::size_t processBlocks = 0;
+    std::size_t processedBlocks = 0;
+    std::size_t bypassBlocks = 0;
+    std::size_t errorBlocks = 0;
+    std::size_t configuredEffects = 0;
+    bool configured = false;
+    bool processed = false;
+    bool writeObserved = false;
+};
+
 struct State {
+    std::string trackBindingSource;
     bool installed = false;
     bool enabled = false;
     bool hostSupported = false;
@@ -76,6 +94,12 @@ struct State {
     bool globalChainEnabled = false;
     std::size_t globalChainProcessBlocks = 0;
     std::size_t trackChainProcessBlocks = 0;
+    std::size_t trackChainProcessedBlocks = 0;
+    std::size_t trackBindingsPublished = 0;
+    bool trackRuntimeProcessed = false;
+    bool trackRuntimeWriteObserved = false;
+    std::string trackRuntimeError;
+    std::vector<TrackRuntimeEvidence> trackRuntimeEvidence;
     bool trackContextObserved = false;
     bool trackContextStable = false;
     bool trackScopeUnresolved = true;
@@ -95,6 +119,13 @@ struct State {
     std::size_t audioLayerBufferSize = 0;
     bool inputCapturePathLocated = false;
     bool inputCaptureObserved = false;
+    std::size_t inputAfterOriginalBlocks = 0;
+    std::uint64_t inputPostOriginalHash = 0;
+    std::uint64_t inputPostRouteHash = 0;
+    bool inputOrderSamplesObserved = false;
+    float inputOrderCaptureSample = 0.0F;
+    float inputOrderGeneratedSample = 0.0F;
+    float inputOrderOutputSample = 0.0F;
     bool inputRouteEnabled = false;
     bool inputProcessorReady = false;
     std::string inputRoute = "disabled";
@@ -145,6 +176,12 @@ struct State {
 State prepare(const host::Verification &verification, bool enableForSelection = false) noexcept;
 State snapshot() noexcept;
 void shutdown() noexcept;
+// Refresh the verified GuitarProMCP EffectsChain -> track binding table on
+// the Qt/control thread. The audio callback only consumes its atomics.
+void refreshTrackContext() noexcept;
+// Control-thread notification after a failed restored/running entry was
+// persisted as disabled; the UI reloads the actual accepted selection.
+bool consumeSelectionStateChanges() noexcept;
 
 // Thread-safe control used by the Qt panel. It only changes an atomic bypass
 // flag; processor creation and destruction remain on the worker thread.
@@ -168,6 +205,8 @@ std::vector<Vst3SelectionEntry> captureTrackVst3States(const std::string &trackK
 // Open the editor owned by the currently active processing instance. The
 // caller supplies a native Windows child HWND created on the Qt UI thread.
 bool openVst3Editor(const Vst3SelectionEntry &entry, void *parentWindow) noexcept;
+bool openTrackVst3Editor(const std::string &trackKey, const Vst3SelectionEntry &entry,
+                         void *parentWindow) noexcept;
 void closeVst3Editors() noexcept;
 void scaleVst3Editor(void *host, double scale) noexcept;
 

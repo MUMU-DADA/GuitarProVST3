@@ -1,4 +1,4 @@
-﻿param(
+param(
     [string]$HostDirectory = 'C:\Program Files\Arobas Music\Guitar Pro 8',
     [string]$McpRoot = 'C:\Users\mumu\source\GuitarProMCP',
     [string]$PluginPath = '',
@@ -16,7 +16,7 @@ $ErrorActionPreference = 'Stop'
 function Set-P7SoundSection($Session, $Restore = $null) {
     Invoke-McpTool $Session gp_window @{state='restore'} | Out-Null
     $previous = @{}
-    foreach ($name in @('actionShowInspector', 'tabTrackButton')) {
+    foreach ($name in @('tabScoreButton')) {
         $query = Invoke-McpTool $Session gp_objects @{query=$name;limit=10}
         $target = @($query.objects | Where-Object object_name -EQ $name)[0]
         if (-not $target) { throw "Sound-section control was not found: $name" }
@@ -104,12 +104,32 @@ try {
         $operation = Invoke-McpTool $session gp_operation @{request=$opened.request}
     } while ($operation.operation.status -notin @('opened','error','cancelled') -and [DateTime]::UtcNow -lt $openDeadline)
     if ($operation.operation.status -ne 'opened') { throw "P7 MCP fixture did not open: $($operation | ConvertTo-Json -Depth 12 -Compress)" }
+    # Use a real RSE template with audible notes; changing AudioEngineState
+    # alone does not create a native instrument sound for every minimal file.
+    $created = Invoke-McpTool $session gp_new @{template='Steel Guitar'}
+    $deadline = [DateTime]::UtcNow.AddSeconds(20)
+    do {
+        Start-Sleep -Milliseconds 100
+        $operation = Invoke-McpTool $session gp_operation @{request=$created.request}
+    } while ($operation.operation.status -notin @('created','error','cancelled') -and [DateTime]::UtcNow -lt $deadline)
+    if ($operation.operation.status -ne 'created') { throw 'P7 RSE template did not create a document.' }
+    $riff = Invoke-McpTool $session gp_insert_tab @{document=$operation.operation.document;track=0;string=0;bar=0;text='0-2-5-7';mode='replace';denominator=4}
+    $deadline = [DateTime]::UtcNow.AddSeconds(20)
+    do { Start-Sleep -Milliseconds 100; $riffState = Invoke-McpTool $session gp_operation @{request=$riff.request} }
+    while ($riffState.operation.status -notin @('applied','error','cancelled') -and [DateTime]::UtcNow -lt $deadline)
+    if ($riffState.operation.status -ne 'applied') { throw 'P7 audible riff was not applied.' }
+    $fixture = Join-Path $run 'p7-playback.gp'
+    $save = Invoke-McpTool $session gp_save_as @{document=$operation.operation.document;path=$fixture}
+    $deadline = [DateTime]::UtcNow.AddSeconds(20)
+    do { Start-Sleep -Milliseconds 100; $saveState = Invoke-McpTool $session gp_operation @{request=$save.request} }
+    while ($saveState.operation.status -notin @('saved','error','cancelled') -and [DateTime]::UtcNow -lt $deadline)
+    if ($saveState.operation.status -ne 'saved') { throw 'P7 playback fixture was not saved.' }
     Invoke-McpTool $session gp_activate @{document=$operation.operation.document} | Out-Null
-    if ($CheckCatalogRestart) { $soundSectionBefore = Set-P7SoundSection $session }
     $scanDeadline = [DateTime]::UtcNow.AddSeconds(90)
     do {
         $scan = Get-Content -LiteralPath $statusPath -Raw | ConvertFrom-Json
-        if (-not $scan.vst3_host.scan_pending -and $scan.vst3_host.status -ne 'scanning') { break }
+        if (-not $scan.vst3_host.scan_pending -and -not $scan.vst3_host.recognition_pending -and $scan.vst3_host.status -ne 'scanning' -and
+            -not @($scan.vst3_catalog | Where-Object { $_.recognition_status -in @('queued','running') }).Count) { break }
         Start-Sleep -Milliseconds 250
         $process.Refresh()
         if ($process.HasExited) { throw 'Guitar Pro exited during P7 catalog scan.' }
@@ -121,8 +141,9 @@ try {
         throw 'Default/disabled startup must remain unpatched and bypassed before a selection.'
     }
     Start-Sleep -Milliseconds 500
+    $soundSectionBefore = Set-P7SoundSection $session
     $sound = Invoke-McpTool $session gp_objects @{query='soundsContainer';limit=30}
-    $panel = Invoke-McpTool $session gp_objects @{query='gpvst3P7Panel';limit=30}
+    $panel = Invoke-McpTool $session gp_objects @{query='gpvst3GlobalPanel';limit=30}
     $entry = Invoke-McpTool $session gp_objects @{query='gpvst3SoundEffectChainButton';limit=30}
     $result = [ordered]@{
         identity = $identity
@@ -142,56 +163,45 @@ try {
     $panelDeadline = [DateTime]::UtcNow.AddSeconds(5)
     do {
         Start-Sleep -Milliseconds 100
-        $panelAfter = Invoke-McpTool $session gp_objects @{query='gpvst3P7Panel';limit=30}
-        $panelObject = @($panelAfter.objects | Where-Object object_name -EQ 'gpvst3P7Panel') | Select-Object -First 1
-    } while ((!$panelObject -or $panelObject.parent_name -ne 'soundsContainer') -and [DateTime]::UtcNow -lt $panelDeadline)
+        $panelAfter = Invoke-McpTool $session gp_objects @{query='gpvst3GlobalPanel';limit=30}
+        $panelObject = @($panelAfter.objects | Where-Object object_name -EQ 'gpvst3GlobalPanel') | Select-Object -First 1
+    } while ((!$panelObject -or $panelObject.parent_name -ne 'gpvst3GlobalVst3Section') -and [DateTime]::UtcNow -lt $panelDeadline)
     $result.panel_after = $panelAfter
     $result.cold_list_open_ms = $panelClock.ElapsedMilliseconds
     if (-not $panelObject) { throw 'P7 panel was not found after opening the sound-section entry.' }
-    if ($panelObject.parent_name -ne 'soundsContainer') {
-        throw "P7 panel is not a direct child of soundsContainer: $($panelObject | ConvertTo-Json -Depth 12 -Compress)"
+    if ($panelObject.parent_name -ne 'gpvst3GlobalVst3Section') {
+        throw "P7 panel is not mounted inside the global section: $($panelObject | ConvertTo-Json -Depth 12 -Compress)"
     }
-    if ($CheckCatalogRestart -and (-not $entryObject.visible -or -not $panelObject.visible)) {
-        throw 'Cold default-directory entry or panel was hidden after restoring the GP window.'
+    $anchor = (Invoke-McpTool $session gp_objects @{query='soundMastering';limit=10}).objects | Where-Object object_name -eq 'soundMastering'
+    $section = (Invoke-McpTool $session gp_objects @{query='gpvst3GlobalVst3Section';limit=10}).objects | Where-Object object_name -eq 'gpvst3GlobalVst3Section'
+    if (-not $panelObject.visible -or -not $anchor.visible -or -not $section.visible -or
+        $section.parent_name -ne $anchor.parent_name -or $section.properties.y -lt ($anchor.properties.y + $anchor.properties.height)) {
+        throw 'Global content is not visible after the native mastering controls.'
     }
     $result.trigger = $trigger
     if ($scan.vst3_host.modules_loaded -ne 0 -or $scan.vst3_host.instances_created -ne 0) {
-        throw 'Startup discovery executed third-party code.'
+        throw 'Static scan counters unexpectedly contain module loads or processor creation.'
     }
     $requested = @()
     foreach ($modulePath in $vst3Paths) {
-        $candidate = @($scan.vst3_catalog | Where-Object { [IO.Path]::GetFullPath($_.module) -ieq [IO.Path]::GetFullPath($modulePath) })[0]
-        if (-not $candidate) { throw "Static candidate not found: $modulePath" }
-        if (-not $candidate.class_id) {
-            $sha = [Security.Cryptography.SHA256]::Create()
-            try { $token = ([BitConverter]::ToString($sha.ComputeHash([Text.Encoding]::UTF8.GetBytes($candidate.module)))).Replace('-','').ToLower().Substring(0,16) }
-            finally { $sha.Dispose() }
-            $query = Invoke-McpTool $session gp_objects @{query=("gpvst3Identify_" + $token);limit=10}
-            $target = @($query.objects)[0]
-            Invoke-McpTool $session gp_set_property @{snapshot=$query.snapshot;id=$target.id;property='checked';value=$true} | Out-Null
-            Start-Sleep -Seconds 2
-            if ($HookMode -eq 'disabled') {
-                $checkbox = $target
-                $checkboxes = $query
-                break
-            }
-            $saved = Get-Content -LiteralPath (Join-Path $dataDirectory 'effect-chain.json') -Raw | ConvertFrom-Json
-            $candidate = @($saved.effects | Where-Object { [IO.Path]::GetFullPath($_.module) -ieq [IO.Path]::GetFullPath($modulePath) -and $_.class_id })[0]
-            if (-not $candidate) { throw "Requested identification failed: $modulePath" }
-            $query = Invoke-McpTool $session gp_objects @{query=("gpvst3Enabled_" + $candidate.class_id);limit=10}
-            Invoke-McpTool $session gp_set_property @{snapshot=$query.snapshot;id=@($query.objects)[0].id;property='checked';value=$false} | Out-Null
-            Start-Sleep -Milliseconds 300
-        }
+        $identifyDeadline = [DateTime]::UtcNow.AddSeconds(20)
+        do {
+            $scan = Get-Content -LiteralPath $statusPath -Raw | ConvertFrom-Json
+            $candidate = @($scan.vst3_catalog | Where-Object { [IO.Path]::GetFullPath($_.module) -ieq [IO.Path]::GetFullPath($modulePath) -and $_.class_id -and $_.recognition_status -eq 'ready' })[0]
+            if ($candidate) { break }
+            Start-Sleep -Milliseconds 200
+        } while ([DateTime]::UtcNow -lt $identifyDeadline)
+        if (-not $candidate) { throw "Background identification did not publish a ready audio class: $modulePath" }
         $requested += $candidate
     }
-    if ($HookMode -ne 'disabled') {
+    if ($requested.Count -ge 2) {
         $firstClass = $requested[0]
         $secondClass = $requested[1]
-        $checkboxes = Invoke-McpTool $session gp_objects @{query='gpvst3Enabled';limit=100}
-        $checkbox = @($checkboxes.objects | Where-Object object_name -EQ ("gpvst3Enabled_" + $firstClass.class_id))[0]
-        $secondCheckbox = @($checkboxes.objects | Where-Object object_name -EQ ("gpvst3Enabled_" + $secondClass.class_id))[0]
+        $checkboxes = Invoke-McpTool $session gp_objects @{query='gpvst3GlobalEnabled';limit=100}
+        $checkbox = @($checkboxes.objects | Where-Object object_name -EQ ("gpvst3GlobalEnabled_" + $firstClass.class_id))[0]
+        $secondCheckbox = @($checkboxes.objects | Where-Object object_name -EQ ("gpvst3GlobalEnabled_" + $secondClass.class_id))[0]
         if (-not $checkbox -or -not $secondCheckbox) { throw 'Identified checkbox not found.' }
-    }
+    } else { throw 'P7 regression requires two distinct ready test plugins.' }
     $result.checkbox_before = @($checkbox,$secondCheckbox)
     $freshFirst = Invoke-McpTool $session gp_objects @{query=$checkbox.object_name;limit=10}
     $setFirst = Invoke-McpTool $session gp_set_property @{
@@ -202,7 +212,7 @@ try {
     }
     if ($HookMode -eq 'disabled') {
         $after = Invoke-McpTool $session gp_objects @{query=$checkbox.object_name;limit=10}
-        $notice = Invoke-McpTool $session gp_objects @{query='gpvst3Status';limit=10}
+        $notice = Invoke-McpTool $session gp_objects @{query='gpvst3GlobalStatus';limit=10}
         $result.disabled_selection = $after
         $result.disabled_notice = $notice
         $noticeJson = $notice | ConvertTo-Json -Depth 12 -Compress
@@ -210,7 +220,7 @@ try {
             throw "Disabled hook failure did not explain the actual cause: $noticeJson"
         }
         $persisted = Get-Content -LiteralPath (Join-Path $dataDirectory 'effect-chain.json') -Raw | ConvertFrom-Json
-        if (@($persisted.effects | Where-Object enabled).Count) { throw 'Rejected selection was saved as enabled.' }
+        if (@($persisted.global.effects | Where-Object enabled).Count) { throw 'Rejected selection was saved as enabled.' }
         $result | ConvertTo-Json -Depth 30 | Set-Content -LiteralPath (Join-Path $run 'verification.json') -Encoding UTF8
         Write-Output "PASS: P7 explicitly disabled hook rejects selection with its actual cause. Evidence: $run"
         return
@@ -229,7 +239,7 @@ try {
         $hook.chain_active_slot -lt 0 -or $hook.total_bypass -or -not $hook.runtime_process_observed) {
         throw "P7 checked selection did not produce one live processor: $($hook | ConvertTo-Json -Depth 12 -Compress)"
     }
-    $checkboxes2 = Invoke-McpTool $session gp_objects @{query='gpvst3Enabled';limit=30}
+    $checkboxes2 = Invoke-McpTool $session gp_objects @{query='gpvst3GlobalEnabled';limit=30}
     $second2 = @($checkboxes2.objects | Where-Object object_name -EQ $secondCheckbox.object_name)[0]
     $setSecond = Invoke-McpTool $session gp_set_property @{
         snapshot=$checkboxes2.snapshot
@@ -245,10 +255,10 @@ try {
         $twoObservation.gp_hook.chain_active_slot -lt 0 -or $twoObservation.gp_hook.total_bypass) {
         throw "P7 two-item selection did not produce a live serial chain: $($twoObservation.gp_hook | ConvertTo-Json -Depth 12 -Compress)"
     }
-    $classId = ([string]$checkbox.object_name) -replace '^gpvst3Enabled_', ''
-    $selectorBefore = Invoke-McpTool $session gp_objects @{query="gpvst3P7Panel";limit=10}
-    $result.selector_before_editor = @($selectorBefore.objects | Where-Object object_name -EQ "gpvst3P7Panel")[0].properties
-    $editorButtons = Invoke-McpTool $session gp_objects @{query=("gpvst3Editor_$classId");limit=10}
+    $classId = ([string]$checkbox.object_name) -replace '^gpvst3GlobalEnabled_', ''
+    $selectorBefore = Invoke-McpTool $session gp_objects @{query="gpvst3GlobalPanel";limit=10}
+    $result.selector_before_editor = @($selectorBefore.objects | Where-Object object_name -EQ "gpvst3GlobalPanel")[0].properties
+    $editorButtons = Invoke-McpTool $session gp_objects @{query=("gpvst3GlobalEditor_$classId");limit=10}
     if (@($editorButtons.objects).Count -eq 0) { throw 'P7 native editor button was not found.' }
     $editorButton = @($editorButtons.objects)[0]
     $result.editor_button = $editorButton
@@ -266,8 +276,8 @@ try {
     if (-not $editorWindow.visible -or $editorWindow.kind -ne 'window' -or $editorWindow.modality -ne 'non_modal' -or
         $editorWindow.geometry.width -lt 100 -or $editorWindow.geometry.height -lt 100) { throw 'Native editor is not a visible independent nonmodal window.' }
     $result.editor_window = $editorWindow
-    $selectorAfter = Invoke-McpTool $session gp_objects @{query='gpvst3P7Panel';limit=10}
-    $result.selector_after_editor = @($selectorAfter.objects | Where-Object object_name -EQ 'gpvst3P7Panel')[0].properties
+    $selectorAfter = Invoke-McpTool $session gp_objects @{query='gpvst3GlobalPanel';limit=10}
+    $result.selector_after_editor = @($selectorAfter.objects | Where-Object object_name -EQ 'gpvst3GlobalPanel')[0].properties
     foreach ($property in @('x','y','width','height')) {
         if ($result.selector_before_editor.$property -ne $result.selector_after_editor.$property) { throw "Editor changed selector layout: $property" }
     }
@@ -281,7 +291,7 @@ try {
     if ($result.editor_observation.runtime_effect_error) {
         throw "P7 native editor reported a runtime error: $($result.editor_observation.runtime_effect_error)"
     }
-    $result.editor_status = Invoke-McpTool $session gp_objects @{query='gpvst3Status';limit=10} -AllowError
+    $result.editor_status = Invoke-McpTool $session gp_objects @{query='gpvst3GlobalStatus';limit=10} -AllowError
     if (@($result.editor_status.objects | Where-Object { $_.properties.text -eq ('原生 GUI 已打开：' + $firstClass.name) }).Count -eq 0) {
         throw "P7 native editor status was not published: $($result.editor_status.objects.properties.text -join '; ')"
     }
@@ -305,7 +315,7 @@ try {
         $result.resized_moved_window = $moved
         if ($moved.geometry.width -ne 480 -or $moved.geometry.height -ne 240 -or $moved.geometry.x -eq $editorWindow.geometry.x) { throw 'Native IPlugFrame resize or independent movement failed.' }
     }
-    $editorButtons2 = Invoke-McpTool $session gp_objects @{query=("gpvst3Editor_$classId");limit=10}
+    $editorButtons2 = Invoke-McpTool $session gp_objects @{query=("gpvst3GlobalEditor_$classId");limit=10}
     $editorButton2 = @($editorButtons2.objects)[0]
     $editorReopen = Invoke-McpTool $session gp_trigger @{snapshot=$editorButtons2.snapshot;id=$editorButton2.id}
     Start-Sleep -Milliseconds 500
@@ -318,13 +328,13 @@ try {
     Start-Sleep -Milliseconds 600
     $result.after_editor_close = (Get-Content -LiteralPath $observationPath -Raw | ConvertFrom-Json).gp_hook
     if ($result.after_editor_close.runtime_effect_instances -ne 2 -or $result.after_editor_close.total_bypass -or $result.after_editor_close.runtime_process_count -le $result.editor_observation.runtime_process_count) { throw 'Closing editor disabled processing.' }
-    $editorButtons = Invoke-McpTool $session gp_objects @{query=("gpvst3Editor_" + $secondClass.class_id);limit=10}
+    $editorButtons = Invoke-McpTool $session gp_objects @{query=("gpvst3GlobalEditor_" + $secondClass.class_id);limit=10}
     Invoke-McpTool $session gp_trigger @{snapshot=$editorButtons.snapshot;id=@($editorButtons.objects)[0].id} | Out-Null
     Start-Sleep -Milliseconds 600
     $result.second_editor_window = (Invoke-McpTool $session gp_windows @{include_hidden=$true}).windows | Where-Object object_name -EQ 'gpvst3NativeEditorWindow'
     if (-not $result.second_editor_window.visible -or $result.second_editor_window.title -notlike ($secondClass.name + '*')) { throw 'Second native editor did not open.' }
     $result.second_native_capture = Save-P7NativeWindowCapture $process.Id $result.second_editor_window.title (Join-Path $run 'second-editor-native.png')
-    $closePanel = Invoke-McpTool $session gp_objects @{query='gpvst3CloseSelectorButton';limit=10}
+    $closePanel = Invoke-McpTool $session gp_objects @{query='gpvst3GlobalCloseSelectorButton';limit=10}
     Invoke-McpTool $session gp_trigger @{snapshot=$closePanel.snapshot;id=@($closePanel.objects)[0].id} | Out-Null
     Start-Sleep -Milliseconds 600
     $result.editor_after_panel_close = (Invoke-McpTool $session gp_windows @{include_hidden=$true}).windows | Where-Object object_name -EQ 'gpvst3NativeEditorWindow'
@@ -332,7 +342,7 @@ try {
     $entryAgain = Invoke-McpTool $session gp_objects @{query='gpvst3SoundEffectChainButton';limit=10}
     Invoke-McpTool $session gp_trigger @{snapshot=$entryAgain.snapshot;id=@($entryAgain.objects)[0].id} | Out-Null
     Start-Sleep -Seconds 1
-    $uncheckedQuery = Invoke-McpTool $session gp_objects @{query=("gpvst3Enabled_$classId");limit=10}
+    $uncheckedQuery = Invoke-McpTool $session gp_objects @{query=("gpvst3GlobalEnabled_$classId");limit=10}
     $uncheckedObject = @($uncheckedQuery.objects)[0]
     $setFirstOff = Invoke-McpTool $session gp_set_property @{
         snapshot=$uncheckedQuery.snapshot
@@ -347,7 +357,7 @@ try {
         $oneRemaining.gp_hook.chain_active_slot -lt 0) {
         throw "P7 disabling one item did not keep the remaining processor active: $($oneRemaining.gp_hook | ConvertTo-Json -Depth 12 -Compress)"
     }
-    $secondOffQuery = Invoke-McpTool $session gp_objects @{query=("gpvst3Enabled_$(([string]$secondCheckbox.object_name) -replace '^gpvst3Enabled_', '')");limit=10}
+    $secondOffQuery = Invoke-McpTool $session gp_objects @{query=("gpvst3GlobalEnabled_$(([string]$secondCheckbox.object_name) -replace '^gpvst3GlobalEnabled_', '')");limit=10}
     $secondOffObject = @($secondOffQuery.objects)[0]
     $setSecondOff = Invoke-McpTool $session gp_set_property @{
         snapshot=$secondOffQuery.snapshot
@@ -366,12 +376,12 @@ try {
     $sidecarPath = Join-Path $dataDirectory 'effect-chain.json'
     if (-not (Test-Path -LiteralPath $sidecarPath)) { throw 'P7 sidecar was not written.' }
     $sidecar = Get-Content -LiteralPath $sidecarPath -Raw | ConvertFrom-Json
-    $savedStates = @($sidecar.effects | Where-Object { $_.component_state })
+    $savedStates = @($sidecar.global.effects | Where-Object { $_.component_state })
     if ($savedStates.Count -lt 2) {
         throw "P7 sidecar did not retain component state for both selected plugins: $($sidecar | ConvertTo-Json -Depth 8 -Compress)"
     }
     $result.sidecar = $sidecar
-    $restoreQuery = Invoke-McpTool $session gp_objects @{query=("gpvst3Enabled_$classId");limit=10}
+    $restoreQuery = Invoke-McpTool $session gp_objects @{query=("gpvst3GlobalEnabled_$classId");limit=10}
     $restoreObject = @($restoreQuery.objects)[0]
     Invoke-McpTool $session gp_set_property @{
         snapshot=$restoreQuery.snapshot
@@ -386,12 +396,12 @@ try {
         $restoredObservation.gp_hook.runtime_effect_instances -ne 1 -or
         $restoredObservation.gp_hook.chain_active_slot -lt 0 -or
         $restoredObservation.gp_hook.runtime_effect_error) {
-        $notice = Invoke-McpTool $session gp_objects @{query='gpvst3Status';limit=10}
+        $notice = Invoke-McpTool $session gp_objects @{query='gpvst3GlobalStatus';limit=10}
         $result.restore_notice = $notice
         $result | ConvertTo-Json -Depth 30 | Set-Content -LiteralPath (Join-Path $run 'verification.json') -Encoding UTF8
         throw "P7 sidecar state did not restore a live processor: $($notice.objects.properties.toolTip -join '; '). Evidence: $run"
     }
-    $restoreOffQuery = Invoke-McpTool $session gp_objects @{query=("gpvst3Enabled_$classId");limit=10}
+    $restoreOffQuery = Invoke-McpTool $session gp_objects @{query=("gpvst3GlobalEnabled_$classId");limit=10}
     $restoreOffObject = @($restoreOffQuery.objects)[0]
     Invoke-McpTool $session gp_set_property @{
         snapshot=$restoreOffQuery.snapshot
@@ -408,7 +418,7 @@ try {
     $result.status = Get-Content -LiteralPath $statusPath -Raw | ConvertFrom-Json
     if ($CheckGain -or $CheckCatalogRestart) {
         if ($CheckGain) {
-        $enableForRestart = Invoke-McpTool $session gp_objects @{query=("gpvst3Enabled_" + $firstClass.class_id);limit=10}
+        $enableForRestart = Invoke-McpTool $session gp_objects @{query=("gpvst3GlobalEnabled_" + $firstClass.class_id);limit=10}
         Invoke-McpTool $session gp_set_property @{snapshot=$enableForRestart.snapshot;id=@($enableForRestart.objects)[0].id;property='checked';value=$true} | Out-Null
         Start-Sleep -Milliseconds 400
         $result.enabled_before_restart = Get-Content -LiteralPath (Join-Path $dataDirectory 'effect-chain.json') -Raw | ConvertFrom-Json
@@ -437,7 +447,7 @@ try {
         $session = New-McpSession -SessionFile $sessionPath
         Start-Sleep -Seconds 1
         if ($CheckGain) {
-        $editor = Invoke-McpTool $session gp_objects @{query=("gpvst3Editor_" + $firstClass.class_id);limit=10}
+        $editor = Invoke-McpTool $session gp_objects @{query=("gpvst3GlobalEditor_" + $firstClass.class_id);limit=10}
         Invoke-McpTool $session gp_trigger @{snapshot=$editor.snapshot;id=@($editor.objects)[0].id} | Out-Null
         Start-Sleep -Milliseconds 400
         $gainRestored = Invoke-McpTool $session gp_objects @{query='gpvst3TestGain';limit=10}
@@ -463,23 +473,24 @@ try {
             $clock = [Diagnostics.Stopwatch]::StartNew()
             Invoke-McpTool $session gp_trigger @{snapshot=$entry.snapshot;id=@($entry.objects)[0].id} | Out-Null
             do {
-                $panel = Invoke-McpTool $session gp_objects @{query='gpvst3P7Panel';limit=10}
-                $visible = @($panel.objects | Where-Object object_name -EQ 'gpvst3P7Panel')[0].visible
+                $panel = Invoke-McpTool $session gp_objects @{query='gpvst3GlobalPanel';limit=10}
+                $visible = @($panel.objects | Where-Object object_name -EQ 'gpvst3GlobalPanel')[0].visible
                 if ($visible) { break }
                 Start-Sleep -Milliseconds 10
             } while ($clock.ElapsedMilliseconds -lt 500)
             $rows = Invoke-McpTool $session gp_objects @{query='gpvst3';limit=100}
-            $checkboxes = @($rows.objects | Where-Object class -EQ QCheckBox)
+            $checkboxes = @($rows.objects | Where-Object { $_.class -eq 'QCheckBox' -and $_.object_name -like 'gpvst3GlobalEnabled_*' })
             $openMs = $clock.ElapsedMilliseconds
             $process.Refresh()
             $loadedVst3 = @($process.Modules | Where-Object FileName -Like '*.vst3' | ForEach-Object FileName)
             $result.default_catalog_restart = @{scan=$cachedScan;list_open_ms=$openMs;vst3_modules=$loadedVst3;entry=$entry;panel=$panel;checkboxes=$checkboxes}
-            if ($openMs -gt 500 -or -not $visible -or $loadedVst3.Count -or $checkboxes.Count -ne @($scan.vst3_catalog).Count -or
+            $readyClasses = @($scan.vst3_catalog | Where-Object { $_.recognition_status -eq 'ready' -and $_.class_id })
+            if ($openMs -gt 500 -or -not $visible -or $loadedVst3.Count -or $checkboxes.Count -ne $readyClasses.Count -or
                 @($checkboxes | Where-Object { -not $_.visible -or -not $_.enabled }).Count) { throw "Cached default-directory list was slow, hidden, incomplete or loaded VST3 code. Time: $openMs ms; modules: $($loadedVst3.Count)." }
         }
     }
     $result | ConvertTo-Json -Depth 30 | Set-Content -LiteralPath (Join-Path $run 'verification.json') -Encoding UTF8
-    Write-Output "PASS: P7 MCP same-level panel, catalog and realtime selection lifecycle. Evidence: $run"
+    Write-Output "PASS: P7 native global section, catalog and realtime selection lifecycle. Evidence: $run"
 }
 catch {
     if ($result) { $result.failure = $_.Exception.Message; $result.failure_stack = $_.ScriptStackTrace; $result | ConvertTo-Json -Depth 30 | Set-Content -LiteralPath (Join-Path $run 'verification.json') -Encoding UTF8 }
