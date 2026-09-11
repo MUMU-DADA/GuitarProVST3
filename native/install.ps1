@@ -1,14 +1,27 @@
 param(
-    [ValidateSet('Install', 'Uninstall', 'Status')]
+    [ValidateSet('Install', 'Update', 'Uninstall', 'Status')]
     [string]$Action = 'Install',
     [string]$HostDirectory = 'C:\Program Files\Arobas Music\Guitar Pro 8',
-    [string]$PackageDirectory = ''
+    [string]$PackageDirectory = '',
+    [switch]$Elevate
 )
 
 $ErrorActionPreference = 'Stop'
 if (-not $PackageDirectory) { $PackageDirectory = Split-Path -Parent $PSCommandPath }
 $PackageDirectory = (Resolve-Path -LiteralPath $PackageDirectory).Path
 $HostDirectory = [IO.Path]::GetFullPath($HostDirectory)
+$dataScript = $PSCommandPath
+if ($Elevate -and $Action -in @('Install','Update','Uninstall')) {
+    $principal = [Security.Principal.WindowsPrincipal]::new([Security.Principal.WindowsIdentity]::GetCurrent())
+    if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+        $arguments = @('-NoProfile','-ExecutionPolicy','Bypass','-File',('"' + $dataScript + '"'),'-Action',$Action,
+            '-HostDirectory',('"' + $HostDirectory + '"'),'-PackageDirectory',('"' + $PackageDirectory + '"'))
+        $child = Start-Process -FilePath powershell.exe -ArgumentList $arguments -Verb RunAs -WindowStyle Hidden -Wait -PassThru
+        if ($child.ExitCode) { throw "Elevated installer failed (exit $($child.ExitCode))." }
+        Write-Output "$Action completed."
+        return
+    }
+}
 $sourceRelative = 'plugins/imageformats/guitarpro_vst3_autoload.dll'
 $targetRelative = 'Plugins/imageformats/guitarpro_vst3_autoload.dll'
 $targetPath = Join-Path $HostDirectory $targetRelative
@@ -65,7 +78,7 @@ $running = @(Get-Process -Name GuitarPro -ErrorAction SilentlyContinue | Where-O
 if ($running.Count) { throw 'Close Guitar Pro before installing or uninstalling GuitarProVST3.' }
 
 $receipt = Read-Receipt
-if ($Action -eq 'Install') {
+if ($Action -in @('Install','Update')) {
     $package = Read-Package
     $expectedHash = [string]$package.entry.sha256
     if ($receipt) {
@@ -73,8 +86,28 @@ if ($Action -eq 'Install') {
             (Get-FileHash -LiteralPath $targetPath -Algorithm SHA256).Hash -ine [string]$receipt.sha256) {
             throw 'Owned plugin was modified or removed; refusing an in-place update.'
         }
-        if ([string]$receipt.sha256 -ine $expectedHash) { throw 'Uninstall the existing version before installing a different package.' }
-        [pscustomobject]@{installed=$true;target=$targetPath;sha256=$expectedHash;receipt=$receiptPath}
+        if ($Action -eq 'Install' -and [string]$receipt.sha256 -ine $expectedHash) {
+            throw 'A different package is installed. Use Install.cmd -Action Update or uninstall it first.'
+        }
+        if ([string]$receipt.sha256 -ieq $expectedHash) {
+            [pscustomobject]@{installed=$true;target=$targetPath;sha256=$expectedHash;receipt=$receiptPath;updated=$false}
+            return
+        }
+        $temporary = "$targetPath.$([guid]::NewGuid().ToString('N')).tmp"
+        $backup = "$temporary.backup"
+        try {
+            Copy-Item -LiteralPath $package.source -Destination $temporary
+            if ((Get-FileHash -LiteralPath $temporary -Algorithm SHA256).Hash -ine $expectedHash) { throw 'Package hash changed while staging update.' }
+            [IO.File]::Replace($temporary, $targetPath, $backup)
+            [ordered]@{schema=1;product='GuitarProVST3';version=[string]$package.manifest.version;
+                       path=$targetRelative;sha256=$expectedHash;installed_at=[DateTime]::UtcNow.ToString('o')} |
+                ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $receiptPath -Encoding UTF8
+            if (Test-Path -LiteralPath $backup) { Remove-Item -LiteralPath $backup -Force }
+            [pscustomobject]@{installed=$true;target=$targetPath;sha256=$expectedHash;receipt=$receiptPath;updated=$true}
+        } catch {
+            if (Test-Path -LiteralPath $backup) { [IO.File]::Replace($backup, $targetPath, [NullString]::Value) }
+            throw
+        } finally { if (Test-Path -LiteralPath $temporary) { Remove-Item -LiteralPath $temporary -Force } }
         return
     }
     if (Test-Path -LiteralPath $targetPath -PathType Leaf) {

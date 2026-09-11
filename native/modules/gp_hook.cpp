@@ -2565,6 +2565,13 @@ bool requestTrackVst3Selection(const std::string &trackKey,
         if (error) *error = "runtime_vst3_chain_full";
         return false;
     }
+    if (!g_runtime.dsp.installed && !selection.empty()) {
+        const auto prepared = prepare(host::verify(), true);
+        if (!prepared.installed) {
+            if (error) *error = prepared.reason;
+            return false;
+        }
+    }
     // Track runtimes already have an independent fixed table. Queueing the
     // request through the same worker keeps processor construction off Qt;
     // the current binding is validated before accepting it.

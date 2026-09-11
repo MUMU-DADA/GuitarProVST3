@@ -1,6 +1,6 @@
 param(
     [ValidatePattern('^\d+\.\d+\.\d+([-.][A-Za-z0-9.]+)?$')]
-    [string]$Version = '0.8.0',
+    [string]$Version = '0.9.0',
     [string]$PluginPath = '',
     [string]$OutputDirectory = ''
 )
@@ -26,7 +26,8 @@ Copy-Item -LiteralPath (Join-Path $root 'native/effect-chain.template.json') -De
 # Release packages contain current surface docs; historical records stay in the source archive.
 Copy-Item -LiteralPath (Join-Path $root 'docs/INSTALL.md'), (Join-Path $root 'docs/P8_IMPLEMENTATION.md'), (Join-Path $root 'docs/P8_TRACK_GLOBAL_VST3_PLAN.md'), (Join-Path $root 'docs/P9_IMPLEMENTATION.md'), (Join-Path $root 'docs/P9_AUDIO_SWITCH_UI_PLAN.md'), (Join-Path $root 'docs/REALTIME_IMPLEMENTATION_PLAN.md'), (Join-Path $root 'docs/TESTING.md'), (Join-Path $root 'LICENSE'), (Join-Path $root 'DISCLAIMER.md') -Destination (Join-Path $staging 'docs')
 Copy-Item -LiteralPath (Join-Path $root 'third_party/vst3sdk/LICENSE.txt') -Destination (Join-Path $staging 'docs/VST3-SDK-LICENSE.txt')
-Copy-Item -LiteralPath (Join-Path $root 'native/install.ps1'), (Join-Path $root 'native/uninstall.ps1') -Destination $staging
+Copy-Item -LiteralPath (Join-Path $root 'native/install.ps1'), (Join-Path $root 'native/uninstall.ps1'),
+    (Join-Path $root 'native/Install.cmd'), (Join-Path $root 'native/Uninstall.cmd') -Destination $staging
 
 $files = @(Get-ChildItem -LiteralPath $staging -File -Recurse | Sort-Object FullName | ForEach-Object {
     [pscustomobject]@{path=$_.FullName.Substring($staging.Length + 1).Replace('\','/');sha256=(Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash}
@@ -42,6 +43,7 @@ $forbidden = @(Get-ChildItem -LiteralPath $staging -File -Recurse | Where-Object
 })
 if ($forbidden.Count) { throw "Forbidden release file: $($forbidden[0].FullName)" }
 # Fix zip entry ordering and timestamps so the same payload yields the same zip.
+Add-Type -AssemblyName System.IO.Compression
 Add-Type -AssemblyName System.IO.Compression.FileSystem
 $archive = [IO.Compression.ZipFile]::Open($zip, [IO.Compression.ZipArchiveMode]::Create)
 try {

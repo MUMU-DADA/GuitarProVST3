@@ -9,10 +9,17 @@
 #include <QtWidgets/QListWidget>
 #include <QtWidgets/QPushButton>
 #include <QtWidgets/QVBoxLayout>
+#include <QtGui/QMouseEvent>
 #include <iostream>
 #include <memory>
 
 namespace {
+void doubleClick(QWidget *widget) {
+    QMouseEvent event(QEvent::MouseButtonDblClick, QPointF(2, 2), Qt::LeftButton,
+                      Qt::LeftButton, Qt::NoModifier);
+    QApplication::sendEvent(widget, &event);
+    QCoreApplication::processEvents();
+}
 bool check(bool value, const char *message) {
     if (!value) std::cerr << "FAIL: " << message << '\n';
     return value;
@@ -109,9 +116,9 @@ int main(int argc, char **argv) {
                globalSelection.size() == 1 && globalSelection[0].classId == "A" &&
                track->count() == 2 && global->count() == 1,
                "simultaneous controls publish only their fixed scope")) return 1;
-    trackSection->findChild<QPushButton *>("gpvst3Name_A")->click();
+    doubleClick(trackSection->findChild<QPushButton *>("gpvst3Name_A"));
     if (!check(editorScope == selectedTrack, "name opens the track processor editor")) return 1;
-    globalSection->findChild<QPushButton *>("gpvst3GlobalName_A")->click();
+    doubleClick(globalSection->findChild<QPushButton *>("gpvst3GlobalName_A"));
     if (!check(editorScope == "global", "name opens the independent global editor")) return 1;
     for (const int width : {260, 320, 420}) {
         soundHost->setFixedWidth(width);
@@ -119,14 +126,12 @@ int main(int argc, char **argv) {
         QCoreApplication::processEvents();
         for (auto *section : {trackSection, globalSection}) {
             const QString prefix = section == trackSection ? "gpvst3" : "gpvst3Global"; auto *name = section->findChild<QPushButton *>(prefix + "Name_A");
-            auto *editor = section->findChild<QPushButton *>(prefix + "Editor_A");
             auto *toggle = section->findChild<QCheckBox *>(prefix + "Enabled_A");
             if (!check(name && name->text().startsWith("A") && name->width() >= 60 &&
                        name->toolTip().contains("Test Vendor") && name->toolTip().contains("C:/VST3/A.vst3") &&
                        toggle->geometry().right() < name->geometry().left() &&
-                       name->geometry().right() < editor->geometry().left() &&
-                       editor->geometry().right() < editor->parentWidget()->width(),
-                       "narrow/DPI layout preserves prefix, identity and nonoverlapping controls")) return 1;
+                       section->findChildren<QPushButton *>(prefix + "Editor_A").isEmpty(),
+                       "narrow/DPI layout preserves prefix, identity and removes dedicated GUI controls")) return 1;
         }
     }
     qputenv("GPVST3_TRACK", "2");

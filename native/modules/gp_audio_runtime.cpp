@@ -31,12 +31,39 @@ namespace {
 constexpr std::size_t kMaxBindings = 64;
 NativeObjectRegistry g_objects;
 
-using McpAudioBindingVisitor = void (*)(void *user, void *chain, int trackIndex,
-                                        int soundIndex, const char *documentId,
-                                        const char *trackId, const char *scoreKey,
-                                        bool activeDocument, bool selectedTrack) noexcept;
-using McpAudioEnumerateFn = std::size_t (*)(McpAudioBindingVisitor visitor,
-                                            void *user) noexcept;
+// GuitarProMCP exposes a versioned C ABI. Its native pointers are only valid
+// during a callback, so this consumer uses it for selected-track context only.
+// The native registry below remains the sole source of real-time chains.
+struct McpAudioBindingV1 {
+    std::uint32_t structSize;
+    std::uint32_t abiVersion;
+    std::uint32_t status;
+    std::uint32_t controllerIndex;
+    std::uint64_t generation;
+    void *chain;
+    std::int32_t trackIndex;
+    std::int32_t soundIndex;
+    std::uint8_t activeDocument;
+    std::uint8_t selectedTrack;
+    std::uint16_t reserved;
+    const char *documentId;
+    const char *trackId;
+    const char *scoreKey;
+};
+using McpAudioBindingVisitor = void (__cdecl *)(void *user,
+                                                 const McpAudioBindingV1 *binding) noexcept;
+struct McpAudioEnumerateResult {
+    std::uint32_t structSize;
+    std::uint32_t status;
+    std::uint64_t generation;
+    std::uint64_t count;
+};
+using McpAudioEnumerateFn = std::uint32_t (__cdecl *)(std::uint32_t requestedAbi,
+                                                      McpAudioBindingVisitor visitor,
+                                                      void *user,
+                                                      McpAudioEnumerateResult *result) noexcept;
+static_assert(sizeof(McpAudioBindingV1) == 72, "MCP audio binding ABI changed");
+static_assert(sizeof(McpAudioEnumerateResult) == 24, "MCP audio result ABI changed");
 
 class ControllerObserver final : public QObject {
 public:
@@ -91,51 +118,86 @@ QString scoreKey() {
         QDir::fromNativeSeparators(QFileInfo(configured).absoluteFilePath());
 }
 
-struct BridgeCollector {
-    std::vector<Binding> result;
+struct BridgeContext {
+    QString documentId;
+    QString trackId;
+    QString scoreKey;
+    int trackIndex = -1;
+    std::uint8_t activeDocument = 2;
+    std::uint8_t selectedTrack = 2;
 };
 
-void collectBridgeBinding(void *user, void *chain, int trackIndex, int soundIndex,
-                          const char *documentId, const char *trackId,
-                          const char *scoreKeyText, bool activeDocument,
-                          bool selectedTrack) noexcept {
+struct BridgeCollector {
+    std::vector<BridgeContext> result;
+};
+
+void collectBridgeBinding(void *user, const McpAudioBindingV1 *source) noexcept {
     auto *collector = static_cast<BridgeCollector *>(user);
-    if (!collector || trackIndex < 0 ||
+    if (!collector || !source || source->structSize < sizeof(McpAudioBindingV1) ||
+        source->abiVersion != 1 || (source->status != 0 && source->status != 2) ||
+        source->trackIndex < 0 ||
         collector->result.size() >= kMaxBindings) return;
+    const auto stableScoreKey = source->scoreKey && *source->scoreKey
+        ? QString::fromUtf8(source->scoreKey) : scoreKey();
+    const auto documentId = source->documentId ? QString::fromUtf8(source->documentId) : QString{};
     const auto duplicate = std::find_if(collector->result.begin(), collector->result.end(),
-        [&](const Binding &existing) { return chain ? existing.chain == chain :
-            !existing.chain && existing.trackId == (trackId ? trackId : ""); });
-    if (duplicate != collector->result.end()) return;
-    Binding binding;
-    binding.chain = chain;
-    binding.trackIndex = trackIndex;
-    binding.soundIndex = soundIndex;
-    const auto stableScoreKey = scoreKeyText && *scoreKeyText
-        ? QString::fromUtf8(scoreKeyText) : scoreKey();
-    binding.trackKey = (stableScoreKey + QStringLiteral("#track-") +
-                       QString::number(trackIndex)).toStdString();
-    binding.trackId = trackId ? trackId : "";
-    binding.documentId = documentId ? documentId : "";
-    binding.scoreKey = stableScoreKey.toStdString();
-    binding.activeDocument = activeDocument;
-    binding.selectedTrack = selectedTrack;
-    collector->result.push_back(std::move(binding));
+        [&](const BridgeContext &existing) {
+            return existing.documentId == documentId && existing.scoreKey == stableScoreKey &&
+                   existing.trackIndex == source->trackIndex;
+        });
+    if (duplicate != collector->result.end()) {
+        if (source->activeDocument != 2) duplicate->activeDocument = source->activeDocument;
+        if (source->selectedTrack != 2) duplicate->selectedTrack = source->selectedTrack;
+        return;
+    }
+    collector->result.push_back({documentId, source->trackId ? QString::fromUtf8(source->trackId) : QString{},
+                                 stableScoreKey, source->trackIndex,
+                                 source->activeDocument, source->selectedTrack});
 }
 
-std::vector<Binding> collectFromMcpBridge() {
-    std::vector<Binding> empty;
+std::vector<BridgeContext> collectFromMcpBridge(bool *available) {
+    if (available) *available = false;
+    std::vector<BridgeContext> empty;
     const auto module = GetModuleHandleW(L"guitarpro_mcp.dll");
     if (!module) return empty;
     using VersionFn = unsigned (*)() noexcept;
     const auto version = reinterpret_cast<VersionFn>(GetProcAddress(module, "gpmcp_audio_bridge_version"));
     if (!version || version() != 1) return empty;
-    auto enumerate = reinterpret_cast<McpAudioEnumerateFn>(GetProcAddress(module, "gpmcp_audio_enumerate_contexts"));
-    if (!enumerate) enumerate = reinterpret_cast<McpAudioEnumerateFn>(GetProcAddress(module, "gpmcp_audio_enumerate"));
+    auto enumerate = reinterpret_cast<McpAudioEnumerateFn>(GetProcAddress(module, "gpmcp_audio_enumerate_v1"));
     if (!enumerate) return empty;
+    if (available) *available = true;
     BridgeCollector collector;
-    const auto count = enumerate(&collectBridgeBinding, &collector);
-    if (!count || collector.result.empty()) return empty;
+    McpAudioEnumerateResult result{sizeof(result), 0, 0, 0};
+    const auto status = enumerate(1, &collectBridgeBinding, &collector, &result);
+    if (status != 0 && collector.result.empty()) return empty;
     return collector.result;
+}
+
+bool sameScoreKey(const std::string &nativeScore, const QString &bridgeScore) {
+    return QString::fromStdString(nativeScore).compare(bridgeScore, Qt::CaseInsensitive) == 0;
+}
+
+void mergeBridgeContexts(std::vector<Binding> &bindings,
+                         const std::vector<BridgeContext> &contexts) {
+    for (const auto &context : contexts) {
+        const auto native = std::find_if(bindings.begin(), bindings.end(), [&](const Binding &binding) {
+            return binding.trackIndex == context.trackIndex && sameScoreKey(binding.scoreKey, context.scoreKey);
+        });
+        if (native != bindings.end()) {
+            if (context.activeDocument != 2) native->activeDocument = context.activeDocument == 1;
+            if (context.selectedTrack != 2) native->selectedTrack = context.selectedTrack == 1;
+            continue;
+        }
+        if (bindings.size() >= kMaxBindings || context.documentId.isEmpty() || context.trackId.isEmpty()) continue;
+        Binding contextBinding;
+        contextBinding.trackIndex = context.trackIndex;
+        contextBinding.trackId = context.trackId.toStdString();
+        contextBinding.documentId = context.documentId.toStdString();
+        contextBinding.scoreKey = context.scoreKey.toStdString();
+        contextBinding.activeDocument = context.activeDocument == 1;
+        contextBinding.selectedTrack = context.selectedTrack == 1;
+        bindings.push_back(std::move(contextBinding));
+    }
 }
 
 void observeObjectTree(QObject *root, QSet<QObject *> &seen) {
@@ -218,23 +280,15 @@ std::vector<NativeTrack> g_nativeTracks;
 std::vector<Binding> collect() {
     static const bool verified = host::verify().supported;
     if (!verified) return {};
-    // GuitarProMCP owns the verified native object registry, including
-    // non-parented ConductorController services. Prefer its in-process bridge
-    // so this plugin consumes the exact EffectsChain -> track_id mapping that
-    // the gp_audio_abi tool validates.
-#ifndef GPVST3_FORCE_NATIVE_AUDIO_BINDINGS
-    if (const auto module = GetModuleHandleW(L"guitarpro_mcp.dll")) {
-        using VersionFn = unsigned (*)() noexcept;
-        const auto version = reinterpret_cast<VersionFn>(GetProcAddress(module, "gpmcp_audio_bridge_version"));
-        if (version && version() == 1) {
-            g_bindingSource = "mcp_bridge";
-            return collectFromMcpBridge();
-        }
-    }
-#endif
-    g_bindingSource = "native_document_registry";
+    bool bridgeAvailable = false;
+    const auto bridgeContexts = collectFromMcpBridge(&bridgeAvailable);
     std::vector<Binding> result;
-    if (!g_observer || !qApp) return result;
+    const auto finish = [&] {
+        mergeBridgeContexts(result, bridgeContexts);
+        g_bindingSource = bridgeAvailable ? "mcp_context_native_registry" : "native_document_registry";
+        return result;
+    };
+    if (!g_observer || !qApp) return finish();
     QSet<QObject *> seen;
     observeObjectTree(qApp, seen);
     for (QWidget *widget : QApplication::allWidgets()) observeObjectTree(widget, seen);
@@ -296,7 +350,7 @@ std::vector<Binding> collect() {
                 auto duplicate = std::find_if(result.begin(), result.end(),
                     [&](const Binding &existing) { return existing.chain == binding.chain; });
                 if (duplicate == result.end()) result.push_back(std::move(binding));
-                if (result.size() >= kMaxBindings) return result;
+                if (result.size() >= kMaxBindings) return finish();
             }
             if (result.size() == beforeTrack) {
                 Binding context;
@@ -306,11 +360,11 @@ std::vector<Binding> collect() {
                 context.activeDocument = activeDocument == document->object;
                 context.selectedTrack = context.activeDocument && document->score->cursor().trackIndex() == static_cast<int>(trackIndex);
                 result.push_back(std::move(context));
-                if (result.size() >= kMaxBindings) return result;
+                if (result.size() >= kMaxBindings) return finish();
             }
         }
     }
-    return result;
+    return finish();
 }
 
 } // namespace
@@ -323,16 +377,8 @@ void initialize() noexcept {
         g_observer = new ControllerObserver;
         g_observer->setParent(qApp);
         qApp->installEventFilter(g_observer);
-        bool registryRequired = true;
-#ifndef GPVST3_FORCE_NATIVE_AUDIO_BINDINGS
-        if (const auto module = GetModuleHandleW(L"guitarpro_mcp.dll")) {
-            using VersionFn = unsigned (*)() noexcept;
-            const auto version = reinterpret_cast<VersionFn>(GetProcAddress(module, "gpmcp_audio_bridge_version"));
-            registryRequired = !version || version() != 1;
-        }
-#endif
         const auto qtCore = QDir(QCoreApplication::applicationDirPath()).filePath("Qt5Core.dll");
-        if (registryRequired && host::verify().supported && host::sha256(qtCore) ==
+        if (host::verify().supported && host::sha256(qtCore) ==
             "C2F85BD55C31E5380DD99F0D517EE183A54C3852480BC497DC30A5483FD70FF2") g_objects.install();
     } catch (...) {
         g_observer = nullptr;
@@ -385,7 +431,11 @@ bool currentTrack(Binding &binding) noexcept {
         const int active = g_activeBuffer.load(std::memory_order_acquire);
         for (std::size_t index = 0; index < count; ++index) {
             const auto &candidate = g_bindingBuffers[active][index];
-            if (!candidate.chain || !candidate.activeDocument || !candidate.selectedTrack) continue;
+            // MCP may publish a verified selected-track context while its
+            // EffectsChain is temporarily HOST_LIMITED. Keep that context
+            // visible so the UI can bind to the correct track before DSP is
+            // available; processing still requires a non-null chain later.
+            if (!candidate.activeDocument || !candidate.selectedTrack) continue;
             binding = candidate;
             return true;
         }

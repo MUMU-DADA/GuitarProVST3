@@ -312,37 +312,59 @@ namespace gpvst3::bootstrap {
 
 QJsonObject initialize() {
     const auto host = host::verify();
-    gpvst3::gp_audio::initialize();
-    hook::prepare(host);
-    hook::refreshTrackContext();
-    ui::setRealtimeBypassControl(&hook::setTotalBypass);
-    ui::setVst3SelectionControl(&hook::setGlobalVst3Selection);
-    ui::setVst3SelectionRequestControl(&hook::requestGlobalVst3Selection);
-    ui::setVst3TrackSelectionControl(&hook::setTrackVst3Selection);
-    ui::setVst3TrackSelectionRequestControl(&hook::requestTrackVst3Selection);
-    ui::setVst3StateControl(&hook::captureGlobalVst3States);
-    ui::setVst3TrackControls(&hook::captureTrackVst3States, &hook::openTrackVst3Editor);
-    ui::setVst3EditorControl(&hook::openVst3Editor, &hook::closeVst3Editors, &hook::scaleVst3Editor);
-    const auto hookState = hook::snapshot();
-    vst3::setRecognitionControl(&vst3::identifyBundle);
-    ui::setVst3DiscoveryControl([] { refreshCatalog(true); }, &identifyBundle);
-    auto *refreshTimer = new QTimer(QCoreApplication::instance());
-    refreshTimer->setInterval(60000);
-    QObject::connect(refreshTimer, &QTimer::timeout, refreshTimer, [] { refreshCatalog(); });
-    refreshTimer->start();
-    auto *trackTimer = new QTimer(QCoreApplication::instance());
-    trackTimer->setInterval(250);
-    QObject::connect(trackTimer, &QTimer::timeout, trackTimer, [] {
+    const bool enabled = state::pluginEnabled();
+    if (enabled) {
+        gpvst3::gp_audio::initialize();
+        hook::prepare(host);
         hook::refreshTrackContext();
-        if (hook::consumeSelectionStateChanges()) ui::reloadVst3Selections();
-        ui::refreshVst3TrackContext();
-    });
-    trackTimer->start();
-    const auto vst3 = qEnvironmentVariable("GPVST3_RUN_LIFECYCLE_PROBE") == "1"
-        ? vst3::prepare(host.supported) : vst3::beginAsync(host.supported);
+        ui::setRealtimeBypassControl(&hook::setTotalBypass);
+        ui::setVst3SelectionControl(&hook::setGlobalVst3Selection);
+        ui::setVst3SelectionRequestControl(&hook::requestGlobalVst3Selection);
+        ui::setVst3TrackSelectionControl(&hook::setTrackVst3Selection);
+        ui::setVst3TrackSelectionRequestControl(&hook::requestTrackVst3Selection);
+        ui::setVst3StateControl(&hook::captureGlobalVst3States);
+        ui::setVst3TrackControls(&hook::captureTrackVst3States, &hook::openTrackVst3Editor);
+        ui::setVst3EditorControl(&hook::openVst3Editor, &hook::closeVst3Editors, &hook::scaleVst3Editor);
+    } else {
+        ui::setRealtimeBypassControl(nullptr);
+        ui::setVst3SelectionControl(nullptr);
+        ui::setVst3SelectionRequestControl(nullptr);
+        ui::setVst3TrackSelectionControl(nullptr);
+        ui::setVst3TrackSelectionRequestControl(nullptr);
+        ui::setVst3StateControl(nullptr);
+        ui::setVst3TrackControls(nullptr, nullptr);
+        ui::setVst3EditorControl(nullptr, nullptr, nullptr);
+    }
+    const auto hookState = hook::snapshot();
+    vst3::State vst3;
+    if (enabled) {
+        vst3::setRecognitionControl(&vst3::identifyBundle);
+        ui::setVst3DiscoveryControl([] { refreshCatalog(true); }, &identifyBundle);
+        auto *refreshTimer = new QTimer(QCoreApplication::instance());
+        refreshTimer->setInterval(60000);
+        QObject::connect(refreshTimer, &QTimer::timeout, refreshTimer, [] { refreshCatalog(); });
+        refreshTimer->start();
+        auto *trackTimer = new QTimer(QCoreApplication::instance());
+        trackTimer->setInterval(250);
+        QObject::connect(trackTimer, &QTimer::timeout, trackTimer, [] {
+            hook::refreshTrackContext();
+            if (hook::consumeSelectionStateChanges()) ui::reloadVst3Selections();
+            ui::refreshVst3TrackContext();
+        });
+        trackTimer->start();
+        vst3 = qEnvironmentVariable("GPVST3_RUN_LIFECYCLE_PROBE") == "1"
+            ? vst3::prepare(host.supported) : vst3::beginAsync(host.supported);
+    } else {
+        vst3.status = "disabled_by_user";
+        ui::setVst3DiscoveryControl(nullptr, nullptr);
+        ui::setVst3Catalog({});
+        ui::setVst3ScanState(QStringLiteral("disabled"), 0, 0, false, {});
+    }
     const auto catalog = vst3Catalog(vst3);
-    hook::setVst3Catalog(catalog);
-    if (hook::consumeSelectionStateChanges()) ui::reloadVst3Selections();
+    if (enabled) {
+        hook::setVst3Catalog(catalog);
+        if (hook::consumeSelectionStateChanges()) ui::reloadVst3Selections();
+    }
     ui::setVst3Catalog(catalog);
     scanFeedback(vst3);
     effects::Chain chain;
@@ -354,7 +376,7 @@ QJsonObject initialize() {
 
     return QJsonObject{
         {"schema", 1},
-        {"status", host.supported ? "loaded" : "host_unsupported"},
+        {"status", !enabled ? "disabled_by_user" : (host.supported ? "loaded" : "host_unsupported")},
         {"loaded", true},
         {"bypassed", chain.bypassed()},
         {"host", "Guitar Pro 8.1.1.17"},
@@ -373,7 +395,8 @@ QJsonObject initialize() {
         {"qt_ui", ui::state()},
         {"state_manager", QJsonObject{{"status", "sidecar_json_p7_enabled"},
                                         {"path", state::sidecarPath()}}},
-        {"reason", hookState.runtimeProcessorReady
+        {"reason", !enabled ? "plugin_disabled_by_user"
+                   : hookState.runtimeProcessorReady
                        ? "P2 runtime VST3 effect processing enabled by environment switch"
                        : (host.supported ? "P0 bootstrap complete; processing remains bypassed"
                                           : "Host files do not match the P0 lock")}

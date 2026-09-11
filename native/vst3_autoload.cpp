@@ -46,6 +46,12 @@ void initializePlugin() {
     status.insert("plugin_path", pluginPath());
     gpvst3::state::writeStatus(status);
     gpvst3::ui::showEffectChainPanel(false);
+    if (!gpvst3::state::pluginEnabled()) {
+        // The About dialog remains available so the user can re-enable the
+        // plugin for the next Guitar Pro launch, but no scanner, observer or
+        // audio hook is started while disabled.
+        return;
+    }
     gpvst3::ui::syncVst3Selection();
     auto *scanTimer = new QTimer(application);
     scanTimer->setInterval(100);

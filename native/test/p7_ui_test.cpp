@@ -10,11 +10,18 @@
 #include <QtWidgets/QLabel>
 #include <QtWidgets/QPushButton>
 #include <QtWidgets/QVBoxLayout>
+#include <QtGui/QMouseEvent>
 #include <QtCore/QTimer>
 
 #include <iostream>
 
 namespace {
+void doubleClick(QWidget *widget) {
+    QMouseEvent event(QEvent::MouseButtonDblClick, QPointF(2, 2), Qt::LeftButton,
+                      Qt::LeftButton, Qt::NoModifier);
+    QApplication::sendEvent(widget, &event);
+    QCoreApplication::processEvents();
+}
 bool check(bool value, const char *message) {
     if (!value) std::cerr << "FAIL: " << message << '\n';
     return value;
@@ -87,7 +94,7 @@ int main(int argc, char **argv) {
                    !saved.value("effects").toArray().at(1).toObject().value("enabled").toBool(),
                "rejected selection is not persisted as enabled")) return 1;
     gpvst3::ui::setVst3SelectionControl(nullptr);
-    panel->findChild<QPushButton *>("gpvst3GlobalEditor_ONE")->click();
+    doubleClick(panel->findChild<QPushButton *>("gpvst3GlobalName_ONE"));
     QCoreApplication::processEvents();
     bool hostLimited = false;
     for (auto *label : panel->findChildren<QLabel *>())
@@ -95,7 +102,7 @@ int main(int argc, char **argv) {
     if (!check(hostLimited, "native editor boundary is explicit")) return 1;
 
     gpvst3::ui::setVst3EditorControl(&openEditor, &closeEditor);
-    panel->findChild<QPushButton *>("gpvst3GlobalEditor_ONE")->click();
+    doubleClick(panel->findChild<QPushButton *>("gpvst3GlobalName_ONE"));
     QWidget *window = nullptr;
     for (auto *widget : QApplication::topLevelWidgets())
         if (widget->objectName() == "gpvst3NativeEditorWindow") window = widget;
@@ -103,13 +110,13 @@ int main(int argc, char **argv) {
                    window->size() == QSize(640, 480) && window->parentWidget() != panel,
                "native view has an independent correctly sized nonmodal window")) return 1;
     const auto panelSize = panel->size();
-    panel->findChild<QPushButton *>("gpvst3GlobalEditor_ONE")->click();
+    doubleClick(panel->findChild<QPushButton *>("gpvst3GlobalName_ONE"));
     if (!check(opens == 1 && window->size() == QSize(640, 480), "repeated open reuses view")) return 1;
     window->move(100, 120);
     if (!check(panel->size() == panelSize, "moving editor leaves selector layout unchanged")) return 1;
     window->close();
     if (!check(!window->isVisible() && first->isChecked(), "closing editor keeps effect enabled")) return 1;
-    panel->findChild<QPushButton *>("gpvst3GlobalEditor_ONE")->click();
+    doubleClick(panel->findChild<QPushButton *>("gpvst3GlobalName_ONE"));
 
     QWidget soundHost;
     soundHost.setObjectName(QStringLiteral("soundsContainer"));

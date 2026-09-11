@@ -2,7 +2,7 @@
 
 状态：已完成（2026-09-12）  
 关联计划：[P9：实时切换稳定性与界面体验计划](P9_AUDIO_SWITCH_UI_PLAN.md)  
-基线：`v0.8.0` / Guitar Pro 8.1.1.17 / Windows x64。
+基线：`v0.9.0` / Guitar Pro 8.1.1.17 / Windows x64。
 
 ## 用户反馈与实现状态
 
@@ -10,8 +10,10 @@
 | --- | --- | --- |
 | P9-1 | 已实现、已验证 | 异步选择 worker、双槽准备后交接、失败保留旧链/旁路、ramp 与 reader drain 指标；`test-p9-switch.ps1` 与 MCP 宿主回归通过。 |
 | P9-2 | 已实现、已验证 | global/track 紧凑行、空/扫描状态、稳定 objectName；`test-p9-ui.ps1` 通过。 |
-| P9-3 | 已实现、已验证/宿主受限回退 | `gpvst3AboutButton` 幂等复用；无稳定标题工具栏时使用 `gpvst3AboutAction`。 |
+| P9-3 | 已实现、已验证/宿主受限回退 | 标题工具栏只保留一个 About 入口；旧的 VST3 菜单 fallback 会被清理。详情窗口提供配置路径和启动开关。 |
 | P9-4 | 已实现、已验证 | 错误详情留在 `status.json`/日志，按钮、状态和 tooltip 使用中性文案；UI 夹具通过。 |
+| P9-5 | 已实现、已验证 | 插件名称双击打开 GUI，移除每行独立 GUI 按钮；MCP v1 只传递音轨上下文，native registry 提供实时链。 |
+| P9-6 | 已实现、已验证 | 状态层只保存显式配置和插件状态，空拓扑不落盘；读取旧的大 sidecar 时自动一次性压缩。 |
 
 ## 验证记录
 
@@ -23,6 +25,7 @@
 - `./native/test/test-p8-ui.ps1`
 - `./native/test/test-p7-ui.ps1`
 - MCP 宿主：`./native/test/test-p7-mcp.ps1`，使用本次构建 DLL、测试 Gain Fixture 与 Gateway，流程通过。
+- `./native/test/test-p5-state.ps1`、`test-p8-state.ps1`、`test-p7-ui.ps1`、`test-p8-ui.ps1`、`test-p9-ui.ps1`。
 
 ## 代码入口
 

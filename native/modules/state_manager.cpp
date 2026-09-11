@@ -55,13 +55,10 @@ QJsonObject emptyChain() {
     bool trackOk = false;
     const int track = qEnvironmentVariable("GPVST3_TRACK").toInt(&trackOk);
     const QString bus = qEnvironmentVariable("GPVST3_BUS", QStringLiteral("master"));
-    const auto trackKey = scoreId + QStringLiteral("#track-") + QString::number(trackOk ? track : 0);
     return QJsonObject{{"schema", kSchema}, {"score_id", scoreId}, {"track", trackOk ? track : 0},
                        {"bus", bus}, {"effects", QJsonArray{}},
                        {"global", QJsonObject{{"effects", QJsonArray{}}}},
-                       {"scores", QJsonObject{{scoreId, QJsonObject{{"tracks", QJsonObject{{
-                           {trackKey, QJsonObject{{"track_index", trackOk ? track : 0}, {"track_name", QString{}},
-                                                 {"effects", QJsonArray{}}}}}}}}}}}};
+                       {"scores", QJsonObject{}}};
 }
 
 void normalizeEffects(QJsonObject &chain) {
@@ -104,6 +101,75 @@ void normalizeScope(QJsonObject &scope) {
         normalized.append(effect);
     }
     scope.insert("effects", normalized);
+}
+
+bool hasPersistedEffectState(const QJsonObject &effect) {
+    if (effect.value("enabled").toBool() || effect.value("configured").toBool() ||
+        effect.value("desired_enabled").toBool() || !effect.value("last_error").toString().isEmpty())
+        return true;
+    for (const char *field : {"component_state", "controller_state", "state_chunk"})
+        if (!effect.value(field).toString().isEmpty()) return true;
+    const auto parameters = effect.value("parameters");
+    return parameters.isObject() && !parameters.toObject().isEmpty();
+}
+
+void compactScope(QJsonObject &scope) {
+    const auto effects = scope.value("effects").toArray();
+    QJsonArray compacted;
+    QHash<QString, int> positions;
+    int order = 0;
+    for (const auto &value : effects) {
+        if (!value.isObject()) continue;
+        auto effect = value.toObject();
+        if (!hasPersistedEffectState(effect)) continue;
+        const auto identity = QDir::cleanPath(QDir::fromNativeSeparators(
+            effect.value("module").toString())).toLower() + QStringLiteral("\n") +
+            effect.value("class_id").toString().toUpper();
+        if (positions.contains(identity)) {
+            // Catalog refreshes can report the same bundle with path casing
+            // changed. Keep one record per module/class and merge fields that
+            // are only present in the later copy.
+            auto merged = compacted.at(positions.value(identity)).toObject();
+            for (auto it = effect.begin(); it != effect.end(); ++it)
+                if (!merged.contains(it.key()) || merged.value(it.key()).isNull() ||
+                    (merged.value(it.key()).isString() && merged.value(it.key()).toString().isEmpty()))
+                    merged.insert(it.key(), it.value());
+            merged.insert("order", positions.value(identity));
+            compacted.replace(positions.value(identity), merged);
+            continue;
+        }
+        effect.insert("order", order++);
+        positions.insert(identity, compacted.size());
+        compacted.append(effect);
+    }
+    scope.insert("effects", compacted);
+}
+
+void compactChain(QJsonObject &chain) {
+    auto global = chain.value("global").toObject();
+    normalizeScope(global);
+    compactScope(global);
+    chain.insert("global", global);
+    const auto scores = chain.value("scores").toObject();
+    QJsonObject compactedScores;
+    for (auto score = scores.begin(); score != scores.end(); ++score) {
+        auto scoreObject = score.value().toObject();
+        auto tracks = scoreObject.value("tracks").toObject();
+        QJsonObject compactedTracks;
+        for (auto track = tracks.begin(); track != tracks.end(); ++track) {
+            auto trackObject = track.value().toObject();
+            normalizeScope(trackObject);
+            compactScope(trackObject);
+            // Empty, non-present records are topology bookkeeping rather than
+            // user configuration. They must not accumulate across documents.
+            if (trackObject.value("effects").toArray().isEmpty()) continue;
+            compactedTracks.insert(track.key(), trackObject);
+        }
+        if (compactedTracks.isEmpty()) continue;
+        scoreObject.insert("tracks", compactedTracks);
+        compactedScores.insert(score.key(), scoreObject);
+    }
+    chain.insert("scores", compactedScores);
 }
 
 void migrateToSchema2(QJsonObject &chain) {
@@ -155,6 +221,33 @@ QString dataDirectory() {
 
 QString sidecarPath() { return QDir(dataDirectory()).filePath(QStringLiteral("effect-chain.json")); }
 
+QString settingsPath() { return QDir(dataDirectory()).filePath(QStringLiteral("settings.json")); }
+
+bool pluginEnabled() {
+    QFile file(settingsPath());
+    if (!file.open(QIODevice::ReadOnly)) return true;
+    QJsonParseError error{};
+    const auto document = QJsonDocument::fromJson(file.readAll(), &error);
+    if (error.error != QJsonParseError::NoError || !document.isObject()) return true;
+    const auto value = document.object().value("enabled");
+    return !value.isBool() || value.toBool();
+}
+
+bool setPluginEnabled(bool enabled) {
+    QJsonObject settings;
+    QFile file(settingsPath());
+    if (file.exists()) {
+        if (!file.open(QIODevice::ReadOnly)) return false;
+        QJsonParseError error{};
+        const auto document = QJsonDocument::fromJson(file.readAll(), &error);
+        file.close();
+        if (error.error != QJsonParseError::NoError || !document.isObject()) return false;
+        settings = document.object();
+    }
+    settings.insert("enabled", enabled);
+    return writeJson(settingsPath(), settings);
+}
+
 bool loadChain(QJsonObject &chain, QString *error) {
     QFile file(sidecarPath());
     if (!file.exists()) { chain = emptyChain(); return true; }
@@ -163,8 +256,10 @@ bool loadChain(QJsonObject &chain, QString *error) {
         chain = emptyChain();
         return false;
     }
+    const auto sourceSize = file.size();
     QJsonParseError parseError{};
     const QJsonDocument document = QJsonDocument::fromJson(file.readAll(), &parseError);
+    file.close();
     if (parseError.error != QJsonParseError::NoError || !document.isObject()) {
         if (error) *error = parseError.errorString();
         chain = emptyChain();
@@ -183,6 +278,13 @@ bool loadChain(QJsonObject &chain, QString *error) {
     }
     migrateToSchema2(chain);
     normalizeEffects(chain);
+    // Older builds copied the complete discovered catalog into every track.
+    // Repair that file once on read while preserving configured plugin state.
+    if (sourceSize > 1024 * 1024) {
+        compactChain(chain);
+        chain.insert("effects", chain.value("global").toObject().value("effects"));
+        if (!writeChain(chain) && error) *error = QStringLiteral("sidecar_compaction_write_failed");
+    }
     return true;
 }
 
@@ -199,9 +301,24 @@ bool writeChain(const QJsonObject &input) {
     }
     migrateToSchema2(chain);
     normalizeEffects(chain);
-    auto global = chain.value("global").toObject();
-    normalizeScope(global);
-    chain.insert("global", global);
+    compactChain(chain);
+    // Older readers only understand this one scope. Keep it bounded to the
+    // compact global chain rather than copying the full discovery catalog.
+    chain.insert("effects", chain.value("global").toObject().value("effects"));
+    QJsonObject existing;
+    QFile file(sidecarPath());
+    if (file.open(QIODevice::ReadOnly)) {
+        QJsonParseError error{};
+        const auto document = QJsonDocument::fromJson(file.readAll(), &error);
+        file.close();
+        if (error.error == QJsonParseError::NoError && document.isObject()) existing = document.object();
+    }
+    auto comparable = chain;
+    comparable.remove("saved_at");
+    if (!existing.isEmpty()) {
+        existing.remove("saved_at");
+        if (QJsonDocument(existing) == QJsonDocument(comparable)) return true;
+    }
     chain.insert("saved_at", QDateTime::currentDateTimeUtc().toString(Qt::ISODate));
     return writeJson(sidecarPath(), chain);
 }
@@ -277,6 +394,7 @@ void setScopeEffects(QJsonObject &chain, ScopeKind scope, const QJsonArray &effe
     migrateToSchema2(chain);
     QJsonObject scopeObject{{"effects", effects}};
     normalizeScope(scopeObject);
+    compactScope(scopeObject);
     if (scope == ScopeKind::Global) {
         chain.insert("global", scopeObject);
         chain.insert("effects", scopeObject.value("effects"));
@@ -292,6 +410,17 @@ void setScopeEffects(QJsonObject &chain, ScopeKind scope, const QJsonArray &effe
     auto scoreObject = scores.value(scoreKey).toObject();
     auto tracks = scoreObject.value("tracks").toObject();
     auto trackObject = tracks.value(trackKey).toObject();
+    if (scopeObject.value("effects").toArray().isEmpty()) {
+        tracks.remove(trackKey);
+        if (tracks.isEmpty()) scores.remove(scoreKey);
+        else {
+            scoreObject.insert("tracks", tracks);
+            scores.insert(scoreKey, scoreObject);
+        }
+        chain.insert("scores", scores);
+        chain.insert("effects", chain.value("global").toObject().value("effects"));
+        return;
+    }
     if (trackIndex >= 0) trackObject.insert("track_index", trackIndex);
     if (!trackName.isEmpty()) trackObject.insert("track_name", trackName);
     trackObject.insert("effects", scopeObject.value("effects"));
@@ -299,9 +428,7 @@ void setScopeEffects(QJsonObject &chain, ScopeKind scope, const QJsonArray &effe
     scoreObject.insert("tracks", tracks);
     scores.insert(scoreKey, scoreObject);
     chain.insert("scores", scores);
-    // Compatibility view used by P5/P7 readers follows the currently active
-    // track scope. The canonical data remains under scores.
-    chain.insert("effects", scopeObject.value("effects"));
+    chain.insert("effects", chain.value("global").toObject().value("effects"));
 }
 
 bool reconcileTrackIdentities(std::vector<HostTrackIdentity> &bindings) {
@@ -358,13 +485,21 @@ bool reconcileTrackIdentities(std::vector<HostTrackIdentity> &bindings) {
                 if (key.isEmpty()) key = QStringLiteral("track-") + QUuid::createUuid().toString(QUuid::WithoutBraces);
                 session.persistentKeys.insert(binding.trackId, key);
                 auto record = tracks.value(key).toObject();
-                record.insert("track_index", binding.index);
-                record.insert("present", true);
-                tracks.insert(key, record);
+                // New, unconfigured tracks only need a runtime key in this
+                // process. Persisting an empty record for each score is what
+                // previously made the sidecar grow without bound.
+                if (!record.isEmpty()) {
+                    record.insert("track_index", binding.index);
+                    record.insert("present", true);
+                    tracks.insert(key, record);
+                }
                 locations.insert(documentId + '#' + key, {scoreKey, key, binding.index});
             }
-            score.insert("tracks", tracks);
-            scores.insert(scoreKey, score);
+            if (tracks.isEmpty()) scores.remove(scoreKey);
+            else {
+                score.insert("tracks", tracks);
+                scores.insert(scoreKey, score);
+            }
         }
         chain.insert("scores", scores);
         if (!writeChain(chain)) return false;

@@ -15,6 +15,9 @@ constexpr int kSchema = 2;
 
 QString dataDirectory();
 QString sidecarPath();
+QString settingsPath();
+bool pluginEnabled();
+bool setPluginEnabled(bool enabled);
 bool loadChain(QJsonObject &chain, QString *error = nullptr);
 bool writeChain(const QJsonObject &chain);
 QJsonArray scopeEffects(const QJsonObject &chain, ScopeKind scope,

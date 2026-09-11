@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <QtCore/QFileInfo>
+#include <QtCore/QFile>
 #include <QtCore/QCryptographicHash>
 #include <QtCore/QJsonArray>
 #include <QtCore/QJsonObject>
@@ -19,6 +20,9 @@
 #include <QtWidgets/QCheckBox>
 #include <QtGui/QCloseEvent>
 #include <QtGui/QFontMetrics>
+#include <QtGui/QMouseEvent>
+#include <QtGui/QDesktopServices>
+#include <QtCore/QUrl>
 #include <QtGui/QResizeEvent>
 #include <QtWidgets/QAction>
 #include <QtWidgets/QFileDialog>
@@ -428,7 +432,7 @@ QDialog *aboutDialog() {
     title->setFont(titleFont);
     layout->addWidget(title);
     auto *details = new QLabel(
-        QStringLiteral("版本：0.8.0\n"
+        QStringLiteral("版本：0.9.0\n"
                        "已验证宿主：Guitar Pro 8.1.1.17（Windows x64）\n"
                        "许可证：MIT License\n"
                        "第三方声明：VST3 SDK 及插件各自遵循其许可证。\n"
@@ -437,6 +441,25 @@ QDialog *aboutDialog() {
     details->setObjectName(QStringLiteral("gpvst3AboutDetails"));
     details->setWordWrap(true);
     layout->addWidget(details);
+    auto *enabled = new QCheckBox(QStringLiteral("启动时启用插件"), dialog);
+    enabled->setObjectName(QStringLiteral("gpvst3PluginEnabledCheckBox"));
+    enabled->setChecked(state::pluginEnabled());
+    enabled->setToolTip(QStringLiteral("修改后重启 Guitar Pro 生效"));
+    layout->addWidget(enabled);
+    auto *openConfig = new QPushButton(QStringLiteral("打开配置"), dialog);
+    openConfig->setObjectName(QStringLiteral("gpvst3OpenConfigButton"));
+    openConfig->setToolTip(state::settingsPath());
+    layout->addWidget(openConfig, 0, Qt::AlignLeft);
+    QObject::connect(enabled, &QCheckBox::toggled, dialog, [enabled](bool checked) {
+        if (state::setPluginEnabled(checked)) return;
+        const QSignalBlocker blocker(enabled);
+        enabled->setChecked(!checked);
+        enabled->setToolTip(QStringLiteral("配置保存失败：请检查诊断数据目录的写入权限。"));
+    });
+    QObject::connect(openConfig, &QPushButton::clicked, dialog, [] {
+        if (!QFile::exists(state::settingsPath())) state::setPluginEnabled(state::pluginEnabled());
+        QDesktopServices::openUrl(QUrl::fromLocalFile(state::settingsPath()));
+    });
     layout->addStretch(1);
     auto *close = new QPushButton(QStringLiteral("关闭"), dialog);
     close->setObjectName(QStringLiteral("gpvst3AboutCloseButton"));
@@ -487,6 +510,10 @@ void ensureAboutEntry() {
             bar->addWidget(button);
             QObject::connect(button, &QPushButton::clicked, button, [] { showAboutDialog(); });
         }
+        if (auto *stale = window->findChild<QAction *>(QStringLiteral("gpvst3AboutAction"))) {
+            window->menuBar()->removeAction(stale);
+            stale->deleteLater();
+        }
         window->setProperty("gpvst3AboutMount", "title_toolbar");
         return;
     }
@@ -516,10 +543,17 @@ public:
         updateElidedText();
     }
 
+    std::function<void()> onDoubleClick;
+
 protected:
     void resizeEvent(QResizeEvent *event) override {
         QPushButton::resizeEvent(event);
         updateElidedText();
+    }
+
+    void mouseDoubleClickEvent(QMouseEvent *event) override {
+        if (event->button() == Qt::LeftButton && onDoubleClick) onDoubleClick();
+        QPushButton::mouseDoubleClickEvent(event);
     }
 
 private:
@@ -914,16 +948,10 @@ private:
         handle->setAlignment(Qt::AlignCenter);
         handle->setFixedWidth(20);
         handle->setToolTip(QStringLiteral("拖动以调整处理顺序"));
-        auto *editor = new QPushButton(QStringLiteral("GUI"), row);
-        editor->setObjectName(prefix + QStringLiteral("Editor_") + token);
-        editor->setFixedWidth(36);
-        editor->setToolTip(QStringLiteral("打开 %1 的原生编辑器").arg(effect.value("name").toString()));
-        editor->setAccessibleName(QStringLiteral("打开 %1 GUI").arg(effect.value("name").toString()));
         layout->addWidget(check);
         layout->addWidget(name, 1);
         layout->addWidget(vendor);
         layout->addWidget(handle);
-        layout->addWidget(editor);
         item->setSizeHint(QSize(0, row->minimumHeight()));
         targetList->setItemWidget(item, row);
         const auto identity = key(effect);
@@ -937,6 +965,7 @@ private:
             if (!enabled && g_editorWindow && g_editorWindow->openedKey == editorKey) g_editorWindow->close();
             effect.insert("enabled", enabled);
             effect.insert("bypass", !enabled);
+            effect.insert("configured", true);
             effect.remove("last_error");
             effect.remove("desired_enabled");
             if (enabled) {
@@ -961,17 +990,14 @@ private:
                     : ((g_vst3SelectionRequestControl && scope_ == state::ScopeKind::Global) ||
                        (g_vst3TrackSelectionRequestControl && scope_ == state::ScopeKind::Track)
                         ? QStringLiteral("请求中：准备完成后自动生效。")
-                        : QStringLiteral("已启用：点击名称打开原生 GUI")))
+                        : QStringLiteral("已启用：双击名称打开原生 GUI")))
                 : QStringLiteral("已停用：%1").arg(effect.value("name").toString()));
             // Rebuild after the current signal so enabled rows move immediately.
             QTimer::singleShot(0, this, [this] { loadChain(); });
         });
-        connect(editor, &QPushButton::clicked, this, [this, identity] {
+        name->onDoubleClick = [this, identity] {
             const int index = indexFor(identity); if (index >= 0) openEditor(index);
-        });
-        connect(name, &QPushButton::clicked, this, [this, identity] {
-            const int index = indexFor(identity); if (index >= 0) openEditor(index);
-        });
+        };
     }
 
     void openEditor(int index) {
@@ -1502,20 +1528,14 @@ void showEffectChainPanel(bool show) {
                 dockReady = true;
             }
         } else if (!soundEntryReady) {
-            // Fallback for GP builds that expose no stable audio-section
-            // object. This keeps a visible, repeatable entry without opening
-            // a dock or showing the editor automatically at startup.
+            // Do not add a second title/menu entry when the host has not yet
+            // exposed its sound section. The native sidebar button is the
+            // single plugin entry once that section becomes available.
             for (QWidget *widget : QApplication::topLevelWidgets()) {
                 if (QByteArray(widget->metaObject()->className()) != "gp::gui::MainWindow") continue;
-                auto *window = qobject_cast<QMainWindow *>(widget);
-                if (!window || !window->menuBar()) continue;
-                auto *action = window->findChild<QAction *>("gpvst3P7EffectChainAction");
-                if (!action) {
-                    action = window->menuBar()->addAction(QStringLiteral("VST3 效果器"));
-                    action->setObjectName(QStringLiteral("gpvst3P7EffectChainAction"));
-                    QObject::connect(action, &QAction::triggered, action, [] {
-                        showEffectChainPanel();
-                    });
+                if (auto *stale = widget->findChild<QAction *>("gpvst3P7EffectChainAction")) {
+                    if (auto *window = qobject_cast<QMainWindow *>(widget)) window->menuBar()->removeAction(stale);
+                    stale->deleteLater();
                 }
             }
         }

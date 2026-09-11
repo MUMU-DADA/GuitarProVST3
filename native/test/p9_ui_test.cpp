@@ -14,6 +14,7 @@
 #include <QtWidgets/QPushButton>
 #include <QtWidgets/QToolBar>
 #include <QtWidgets/QVBoxLayout>
+#include <QtGui/QMouseEvent>
 
 #include <iostream>
 
@@ -90,6 +91,14 @@ int main(int argc, char **argv) {
                about->findChild<QLabel *>("gpvst3AboutDetails") &&
                about->findChild<QLabel *>("gpvst3AboutDetails")->text().contains("MIT License"),
                "About dialog content and nonmodal behavior")) return 1;
+    auto *startupEnabled = about->findChild<QCheckBox *>("gpvst3PluginEnabledCheckBox");
+    auto *openConfig = about->findChild<QPushButton *>("gpvst3OpenConfigButton");
+    if (!check(startupEnabled && openConfig && startupEnabled->isChecked(),
+               "About dialog exposes startup switch and configuration entry")) return 1;
+    startupEnabled->setChecked(false);
+    if (!check(!gpvst3::state::pluginEnabled(), "startup switch disables plugin for next launch")) return 1;
+    startupEnabled->setChecked(true);
+    if (!check(gpvst3::state::pluginEnabled(), "startup switch re-enables plugin")) return 1;
     about->hide();
     aboutButtons.front()->click();
     if (!check(qApp->property("gpvst3AboutDialog").value<QWidget *>() == about && about->isVisible(),
@@ -120,10 +129,9 @@ int main(int argc, char **argv) {
         window.resize(width, 800);
         QCoreApplication::processEvents();
         auto *name = sound->findChild<QPushButton *>("gpvst3GlobalName_A");
-        auto *editor = sound->findChild<QPushButton *>("gpvst3GlobalEditor_A");
-        if (!check(name && editor && name->width() >= 24 &&
-                   name->geometry().right() < editor->geometry().left(),
-                   "narrow sidebar row controls remain reachable")) return 1;
+        if (!check(name && name->width() >= 24 &&
+                   sound->findChildren<QPushButton *>("gpvst3GlobalEditor_A").isEmpty(),
+                   "narrow sidebar row keeps name control without a dedicated GUI button")) return 1;
     }
     gpvst3::ui::shutdownEditors();
     std::cout << "PASS: P9 About toolbar idempotence/reuse, neutral scan feedback and compact narrow UI.\n";
