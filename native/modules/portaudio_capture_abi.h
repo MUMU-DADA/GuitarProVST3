@@ -7,7 +7,7 @@
 
 namespace gpvst3::hook::portaudio {
 
-// AMAudio.dll 8.1.1.17 only. See docs/P4_CAPTURE_ABI.md for the call sites.
+// AMAudio.dll 8.1.1.17 only. See docs/archive/phase-records/P4_CAPTURE_ABI.md for the call sites.
 // Access these fields only inside that module's gated streamCallback: GP
 // stops the old stream before changing its configuration or freeing Impl.
 constexpr std::uintptr_t kInputParametersRva = 0x270880;
