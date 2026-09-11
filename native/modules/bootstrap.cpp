@@ -210,6 +210,18 @@ QJsonObject hookStatus(const gpvst3::hook::State &value) {
         {"chain_bypass_blocks", static_cast<qint64>(value.chainBypassBlocks)},
         {"chain_error_blocks", static_cast<qint64>(value.chainErrorBlocks)},
         {"chain_fallback_blocks", static_cast<qint64>(value.chainFallbackBlocks)},
+        {"chain_switch_requests", static_cast<qint64>(value.chainSwitchRequests)},
+        {"chain_switch_prepared", static_cast<qint64>(value.chainSwitchPrepared)},
+        {"chain_retired_slots", static_cast<qint64>(value.chainRetiredSlots)},
+        {"chain_last_switch_nanoseconds", static_cast<qint64>(value.chainLastSwitchNanoseconds)},
+        {"chain_max_switch_nanoseconds", static_cast<qint64>(value.chainMaxSwitchNanoseconds)},
+        {"chain_last_reader_drain_nanoseconds", static_cast<qint64>(value.chainLastReaderDrainNanoseconds)},
+        {"chain_max_reader_drain_nanoseconds", static_cast<qint64>(value.chainMaxReaderDrainNanoseconds)},
+        {"chain_reader_drain_timeouts", static_cast<qint64>(value.chainReaderDrainTimeouts)},
+        {"chain_sequence_gaps", static_cast<qint64>(value.chainSequenceGaps)},
+        {"chain_last_sequence", static_cast<qint64>(value.chainLastSequence)},
+        {"chain_ramp_samples", static_cast<qint64>(value.chainRampSamples)},
+        {"chain_ramp_remaining", static_cast<qint64>(value.chainRampRemaining)},
         {"last_process_nanoseconds", static_cast<qint64>(value.lastProcessNanoseconds)},
         {"max_process_nanoseconds", static_cast<qint64>(value.maxProcessNanoseconds)},
         {"total_process_nanoseconds", static_cast<qint64>(value.totalProcessNanoseconds)},
@@ -305,7 +317,9 @@ QJsonObject initialize() {
     hook::refreshTrackContext();
     ui::setRealtimeBypassControl(&hook::setTotalBypass);
     ui::setVst3SelectionControl(&hook::setGlobalVst3Selection);
+    ui::setVst3SelectionRequestControl(&hook::requestGlobalVst3Selection);
     ui::setVst3TrackSelectionControl(&hook::setTrackVst3Selection);
+    ui::setVst3TrackSelectionRequestControl(&hook::requestTrackVst3Selection);
     ui::setVst3StateControl(&hook::captureGlobalVst3States);
     ui::setVst3TrackControls(&hook::captureTrackVst3States, &hook::openTrackVst3Editor);
     ui::setVst3EditorControl(&hook::openVst3Editor, &hook::closeVst3Editors, &hook::scaleVst3Editor);

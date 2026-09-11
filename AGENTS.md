@@ -18,6 +18,8 @@
 - [实时实现总览](docs/REALTIME_IMPLEMENTATION_PLAN.md)：目标、架构、阶段状态和总体验收边界。
 - [P8 范围与验收](docs/P8_TRACK_GLOBAL_VST3_PLAN.md)：音轨/global 链、后台识别、UI 和顺序模型。
 - [P8 实现记录](docs/P8_IMPLEMENTATION.md)：当前实现、验证摘要和剩余宿主限制。
+- [P9 体验与稳定性计划](docs/P9_AUDIO_SWITCH_UI_PLAN.md)：切换稳定性、UI 重构、About 入口和扫描反馈收敛。
+- [P9 实现记录](docs/P9_IMPLEMENTATION.md)：P9 用户反馈登记、阶段状态和验证入口。
 - [测试与验证](docs/TESTING.md)：构建、免安装宿主回归和常用测试命令。
 
 历史阶段记录和完整计划快照见 [docs/archive](docs/archive/README.md)。

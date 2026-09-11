@@ -43,6 +43,18 @@ public:
         std::uint64_t maxProcessNanoseconds = 0;
         std::uint64_t totalProcessNanoseconds = 0;
         std::size_t switchCount = 0;
+        std::size_t switchRequests = 0;
+        std::size_t switchPrepared = 0;
+        std::size_t retiredSlots = 0;
+        std::uint64_t lastSwitchNanoseconds = 0;
+        std::uint64_t maxSwitchNanoseconds = 0;
+        std::uint64_t lastReaderDrainNanoseconds = 0;
+        std::uint64_t maxReaderDrainNanoseconds = 0;
+        std::size_t readerDrainTimeouts = 0;
+        std::size_t sequenceGaps = 0;
+        std::uint64_t lastSequence = 0;
+        std::size_t rampSamples = 128;
+        std::size_t rampRemaining = 0;
     };
 
     Chain() = default;
@@ -57,6 +69,10 @@ public:
     void deactivate() noexcept;
 
     void setBypassed(bool value) noexcept;
+    // Configure a short block-boundary gain transition used when a prepared
+    // slot becomes active. The default is intentionally small enough for a
+    // realtime block while avoiding a hard step at the handoff.
+    void setRampSamples(std::size_t samples) noexcept;
     bool bypassed() const noexcept { return bypassed_.load(std::memory_order_acquire); }
     void clearFault() noexcept;
     bool faulted() const noexcept { return faulted_.load(std::memory_order_acquire); }
@@ -76,6 +92,7 @@ private:
 
     bool acquire(Slot &slot, int index) noexcept;
     void waitForReaders(Slot &slot) noexcept;
+    void applyRamp(const audio::BlockView &block) noexcept;
 
     Slot slots_[kSlotCount];
     std::atomic<int> activeSlot_{-1};
@@ -91,6 +108,18 @@ private:
     std::atomic<std::uint64_t> maxProcessNanoseconds_{0};
     std::atomic<std::uint64_t> totalProcessNanoseconds_{0};
     std::atomic<std::size_t> switchCount_{0};
+    std::atomic<std::size_t> switchRequests_{0};
+    std::atomic<std::size_t> switchPrepared_{0};
+    std::atomic<std::size_t> retiredSlots_{0};
+    std::atomic<std::uint64_t> lastSwitchNanoseconds_{0};
+    std::atomic<std::uint64_t> maxSwitchNanoseconds_{0};
+    std::atomic<std::uint64_t> lastReaderDrainNanoseconds_{0};
+    std::atomic<std::uint64_t> maxReaderDrainNanoseconds_{0};
+    std::atomic<std::size_t> readerDrainTimeouts_{0};
+    std::atomic<std::size_t> sequenceGaps_{0};
+    std::atomic<std::uint64_t> lastSequence_{0};
+    std::atomic<std::size_t> rampSamples_{128};
+    std::atomic<std::size_t> rampRemaining_{0};
 };
 
 }

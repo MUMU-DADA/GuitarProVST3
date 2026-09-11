@@ -36,3 +36,15 @@ git diff --check
 ## 证据边界
 
 完整宿主回归需要匹配版本的 Guitar Pro、桌面会话和可用音频设备；未运行的设备矩阵或听感项目不能由夹具 PASS 代替。提交前不要将 `artifacts/`、`.tools/`、测试 VST3、缓存或安装包纳入提交。
+
+## P9 验证
+
+P9 夹具验证不使用 computer use；宿主流程使用已安装的 MCP bridge/`host-session.ps1`，并将运行数据写入独立 artifacts 目录。
+
+```powershell
+./native/test/test-p9-switch.ps1
+./native/test/test-p9-ui.ps1
+./native/test/test-p9.ps1
+```
+
+切换专项记录 UI 请求确认、控制 worker 合并、准备/交接/reader drain 耗时、ramp 和音频块连续性；UI 专项覆盖 About 工具栏按钮幂等、窗口复用、窄侧栏/DPI 和扫描错误不出现在可见文本或 tooltip。`test-p9.ps1` 串联两个专项并保留 evidence。真实 Guitar Pro 听感和设备回归仍须单独记录。

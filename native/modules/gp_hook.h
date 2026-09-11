@@ -87,6 +87,18 @@ struct State {
     std::size_t chainBypassBlocks = 0;
     std::size_t chainErrorBlocks = 0;
     std::size_t chainFallbackBlocks = 0;
+    std::size_t chainSwitchRequests = 0;
+    std::size_t chainSwitchPrepared = 0;
+    std::size_t chainRetiredSlots = 0;
+    std::uint64_t chainLastSwitchNanoseconds = 0;
+    std::uint64_t chainMaxSwitchNanoseconds = 0;
+    std::uint64_t chainLastReaderDrainNanoseconds = 0;
+    std::uint64_t chainMaxReaderDrainNanoseconds = 0;
+    std::size_t chainReaderDrainTimeouts = 0;
+    std::size_t chainSequenceGaps = 0;
+    std::uint64_t chainLastSequence = 0;
+    std::size_t chainRampSamples = 128;
+    std::size_t chainRampRemaining = 0;
     std::uint64_t lastProcessNanoseconds = 0;
     std::uint64_t maxProcessNanoseconds = 0;
     std::uint64_t totalProcessNanoseconds = 0;
@@ -197,9 +209,17 @@ std::vector<Vst3SelectionEntry> captureVst3States();
 // observed in processDSP.
 bool setGlobalVst3Selection(const std::vector<Vst3SelectionEntry> &selection,
                             std::string *error = nullptr) noexcept;
+// Nonblocking UI request path. The request is coalesced and prepared on the
+// runtime control worker; the synchronous API above remains available to
+// fixtures and maintenance callers.
+bool requestGlobalVst3Selection(const std::vector<Vst3SelectionEntry> &selection,
+                                std::string *error = nullptr) noexcept;
 bool setTrackVst3Selection(const std::string &trackKey,
                            const std::vector<Vst3SelectionEntry> &selection,
                            std::string *error = nullptr) noexcept;
+bool requestTrackVst3Selection(const std::string &trackKey,
+                               const std::vector<Vst3SelectionEntry> &selection,
+                               std::string *error = nullptr) noexcept;
 std::vector<Vst3SelectionEntry> captureGlobalVst3States();
 std::vector<Vst3SelectionEntry> captureTrackVst3States(const std::string &trackKey);
 // Open the editor owned by the currently active processing instance. The

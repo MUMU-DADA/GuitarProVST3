@@ -30,6 +30,7 @@
 #include <QtWidgets/QLineEdit>
 #include <QtWidgets/QListWidget>
 #include <QtWidgets/QDockWidget>
+#include <QtWidgets/QDialog>
 #include <QtWidgets/QMainWindow>
 #include <QtWidgets/QMenuBar>
 #include <QtWidgets/QPushButton>
@@ -39,13 +40,16 @@
 #include <QtWidgets/QWidget>
 #include <QtWidgets/QSizePolicy>
 #include <QtWidgets/QTabWidget>
+#include <QtWidgets/QToolBar>
 
 namespace gpvst3::ui {
 namespace {
 
 RealtimeBypassControl g_realtimeBypassControl = nullptr;
 Vst3SelectionControl g_vst3SelectionControl = nullptr;
+Vst3SelectionRequestControl g_vst3SelectionRequestControl = nullptr;
 Vst3TrackSelectionControl g_vst3TrackSelectionControl = nullptr;
+Vst3TrackSelectionRequestControl g_vst3TrackSelectionRequestControl = nullptr;
 Vst3StateControl g_vst3StateControl = nullptr;
 Vst3TrackStateControl g_vst3TrackStateControl = nullptr;
 Vst3TrackEditorControl g_vst3TrackEditorControl = nullptr;
@@ -64,6 +68,7 @@ class P7Panel;
 P7Panel *g_p7Panel = nullptr;
 P7Panel *g_globalPanel = nullptr;
 QPointer<QTimer> g_panelAttachTimer;
+QPointer<QDialog> g_aboutDialog;
 bool g_panelUsesP7 = true;
 bool g_trackExpanded = true, g_globalExpanded = true;
 
@@ -395,6 +400,106 @@ NativeEditorWindow *editorWindow() {
     return g_editorWindow;
 }
 
+QMainWindow *mainWindow() {
+    for (auto *widget : QApplication::topLevelWidgets()) {
+        if (auto *window = qobject_cast<QMainWindow *>(widget)) {
+            if (QByteArray(widget->metaObject()->className()) == "gp::gui::MainWindow") return window;
+        }
+    }
+    for (auto *widget : QApplication::topLevelWidgets())
+        if (auto *window = qobject_cast<QMainWindow *>(widget)) return window;
+    return nullptr;
+}
+
+QDialog *aboutDialog() {
+    if (g_aboutDialog) return g_aboutDialog;
+    auto *owner = mainWindow();
+    auto *dialog = new QDialog(owner);
+    dialog->setObjectName(QStringLiteral("gpvst3AboutDialog"));
+    dialog->setWindowTitle(QStringLiteral("关于 GuitarProVST3"));
+    dialog->setModal(false);
+    dialog->setAttribute(Qt::WA_DeleteOnClose, false);
+    dialog->resize(420, 300);
+    auto *layout = new QVBoxLayout(dialog);
+    auto *title = new QLabel(QStringLiteral("GuitarProVST3"), dialog);
+    QFont titleFont = title->font();
+    titleFont.setPointSize(titleFont.pointSize() + 2);
+    titleFont.setBold(true);
+    title->setFont(titleFont);
+    layout->addWidget(title);
+    auto *details = new QLabel(
+        QStringLiteral("版本：0.8.0\n"
+                       "已验证宿主：Guitar Pro 8.1.1.17（Windows x64）\n"
+                       "许可证：MIT License\n"
+                       "第三方声明：VST3 SDK 及插件各自遵循其许可证。\n"
+                       "诊断数据目录：%1")
+            .arg(state::dataDirectory()), dialog);
+    details->setObjectName(QStringLiteral("gpvst3AboutDetails"));
+    details->setWordWrap(true);
+    layout->addWidget(details);
+    layout->addStretch(1);
+    auto *close = new QPushButton(QStringLiteral("关闭"), dialog);
+    close->setObjectName(QStringLiteral("gpvst3AboutCloseButton"));
+    close->setDefault(true);
+    layout->addWidget(close, 0, Qt::AlignRight);
+    QObject::connect(close, &QPushButton::clicked, dialog, &QDialog::hide);
+    g_aboutDialog = dialog;
+    if (qApp) qApp->setProperty("gpvst3AboutDialog", QVariant::fromValue(static_cast<QWidget *>(dialog)));
+    QObject::connect(dialog, &QObject::destroyed, qApp, [] {
+        g_aboutDialog = nullptr;
+        if (qApp) qApp->setProperty("gpvst3AboutDialog", QVariant());
+    });
+    return dialog;
+}
+
+void showAboutDialog() {
+    auto *dialog = aboutDialog();
+    if (!dialog) return;
+    dialog->show();
+    dialog->raise();
+    dialog->activateWindow();
+}
+
+QToolBar *findTitleToolBar(QMainWindow *window) {
+    if (!window) return nullptr;
+    const QStringList names{QStringLiteral("gpvst3TitleToolBar"), QStringLiteral("titleToolBar"),
+                            QStringLiteral("gpTitleToolBar"), QStringLiteral("mainToolBar"),
+                            QStringLiteral("toolBar")};
+    for (const auto &name : names)
+        if (auto *bar = window->findChild<QToolBar *>(name)) return bar;
+    for (auto *bar : window->findChildren<QToolBar *>()) {
+        const auto object = bar->objectName().toLower();
+        if (object.contains(QStringLiteral("title")) || object.contains(QStringLiteral("header"))) return bar;
+    }
+    const auto bars = window->findChildren<QToolBar *>();
+    return bars.isEmpty() ? nullptr : bars.front();
+}
+
+void ensureAboutEntry() {
+    auto *window = mainWindow();
+    if (!window) return;
+    if (auto *bar = findTitleToolBar(window)) {
+        if (!bar->findChild<QPushButton *>(QStringLiteral("gpvst3AboutButton"))) {
+            auto *button = new QPushButton(QStringLiteral("关于"), bar);
+            button->setObjectName(QStringLiteral("gpvst3AboutButton"));
+            button->setToolTip(QStringLiteral("关于 GuitarProVST3"));
+            button->setAccessibleName(QStringLiteral("关于 GuitarProVST3"));
+            bar->addWidget(button);
+            QObject::connect(button, &QPushButton::clicked, button, [] { showAboutDialog(); });
+        }
+        window->setProperty("gpvst3AboutMount", "title_toolbar");
+        return;
+    }
+    if (!window->menuBar()) return;
+    auto *action = window->findChild<QAction *>(QStringLiteral("gpvst3AboutAction"));
+    if (!action) {
+        action = window->menuBar()->addAction(QStringLiteral("关于 GuitarProVST3"));
+        action->setObjectName(QStringLiteral("gpvst3AboutAction"));
+        QObject::connect(action, &QAction::triggered, action, [] { showAboutDialog(); });
+    }
+    window->setProperty("gpvst3AboutMount", "menu_fallback");
+}
+
 class ElidedButton final : public QPushButton {
 public:
     explicit ElidedButton(QWidget *parent = nullptr) : QPushButton(parent) {
@@ -508,7 +613,10 @@ public:
         if (scope_ == state::ScopeKind::Global || contextReady_) restoreSelection();
     }
 
-    void reloadSavedSelection() { loadChain(); }
+    void reloadSavedSelection() {
+        loadChain();
+        setProperty("gpvst3SelectionState", "applied");
+    }
 
     void refreshTrackContext() {
         if (scope_ == state::ScopeKind::Global) return;
@@ -528,7 +636,10 @@ public:
     void capture() { saveRuntimeState(); }
     void scanFeedback() {
         status_->setText(g_scanMessage);
-        status_->setToolTip(g_scanDetail);
+        // Scan diagnostics stay in status.json/logs. Product UI keeps a
+        // neutral tooltip so module paths and error codes never leak into a
+        // row or a hover card.
+        status_->setToolTip(QStringLiteral("VST3 插件清单状态"));
         if (g_scanMessage.isEmpty() && activeList()->count() == 0 && activeAvailableList()->count() == 0)
             status_->setText(QStringLiteral("未发现可用的 VST3 效果器。"));
     }
@@ -586,12 +697,22 @@ private:
                                  stateBytes(effect, "component_state"), stateBytes(effect, "controller_state")});
         }
         selectionDirty_ = false;
+        setProperty("gpvst3SelectionState", "requesting");
         std::string error;
         const bool accepted = scope_ == state::ScopeKind::Global
-            ? (g_vst3SelectionControl ? g_vst3SelectionControl(selection, &error) : true)
-            : (g_vst3TrackSelectionControl ? g_vst3TrackSelectionControl(
-                  trackKey_.toStdString(), selection, &error) : true);
-        if (accepted) return true;
+            ? (g_vst3SelectionRequestControl ? g_vst3SelectionRequestControl(selection, &error)
+               : (g_vst3SelectionControl ? g_vst3SelectionControl(selection, &error) : true))
+            : (g_vst3TrackSelectionRequestControl ? g_vst3TrackSelectionRequestControl(
+                  trackKey_.toStdString(), selection, &error)
+               : (g_vst3TrackSelectionControl ? g_vst3TrackSelectionControl(
+                  trackKey_.toStdString(), selection, &error) : true));
+        if (accepted) {
+            setProperty("gpvst3SelectionState",
+                        (g_vst3SelectionRequestControl || g_vst3TrackSelectionRequestControl)
+                            ? "request_pending" : "applied");
+            return true;
+        }
+        setProperty("gpvst3SelectionState", "failed_reverted");
         QString message = QStringLiteral("无法启用此插件：插件初始化失败。");
         if (error == "host_unsupported")
             message = QStringLiteral("当前 Guitar Pro 版本未通过兼容性校验，无法启用效果器。");
@@ -777,9 +898,10 @@ private:
         name->setToolTip(QStringLiteral("%1\n厂商：%2\nentry_id：%3")
             .arg(effect.value("name").toString(), effect.value("vendor").toString(), fullIdentity));
         if (!effect.value("last_error").toString().isEmpty()) {
-            name->setToolTip(name->toolTip() + QStringLiteral("\n上次启用失败：") + effect.value("last_error").toString());
-            check->setToolTip(QStringLiteral("上次启用失败；重新勾选可重试。"));
-            check->setAccessibleDescription(effect.value("last_error").toString());
+            // Keep the failure reason in the sidecar/structured diagnostics;
+            // the compact row only offers a neutral retry affordance.
+            row->setProperty("gpvst3Diagnostic", effect.value("last_error"));
+            check->setToolTip(QStringLiteral("重新勾选可重试。"));
         }
         auto *vendor = new QLabel(effect.value("vendor").toString(), row);
         vendor->setObjectName(prefix + QStringLiteral("Vendor_") + token);
@@ -836,7 +958,10 @@ private:
             status_->setText(enabled
                 ? (scope_ == state::ScopeKind::Track && !state::runtimeTrackContextAvailable()
                     ? QStringLiteral("已保存音轨链：等待宿主确认音轨上下文，当前保持旁路。")
-                    : QStringLiteral("已启用：点击名称打开原生 GUI"))
+                    : ((g_vst3SelectionRequestControl && scope_ == state::ScopeKind::Global) ||
+                       (g_vst3TrackSelectionRequestControl && scope_ == state::ScopeKind::Track)
+                        ? QStringLiteral("请求中：准备完成后自动生效。")
+                        : QStringLiteral("已启用：点击名称打开原生 GUI")))
                 : QStringLiteral("已停用：%1").arg(effect.value("name").toString()));
             // Rebuild after the current signal so enabled rows move immediately.
             QTimer::singleShot(0, this, [this] { loadChain(); });
@@ -1138,7 +1263,7 @@ QWidget *ensureHostSection(QWidget *host, const QString &sectionName,
 
 } // namespace
 
-const char *state() noexcept { return "panel_ready_p7"; }
+const char *state() noexcept { return "panel_ready_p9"; }
 
 void setRealtimeBypassControl(RealtimeBypassControl control) noexcept {
     g_realtimeBypassControl = control;
@@ -1148,8 +1273,16 @@ void setVst3SelectionControl(Vst3SelectionControl control) noexcept {
     g_vst3SelectionControl = control;
 }
 
+void setVst3SelectionRequestControl(Vst3SelectionRequestControl control) noexcept {
+    g_vst3SelectionRequestControl = control;
+}
+
 void setVst3TrackSelectionControl(Vst3TrackSelectionControl control) noexcept {
     g_vst3TrackSelectionControl = control;
+}
+
+void setVst3TrackSelectionRequestControl(Vst3TrackSelectionRequestControl control) noexcept {
+    g_vst3TrackSelectionRequestControl = control;
 }
 
 void setVst3StateControl(Vst3StateControl control) noexcept {
@@ -1187,23 +1320,27 @@ void setVst3ScanState(const QString &state, int checked, int total, bool cached,
     g_scanMessage.clear();
     g_scanDetail = detail;
     if (state == "scanning") {
-        g_scanButtonText = cached ? QStringLiteral("VST3 · 正在更新…") : (total > 0
-            ? QStringLiteral("VST3 · 扫描 %1/%2").arg(checked).arg(total) : QStringLiteral("VST3 · 正在扫描…"));
+        g_scanButtonText = cached ? QStringLiteral("VST3 · 正在更新…") :
+            (total > 0 ? QStringLiteral("VST3 · 扫描中… %1/%2").arg(checked).arg(total)
+                        : QStringLiteral("VST3 · 扫描中…"));
         g_scanMessage = cached ? QStringLiteral("正在检查插件变化，缓存清单可继续使用。")
             : QStringLiteral("首次扫描可能需要一些时间，完成后将自动显示插件。");
     } else if (state == "recognition") {
-        g_scanButtonText = QStringLiteral("VST3 · 后台识别中…");
-        g_scanMessage = QStringLiteral("插件清单已可用，后台正在识别候选插件。勾选操作不会阻塞界面。");
+        g_scanButtonText = QStringLiteral("VST3 · 扫描中…");
+        g_scanMessage = QStringLiteral("正在更新可用插件清单。");
     } else if (state == "scan_failed") {
-        g_scanButtonText = QStringLiteral("VST3 · 扫描失败，点击重试");
-        g_scanMessage = QStringLiteral("扫描失败，请点击 VST3 重试。");
-    } else if (state == "partial_failure") {
-        g_scanMessage = QStringLiteral("部分文件读取失败，已保留候选插件，稍后重试静态读取。");
+        // A retry affordance is useful while keeping the text free of
+        // module names, paths and error codes.
+        g_scanButtonText = QStringLiteral("VST3 · 点击重试");
+        g_scanMessage = QStringLiteral("点击 VST3 可刷新插件清单。");
+    } else if (state == "partial_failure" || state == "failed" || state == "timeout") {
+        g_scanMessage = QStringLiteral("点击 VST3 可刷新插件清单。");
     }
     if (qApp) for (auto *widget : QApplication::allWidgets()) {
         if (widget->objectName() == QStringLiteral("gpvst3SoundEffectChainButton")) {
             if (auto *button = qobject_cast<QPushButton *>(widget)) {
-                button->setText(g_scanButtonText); button->setToolTip(g_scanDetail);
+                button->setText(g_scanButtonText);
+                button->setToolTip(QStringLiteral("打开或刷新 VST3 插件清单"));
             }
         }
     }
@@ -1270,6 +1407,7 @@ void showEffectChainPanel(bool show) {
         g_panelAttachTimer = timer;
     }
     const auto attachPanel = [timer] {
+        ensureAboutEntry();
         QWidget *panel = qApp->property("gpvst3P5Panel").value<QWidget *>();
         if (!panel) {
             panel = g_panelUsesP7 ? static_cast<QWidget *>(new P7Panel)
@@ -1312,7 +1450,7 @@ void showEffectChainPanel(bool show) {
         if (soundHost && !soundHost->findChild<QPushButton *>("gpvst3SoundEffectChainButton")) {
             auto *button = new QPushButton(g_scanButtonText, soundHost);
             button->setObjectName(QStringLiteral("gpvst3SoundEffectChainButton"));
-            button->setToolTip(g_scanDetail);
+            button->setToolTip(QStringLiteral("打开或刷新 VST3 插件清单"));
             soundHost->layout()->addWidget(button);
             QObject::connect(button, &QPushButton::clicked, button, [] {
                 showEffectChainPanel();

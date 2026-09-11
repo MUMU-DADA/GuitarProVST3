@@ -14,6 +14,7 @@
 #include <cstring>
 #include <filesystem>
 #include <mutex>
+#include <condition_variable>
 #include <string>
 #include <vector>
 #include <unordered_map>
@@ -767,11 +768,16 @@ struct TrackRuntime {
         const auto old = chain.snapshot().activeSlot;
         const auto target = old == 0 ? 1U : 0U;
         const auto *previous = old >= 0 ? &trackSlots[old] : nullptr;
+        // Reuse only a slot that has been retired at a block boundary. The
+        // chain admission check drains readers before the slot's shared
+        // processor instances are replaced.
+        if (!chain.prepareSlot(target, {&trackSlots[target], &SelectionSlot::processCallback})) {
+            if (error) *error = "runtime_vst3_track_chain_prepare_failed";
+            return false;
+        }
         if (!trackSlots[target].prepare(entries, rate, maxBlock, previous, error)) return false;
-        chain.deactivate();
         count = entries.size();
         if (entries.empty()) {
-            if (old >= 0) trackSlots[old].shutdown();
             chain.clearFault();
             chain.setBypassed(true);
             configured.store(true, std::memory_order_release);
@@ -785,7 +791,6 @@ struct TrackRuntime {
         }
         chain.clearFault();
         chain.setBypassed(false);
-        if (old >= 0 && old != static_cast<int>(target)) trackSlots[old].shutdown();
         configured.store(true, std::memory_order_release);
         configuredRate.store(static_cast<int>(rate), std::memory_order_release);
         return true;
@@ -951,12 +956,115 @@ struct Runtime {
     std::atomic<std::size_t> inputConfigurationErrors{0};
     std::atomic<bool> inputConfigurationPending{false};
     std::atomic_flag inputProcessing = ATOMIC_FLAG_INIT;
+    std::thread selectionWorker;
+    std::condition_variable selectionCondition;
+    bool selectionWorkerStop = false;
+    bool selectionRequestPending = false;
+    std::uint64_t selectionRequestGeneration = 0;
+    std::uint64_t selectionAppliedGeneration = 0;
+    std::vector<Vst3SelectionEntry> pendingSelection;
+    std::vector<Vst3SelectionEntry> appliedSelection;
+    std::unordered_map<std::string, std::vector<Vst3SelectionEntry>> pendingTrackSelections;
 };
 
 Runtime g_runtime;
 State g_initial;
+std::atomic<bool> g_selectionStateChanged{false};
 thread_local bool g_inMasterHook = false;
 double callbackSampleRate() noexcept;
+void rejectSavedEntry(const Vst3SelectionEntry &entry, const std::string &error,
+                      state::ScopeKind scope, const std::string &score = {},
+                      const std::string &track = {}, int trackIndex = -1);
+
+bool containsIdentity(const std::vector<Vst3SelectionEntry> &entries,
+                      const Vst3SelectionEntry &value) noexcept {
+    return std::any_of(entries.begin(), entries.end(), [&](const Vst3SelectionEntry &entry) {
+        return entry.module == value.module && entry.classId == value.classId;
+    });
+}
+
+void selectionWorkerLoop() {
+    for (;;) {
+        std::vector<Vst3SelectionEntry> selection;
+        std::string trackKey;
+        std::uint64_t generation = 0;
+        {
+            std::unique_lock<std::mutex> lock(g_runtime.selectionMutex);
+            g_runtime.selectionCondition.wait(lock, [] {
+                return g_runtime.selectionWorkerStop || g_runtime.selectionRequestPending ||
+                       !g_runtime.pendingTrackSelections.empty();
+            });
+            if (g_runtime.selectionWorkerStop && !g_runtime.selectionRequestPending &&
+                g_runtime.pendingTrackSelections.empty()) return;
+            if (g_runtime.selectionRequestPending) {
+                selection = std::move(g_runtime.pendingSelection);
+                generation = g_runtime.selectionRequestGeneration;
+                g_runtime.selectionRequestPending = false;
+                std::string error;
+                const bool accepted = configureSelectedChain(selection, &error);
+                if (accepted) {
+                    g_runtime.requestedSelection = selection;
+                    g_runtime.appliedSelection = selection;
+                    g_runtime.selectionAppliedGeneration = generation;
+                } else {
+                    for (const auto &entry : selection)
+                        if (!containsIdentity(g_runtime.appliedSelection, entry))
+                            rejectSavedEntry(entry, "runtime_vst3_selection_prepare_failed",
+                                             state::ScopeKind::Global);
+                    g_runtime.requestedSelection = g_runtime.appliedSelection;
+                }
+            } else {
+                auto it = g_runtime.pendingTrackSelections.begin();
+                trackKey = it->first;
+                selection = std::move(it->second);
+                g_runtime.pendingTrackSelections.erase(it);
+                auto runtime = std::find_if(std::begin(g_runtime.trackRuntimes),
+                                            std::end(g_runtime.trackRuntimes),
+                                            [&](const TrackRuntime &value) {
+                                                return value.trackKey == trackKey;
+                                            });
+                if (runtime != std::end(g_runtime.trackRuntimes)) {
+                    std::string error;
+                    if (runtime->prepare(selection, callbackSampleRate(), 16384, &error)) {
+                        runtime->requested = selection;
+                        runtime->error.clear();
+                    } else {
+                        for (const auto &entry : selection)
+                            if (!containsIdentity(runtime->requested, entry))
+                                rejectSavedEntry(entry, "runtime_vst3_selection_prepare_failed",
+                                                 state::ScopeKind::Track, runtime->scoreKey,
+                                                 runtime->trackKey, runtime->trackIndex);
+                        runtime->error = error;
+                        runtime->failedSelection = selection;
+                    }
+                }
+            }
+            g_selectionStateChanged.store(true, std::memory_order_release);
+        }
+    }
+}
+
+void startSelectionWorker() {
+    std::lock_guard<std::mutex> lock(g_runtime.selectionMutex);
+    if (g_runtime.selectionWorker.joinable()) return;
+    g_runtime.selectionWorkerStop = false;
+    g_runtime.selectionWorker = std::thread(selectionWorkerLoop);
+}
+
+void stopSelectionWorker() noexcept {
+    {
+        std::lock_guard<std::mutex> lock(g_runtime.selectionMutex);
+        if (!g_runtime.selectionWorker.joinable()) return;
+        g_runtime.selectionWorkerStop = true;
+        g_runtime.selectionRequestPending = false;
+        g_runtime.pendingSelection.clear();
+        g_runtime.pendingTrackSelections.clear();
+    }
+    g_runtime.selectionCondition.notify_all();
+    g_runtime.selectionWorker.join();
+    std::lock_guard<std::mutex> lock(g_runtime.selectionMutex);
+    g_runtime.selectionWorkerStop = false;
+}
 
 bool sameSelection(const std::vector<Vst3SelectionEntry> &left,
                   const std::vector<Vst3SelectionEntry> &right) noexcept {
@@ -1046,10 +1154,8 @@ void persistRuntimeEntries(const std::vector<Vst3SelectionEntry> &entries, state
     state::writeChain(chain);
 }
 
-bool g_selectionStateChanged = false;
-
 void rejectSavedEntry(const Vst3SelectionEntry &entry, const std::string &error, state::ScopeKind scope,
-                      const std::string &score = {}, const std::string &track = {}, int trackIndex = -1) {
+                      const std::string &score, const std::string &track, int trackIndex) {
     QJsonObject chain;
     if (!state::loadChain(chain)) return;
     auto entries = state::scopeEffects(chain, scope, QString::fromStdString(score), QString::fromStdString(track));
@@ -1216,7 +1322,9 @@ void refreshTrackContextImpl() noexcept {
             }
         }
         const auto requested = g_runtime.requestedTrackSelections.find(runtime.trackKey);
-        if (requested != g_runtime.requestedTrackSelections.end() &&
+        const bool queued = g_runtime.pendingTrackSelections.find(runtime.trackKey) !=
+            g_runtime.pendingTrackSelections.end();
+        if (requested != g_runtime.requestedTrackSelections.end() && !queued &&
             (!runtime.configured.load(std::memory_order_acquire) ||
              !sameSelection(runtime.requested, requested->second)) &&
             (runtime.error.empty() || !sameSelection(runtime.failedSelection, requested->second))) {
@@ -1774,8 +1882,9 @@ State prepare(const host::Verification &verification, bool enableForSelection) n
         }
         {
             std::lock_guard<std::mutex> lock(g_runtime.selectionMutex);
-            if (result.installed && !g_runtime.requestedSelection.empty())
-                (void)configureSelectedChain(g_runtime.requestedSelection);
+            if (result.installed && !g_runtime.requestedSelection.empty() &&
+                configureSelectedChain(g_runtime.requestedSelection))
+                g_runtime.appliedSelection = g_runtime.requestedSelection;
         }
         if (result.installed && inputFeatureEnabled()) configureInputRouter();
         else {
@@ -1940,6 +2049,18 @@ State snapshot() noexcept {
     result.chainBypassBlocks = chain.bypassBlocks;
     result.chainErrorBlocks = chain.errorBlocks;
     result.chainFallbackBlocks = chain.fallbackBlocks;
+    result.chainSwitchRequests = chain.switchRequests;
+    result.chainSwitchPrepared = chain.switchPrepared;
+    result.chainRetiredSlots = chain.retiredSlots;
+    result.chainLastSwitchNanoseconds = chain.lastSwitchNanoseconds;
+    result.chainMaxSwitchNanoseconds = chain.maxSwitchNanoseconds;
+    result.chainLastReaderDrainNanoseconds = chain.lastReaderDrainNanoseconds;
+    result.chainMaxReaderDrainNanoseconds = chain.maxReaderDrainNanoseconds;
+    result.chainReaderDrainTimeouts = chain.readerDrainTimeouts;
+    result.chainSequenceGaps = chain.sequenceGaps;
+    result.chainLastSequence = chain.lastSequence;
+    result.chainRampSamples = chain.rampSamples;
+    result.chainRampRemaining = chain.rampRemaining;
     result.lastProcessNanoseconds = chain.lastProcessNanoseconds;
     result.maxProcessNanoseconds = chain.maxProcessNanoseconds;
     result.totalProcessNanoseconds = chain.totalProcessNanoseconds;
@@ -2049,18 +2170,24 @@ bool configureSelectedChain(const std::vector<Vst3SelectionEntry> &selection, st
         if (error) *error = "runtime_vst3_initialize_exception";
         return false;
     }
-    // Prepare before the handoff. Existing instances retain their GUI,
-    // parameters and DSP history. Release removed instances after draining.
-    g_runtime.chain.deactivate();
+    // Prepare before the handoff. Activation only flips atomics at a block
+    // boundary; the previous slot remains owned by the runtime until that
+    // slot is safely reused on a later request. This keeps UI/control calls
+    // out of reader-drain waits while preserving processor lifetime.
     g_runtime.selectionMode.store(!selection.empty(), std::memory_order_release);
     g_runtime.selectionConfiguredRate.store(static_cast<int>(rate), std::memory_order_release);
     g_runtime.selectionPublished.store(true, std::memory_order_release);
     g_runtime.chain.clearFault();
     if (!selection.empty()) {
         g_runtime.chain.activate(target);
+    } else {
+        g_runtime.chain.deactivate();
+        // Keep the last prepared slot available for a future re-enable while
+        // bypassing it immediately. The empty selection is the explicit
+        // direct-bypass state and exposes no active processor instance.
+        g_runtime.chain.setBypassed(true);
     }
     g_runtime.chain.setBypassed(selection.empty());
-    if (old >= 0) g_runtime.selectionSlots[old].shutdown();
     g_runtime.effects[0].shutdown();
     g_runtime.effects[1].shutdown();
     return true;
@@ -2091,6 +2218,7 @@ void reconfigureInputRouterIfNeeded() noexcept {
 }
 
 void shutdown() noexcept {
+    stopSelectionWorker();
     const TrackDispatchUpdate trackUpdate;
     state::clearRuntimeTrackContext();
     g_runtime.chain.setBypassed(true);
@@ -2119,6 +2247,7 @@ void shutdown() noexcept {
         std::lock_guard<std::mutex> lock(g_runtime.selectionMutex);
         g_runtime.requestedSelection.clear();
         g_runtime.requestedTrackSelections.clear();
+        g_runtime.pendingTrackSelections.clear();
         g_runtime.publishedBindings.clear();
         g_runtime.currentTrackKey.clear();
     }
@@ -2154,6 +2283,8 @@ void shutdown() noexcept {
     g_runtime.globalChainProcessBlocks.store(0, std::memory_order_relaxed);
     g_runtime.selectionMode.store(false, std::memory_order_release);
     g_runtime.selectionPublished.store(false, std::memory_order_release);
+    g_runtime.pendingSelection.clear();
+    g_runtime.appliedSelection.clear();
 }
 
 std::uint64_t outputHash(const void *output, unsigned long frames) noexcept {
@@ -2294,6 +2425,31 @@ bool setGlobalVst3Selection(const std::vector<Vst3SelectionEntry> &selection,
     return setVst3Selection(selection, error);
 }
 
+bool requestGlobalVst3Selection(const std::vector<Vst3SelectionEntry> &selection,
+                                std::string *error) noexcept {
+    if (error) error->clear();
+    if (selection.size() > SelectionSlot::kMaxEffects) {
+        if (error) *error = "runtime_vst3_chain_full";
+        return false;
+    }
+    if (!g_runtime.master.installed && !selection.empty()) {
+        const auto prepared = prepare(host::verify(), true);
+        if (!prepared.installed) {
+            if (error) *error = prepared.reason;
+            return false;
+        }
+    }
+    startSelectionWorker();
+    {
+        std::lock_guard<std::mutex> lock(g_runtime.selectionMutex);
+        g_runtime.pendingSelection = selection;
+        g_runtime.selectionRequestPending = true;
+        ++g_runtime.selectionRequestGeneration;
+    }
+    g_runtime.selectionCondition.notify_one();
+    return true;
+}
+
 void saveVst3States() {
     persistRuntimeEntries(captureVst3States(), state::ScopeKind::Global);
     std::lock_guard<std::mutex> lock(g_runtime.selectionMutex);
@@ -2341,9 +2497,7 @@ void setVst3Catalog(const QJsonArray &catalog) {
 }
 
 bool consumeSelectionStateChanges() noexcept {
-    const bool changed = g_selectionStateChanged;
-    g_selectionStateChanged = false;
-    return changed;
+    return g_selectionStateChanged.exchange(false, std::memory_order_acq_rel);
 }
 
 bool setTrackVst3Selection(const std::string &trackKey,
@@ -2396,6 +2550,39 @@ bool setTrackVst3Selection(const std::string &trackKey,
         refreshTrackContextImpl();
         return false;
     }
+    return true;
+}
+
+bool requestTrackVst3Selection(const std::string &trackKey,
+                               const std::vector<Vst3SelectionEntry> &selection,
+                               std::string *error) noexcept {
+    if (error) error->clear();
+    if (trackKey.empty()) {
+        if (error) *error = "track_scope_unresolved";
+        return false;
+    }
+    if (selection.size() > SelectionSlot::kMaxEffects) {
+        if (error) *error = "runtime_vst3_chain_full";
+        return false;
+    }
+    // Track runtimes already have an independent fixed table. Queueing the
+    // request through the same worker keeps processor construction off Qt;
+    // the current binding is validated before accepting it.
+    refreshTrackContextImpl();
+    const auto bindings = gp_audio::snapshot();
+    if (std::none_of(bindings.begin(), bindings.end(), [&](const gp_audio::Binding &binding) {
+            return binding.chain && binding.activeDocument && binding.trackKey == trackKey;
+        })) {
+        if (error) *error = "track_scope_unresolved";
+        return false;
+    }
+    startSelectionWorker();
+    {
+        std::lock_guard<std::mutex> lock(g_runtime.selectionMutex);
+        g_runtime.requestedTrackSelections[trackKey] = selection;
+        g_runtime.pendingTrackSelections[trackKey] = selection;
+    }
+    g_runtime.selectionCondition.notify_one();
     return true;
 }
 
