@@ -296,6 +296,9 @@ QJsonObject hookStatus(const gpvst3::hook::State &value) {
         {"input_order_generated_sample", value.inputOrderGeneratedSample},
         {"input_order_output_sample", value.inputOrderOutputSample},
         {"input_processor_ready", value.inputProcessorReady},
+        {"input_processor_module", QString::fromUtf8(value.inputProcessorModule.data())},
+        {"input_processor_class_id", QString::fromUtf8(value.inputProcessorClassId.data())},
+        {"input_processor_name", QString::fromUtf8(value.inputProcessorName.data())},
         {"input_route", QString::fromUtf8(value.inputRoute.data())},
         {"input_route_evidence", QJsonObject{
             {"route", QString::fromUtf8(value.inputRoute.data())},

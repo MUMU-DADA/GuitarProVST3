@@ -57,6 +57,8 @@ bool configureSelectedChain(const std::vector<Vst3SelectionEntry> &selection, st
 
 namespace {
 
+bool configureInputEffectSelection(const std::vector<Vst3SelectionEntry> &selection) noexcept;
+
 constexpr char kMasterProcess[] =
     "?process@Master@rse@gp@@QEAAXAEAVAudioBuffer@audio@am@@AEBV?$vector@VTick@audio@am@@V?$allocator@VTick@audio@am@@@std@@@std@@AEBV?$vector@PEAVMusician@rse@gp@@V?$allocator@PEAVMusician@rse@gp@@@std@@@8@AEBV?$shared_ptr@VBackingTrack@rse@gp@@@8@@Z";
 constexpr char kEffectsChainProcessDsp[] =
@@ -1068,6 +1070,7 @@ void selectionWorkerLoop() {
                 std::string error;
                 const bool accepted = configureSelectedChain(selection, &error);
                 if (accepted) {
+                    configureInputEffectSelection(selection);
                     g_runtime.requestedSelection = selection;
                     g_runtime.appliedSelection = selection;
                     g_runtime.selectionAppliedGeneration = generation;
@@ -1673,6 +1676,31 @@ bool configureInputRouter() noexcept {
     return true;
 }
 
+// The guitar-input processor must be the effect the user selected for the
+// global chain. Previously inputEffect always loaded GPVST3_RUNTIME_VST3
+// (or ParametricOD), so a selected VST3 could process playback while the
+// capture path silently used a different plug-in.
+bool configureInputEffectSelection(const std::vector<Vst3SelectionEntry> &selection) noexcept {
+    if (selection.empty() || !g_runtime.inputRouter.snapshot().enabled) return true;
+    if (g_runtime.inputProcessing.test_and_set(std::memory_order_acquire)) return false;
+    g_runtime.inputRouter.setEnabled(false);
+    const auto rate = callbackSampleRate() > 0.0 ? callbackSampleRate() : 44100.0;
+    const auto &entry = selection.front();
+    const bool configured = g_runtime.inputEffect.initialize(rate, 16384,
+                                                              fs::u8path(entry.module),
+                                                              entry.classId, &entry);
+    if (configured) {
+        g_runtime.inputConfiguredRate.store(static_cast<int>(rate), std::memory_order_release);
+        g_runtime.inputConfigurationPending.store(false, std::memory_order_release);
+    } else {
+        g_runtime.inputConfigurationErrors.fetch_add(1, std::memory_order_relaxed);
+        g_runtime.inputConfigurationPending.store(true, std::memory_order_release);
+    }
+    g_runtime.inputRouter.setEnabled(configured);
+    g_runtime.inputProcessing.clear(std::memory_order_release);
+    return configured;
+}
+
 bool inputFeatureEnabled() noexcept {
     const char *enabled = std::getenv("GPVST3_ENABLE_P4_INPUT");
     return !enabled || std::strcmp(enabled, "0") != 0;
@@ -2171,6 +2199,9 @@ State snapshot() noexcept {
         result.inputOrderOutputSample = g_runtime.inputOrderOutputSample.load(std::memory_order_relaxed);
     }
     result.inputProcessorReady = input.enabled && g_runtime.inputEffect.ready.load(std::memory_order_acquire);
+    result.inputProcessorModule = g_runtime.inputEffect.identity.module;
+    result.inputProcessorClassId = g_runtime.inputEffect.identity.classId;
+    result.inputProcessorName = g_runtime.inputEffect.name;
     result.inputRoute = input::routeName(input.route);
     if (input.route == input::Route::Disabled)
         result.inputRouteReason = "p4_route_disabled";
@@ -2613,6 +2644,10 @@ bool setVst3Selection(const std::vector<Vst3SelectionEntry> &selection, std::str
         return true;
     }
     if (!configureSelectedChain(selection, error)) return false;
+    if (!configureInputEffectSelection(selection)) {
+        if (error && error->empty()) *error = "input_vst3_selection_prepare_failed";
+        return false;
+    }
     g_runtime.requestedSelection = selection;
     return true;
 }

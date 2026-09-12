@@ -4,7 +4,7 @@
 
 P11 已将启动关键路径与音轨上下文维护解耦：`bootstrap.cpp` 不再在初始化阶段同步遍历音轨，首帧后延迟 1500 ms 才启动维护定时器。VST3 自动扫描由启动 owner 只调用一次 `beginAsync`；周期性 60 秒重扫已移除，用户刷新仍通过 UI discovery control 显式触发，目录和进行中的任务由 `vst3_catalog` 合并。
 
-输入链默认启用（可用 `GPVST3_ENABLE_P4_INPUT=0` 或 `GPVST3_P4_ROUTE=disabled` 关闭），ASIO capture 在 callback 中经过 `input_insert` 或 `bus_mix` 路由后写入监听输出；输入/输出首块 hash、地址、顺序和处理计数写入既有 runtime observation。禁用链走无转换旁路，避免实时线程承担无效 planar 转换。
+输入链默认启用（可用 `GPVST3_ENABLE_P4_INPUT=0` 或 `GPVST3_P4_ROUTE=disabled` 关闭）。输入链现在跟随用户选择的 global VST3 链第一个实例；此前它错误地固定加载 `GPVST3_RUNTIME_VST3`/`ParametricOD.vst3`，导致用户选择的效果器没有作用于吉他输入。ASIO capture 在 callback 中经过该实例的 `input_insert` 或 `bus_mix` 路由后写入监听输出；输入/输出首块 hash、地址、顺序和处理计数写入既有 runtime observation。禁用链走无转换旁路，避免实时线程承担无效 planar 转换。
 
 验证入口：
 

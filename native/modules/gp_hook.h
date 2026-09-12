@@ -142,6 +142,9 @@ struct State {
     float inputOrderOutputSample = 0.0F;
     bool inputRouteEnabled = false;
     bool inputProcessorReady = false;
+    std::string inputProcessorModule;
+    std::string inputProcessorClassId;
+    std::string inputProcessorName;
     std::string inputRoute = "disabled";
     std::string inputRouteReason = "p4_capture_tap_unresolved";
     std::size_t inputCaptureBlocks = 0;
