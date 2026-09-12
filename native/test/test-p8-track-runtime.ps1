@@ -6,11 +6,8 @@ param(
     [switch]$CheckGain,
     [switch]$CheckLifecycle,
     [string]$ExpectedBindingSource = '',
-    [string]$OutputRoot = '',
     [ValidateSet('enabled', 'default')]
     [string]$HookMode = 'default',
-    [ValidateSet('disabled','input_insert','bus_mix')]
-    [string]$P4Route = 'disabled',
     [switch]$KeepHost
 )
 
@@ -24,9 +21,7 @@ foreach ($path in @((Join-Path $HostDirectory 'GuitarPro.exe'), $PluginPath, $mc
     if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { throw "P8 track runtime prerequisite not found: $path" }
 }
 
-$run = if ($OutputRoot) { [IO.Path]::GetFullPath($OutputRoot) } else {
-    Join-Path $root ('artifacts/mcp-p8-track-' + [guid]::NewGuid().ToString('N'))
-}
+$run = Join-Path $root ('artifacts/mcp-p8-track-' + [guid]::NewGuid().ToString('N'))
 New-Item -ItemType Directory -Force -Path $run | Out-Null
 . (Join-Path $PSScriptRoot 'host-session.ps1')
 . $mcpClient
@@ -67,20 +62,8 @@ function Get-Observation() {
 function Read-Gain([int]$track) {
     if ($track -ge 0) { Wait-Track $track | Out-Null }
     $prefix = if ($track -ge 0) {'gpvst3Editor_'} else {'gpvst3GlobalEditor_'}
-    $triggered = $false
-    $triggerDeadline = [DateTime]::UtcNow.AddSeconds(5)
-    do {
-        $query = Invoke-McpTool $session gp_objects @{query=($prefix + $candidates[0].class_id);limit=10}
-        $editor = @($query.objects)[0]
-        if (-not $editor) { throw "Track $track processor GUI control was not found." }
-        try {
-            Invoke-McpTool $session gp_trigger @{snapshot=$query.snapshot;id=$editor.id} | Out-Null
-            $triggered = $true
-        } catch {
-            Start-Sleep -Milliseconds 150
-        }
-    } while (-not $triggered -and [DateTime]::UtcNow -lt $triggerDeadline)
-    if (-not $triggered) { throw "Track $track processor GUI control could not be triggered after refresh." }
+    $query = Invoke-McpTool $session gp_objects @{query=($prefix + $candidates[0].class_id);limit=10}
+    Invoke-McpTool $session gp_trigger @{snapshot=$query.snapshot;id=@($query.objects)[0].id} | Out-Null
     $deadline = [DateTime]::UtcNow.AddSeconds(5)
     do {
         Start-Sleep -Milliseconds 150
@@ -120,62 +103,22 @@ function Assert-NativeLayout() {
 }
 function Set-TrackEffect([int]$index, $candidate) {
     Wait-Track $index | Out-Null
-    # Switching the selected track rebuilds the Qt panel asynchronously.  Every
-    # gp_objects result is therefore a short-lived snapshot; retry only the
-    # deterministic stale-object outcome and always observe a fresh checkbox
-    # before a mutation.  This avoids replaying the panel QAction after a
-    # successful trigger (which would close the panel).
-    $panelEntryDeadline = [DateTime]::UtcNow.AddSeconds(8)
-    $panelState = Invoke-McpTool $session gp_objects @{query='gpvst3P7Panel';limit=10}
-    $existingPanel = @($panelState.objects | Where-Object object_name -eq 'gpvst3P7Panel')[0]
-    $panelTriggered = [bool]($existingPanel -and
-        $existingPanel.parent_name -eq 'gpvst3TrackVst3Section')
-    do {
-        if (-not $panelTriggered) {
-            $panelEntry = Invoke-McpTool $session gp_objects @{query='gpvst3SoundEffectChainButton';limit=10}
-            $entry = @($panelEntry.objects)[0]
-            if (-not $entry) { Start-Sleep -Milliseconds 150; continue }
-            try {
-                Invoke-McpTool $session gp_trigger @{snapshot=$panelEntry.snapshot;id=$entry.id} | Out-Null
-                $panelTriggered = $true
-            } catch {
-                if ($_.Exception.Message -notmatch 'Observed object no longer exists|Stale snapshot') { throw }
-                Start-Sleep -Milliseconds 150
-            }
-        }
-    } while (-not $panelTriggered -and [DateTime]::UtcNow -lt $panelEntryDeadline)
-    if (-not $panelTriggered) { throw 'VST3 sound-section entry could not be triggered after refresh.' }
-
-    $checkboxDeadline = [DateTime]::UtcNow.AddSeconds(8)
-    do {
-        $panelQuery = Invoke-McpTool $session gp_objects @{query='gpvst3P7Panel';limit=10}
-        $panel = @($panelQuery.objects | Where-Object object_name -eq 'gpvst3P7Panel')[0]
-        if (-not $panel -or $panel.parent_name -ne 'gpvst3TrackVst3Section') {
-            Start-Sleep -Milliseconds 150
-            continue
-        }
-        $query = Invoke-McpTool $session gp_objects @{query=('gpvst3Enabled_' + $candidate.class_id);limit=20}
-        $checkbox = @($query.objects | Where-Object { $_.object_name -eq ('gpvst3Enabled_' + $candidate.class_id) })[0]
-        if (-not $checkbox -or -not $checkbox.enabled) {
-            Start-Sleep -Milliseconds 150
-            continue
-        }
-        if (-not $checkbox.properties.checked) {
-            try {
-                Invoke-McpTool $session gp_set_property @{snapshot=$query.snapshot;id=$checkbox.id;property='checked';value=$true} | Out-Null
-            } catch {
-                if ($_.Exception.Message -notmatch 'Observed object no longer exists|Stale snapshot') { throw }
-                Start-Sleep -Milliseconds 150
-                continue
-            }
-            Start-Sleep -Milliseconds 500
-        }
-        $verify = Invoke-McpTool $session gp_objects @{query=('gpvst3Enabled_' + $candidate.class_id);limit=20}
-        $current = @($verify.objects | Where-Object { $_.object_name -eq ('gpvst3Enabled_' + $candidate.class_id) })[0]
-        if ($current -and $current.properties.checked) { return Invoke-McpTool $session gp_objects @{query='gpvst3Status';limit=10} }
-        Start-Sleep -Milliseconds 150
-    } while ([DateTime]::UtcNow -lt $checkboxDeadline)
-    throw "Track $index checkbox could not be enabled after refresh: $(Json @{panel=$panel;query=$query;checkbox=$checkbox;verify=$verify;current=$current})"
+    $panelEntry = Invoke-McpTool $session gp_objects @{query='gpvst3SoundEffectChainButton';limit=10}
+    if (@($panelEntry.objects).Count -eq 0) { throw 'VST3 sound-section entry was not found.' }
+    Invoke-McpTool $session gp_trigger @{snapshot=$panelEntry.snapshot;id=@($panelEntry.objects)[0].id} | Out-Null
+    $panelQuery = Invoke-McpTool $session gp_objects @{query='gpvst3P7Panel';limit=10}
+    $panel = @($panelQuery.objects | Where-Object object_name -eq 'gpvst3P7Panel')[0]
+    if (-not $panel -or $panel.parent_name -ne 'gpvst3TrackVst3Section') { throw 'Track content is not mounted in its native section.' }
+    Start-Sleep -Milliseconds 250
+    $query = Invoke-McpTool $session gp_objects @{query=('gpvst3Enabled_' + $candidate.class_id);limit=20}
+    $checkbox = @($query.objects | Where-Object { $_.object_name -eq ('gpvst3Enabled_' + $candidate.class_id) })[0]
+    if (-not $checkbox) { throw "Track $index checkbox was not found for $($candidate.class_id)." }
+    if (-not $checkbox.enabled) { throw "Track $index checkbox is disabled: $(Json $checkbox)" }
+    if (-not $checkbox.checked) {
+        Invoke-McpTool $session gp_set_property @{snapshot=$query.snapshot;id=$checkbox.id;property='checked';value=$true} | Out-Null
+        Start-Sleep -Milliseconds 500
+    }
+    return Invoke-McpTool $session gp_objects @{query='gpvst3Status';limit=10}
 }
 
 function Assert-NativeEffects() {
@@ -204,26 +147,14 @@ try {
         GPVST3_RUNTIME_VST3 = $vst3Paths[0]
         GPVST3_VST3_ROOT = $vst3Paths -join ';'
     }
-    if ($P4Route -ne 'disabled') {
-        $environment.GPVST3_ENABLE_P4_INPUT = '1'
-        $environment.GPVST3_P4_ROUTE = $P4Route
-    }
     if ($HookMode -eq 'enabled') { $environment.GPVST3_ENABLE_P2_HOOK = '1' }
     $process = Start-Gpvst3TestHost -HostDirectory $HostDirectory -PluginPath $PluginPath -RunDirectory $run -McpRoot $McpRoot -Environment $environment
     $statusPath = Join-Path $dataDirectory 'status.json'; $sessionPath = Join-Path $run 'mcp/native-session.json'
-    $deadline = [DateTime]::UtcNow.AddSeconds(30); $ready = $false
-    do {
-        Start-Sleep -Milliseconds 200
-        $process.Refresh(); if ($process.HasExited) { throw 'Guitar Pro exited before P8 startup.' }
-        if ((Test-Path -LiteralPath $statusPath -PathType Leaf) -and (Test-Path -LiteralPath $sessionPath -PathType Leaf)) {
-            try {
-                $published = Get-Content -LiteralPath $statusPath -Raw -Encoding UTF8 | ConvertFrom-Json
-                $ready = ($published.pid -eq $process.Id -and $published.plugin_path -and
-                    [IO.Path]::GetFullPath($published.plugin_path) -ieq [IO.Path]::GetFullPath($PluginPath))
-            } catch { $ready = $false }
-        }
-    } while (-not $ready -and [DateTime]::UtcNow -lt $deadline)
-    if (-not $ready) { throw 'P8 startup files for the current Guitar Pro process were not published.' }
+    $deadline = [DateTime]::UtcNow.AddSeconds(30)
+    while ((-not (Test-Path -LiteralPath $statusPath) -or -not (Test-Path -LiteralPath $sessionPath)) -and [DateTime]::UtcNow -lt $deadline) {
+        Start-Sleep -Milliseconds 200; $process.Refresh(); if ($process.HasExited) { throw 'Guitar Pro exited before P8 startup.' }
+    }
+    if (-not (Test-Path -LiteralPath $statusPath) -or -not (Test-Path -LiteralPath $sessionPath)) { throw 'P8 startup files were not published.' }
     $result.identity = Get-Gpvst3TestIdentity $process $HostDirectory $PluginPath $statusPath $McpRoot
     $session = New-McpSession -SessionFile $sessionPath
     $seedSource = Join-Path $McpRoot 'test/testdata/minimal.gp'

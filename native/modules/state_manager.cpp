@@ -248,6 +248,48 @@ bool setPluginEnabled(bool enabled) {
     return writeJson(settingsPath(), settings);
 }
 
+bool disableAllEffectsAtStartup() {
+    QJsonObject chain;
+    if (!loadChain(chain)) return false;
+    bool changed = false;
+    const auto clearScope = [&changed](QJsonObject scope) {
+        auto effects = scope.value("effects").toArray();
+        for (int index = 0; index < effects.size(); ++index) {
+            auto effect = effects.at(index).toObject();
+            if (!effect.value("enabled").toBool()) continue;
+            // Preserve the user's last explicit choice as an intent marker,
+            // while making the current host session start fully bypassed.
+            // The marker is consumed only by a later explicit enable action;
+            // it never causes a processor to be created during bootstrap.
+            effect.insert("enabled", false);
+            effect.insert("bypass", true);
+            effect.insert("desired_enabled", true);
+            effects.replace(index, effect);
+            changed = true;
+        }
+        scope.insert("effects", effects);
+        return scope;
+    };
+    chain.insert("global", clearScope(chain.value("global").toObject()));
+    auto scores = chain.value("scores").toObject();
+    for (auto score = scores.begin(); score != scores.end(); ++score) {
+        auto scoreObject = score.value().toObject();
+        auto tracks = scoreObject.value("tracks").toObject();
+        for (auto track = tracks.begin(); track != tracks.end(); ++track) {
+            auto trackObject = track.value().toObject();
+            track.value() = clearScope(trackObject);
+        }
+        scoreObject.insert("tracks", tracks);
+        score.value() = scoreObject;
+    }
+    chain.insert("scores", scores);
+    if (!changed) return true;
+    // Keep the legacy view synchronized for older readers while preserving
+    // component/controller state captured in each scope.
+    chain.insert("effects", chain.value("global").toObject().value("effects"));
+    return writeChain(chain);
+}
+
 bool loadChain(QJsonObject &chain, QString *error) {
     QFile file(sidecarPath());
     if (!file.exists()) { chain = emptyChain(); return true; }
@@ -422,6 +464,10 @@ void setScopeEffects(QJsonObject &chain, ScopeKind scope, const QJsonArray &effe
         return;
     }
     if (trackIndex >= 0) trackObject.insert("track_index", trackIndex);
+    // A configured track record is part of the current document topology.
+    // Keep it marked present so reload/order readers can distinguish it from
+    // stale records retained for a different document incarnation.
+    trackObject.insert("present", true);
     if (!trackName.isEmpty()) trackObject.insert("track_name", trackName);
     trackObject.insert("effects", scopeObject.value("effects"));
     tracks.insert(trackKey, trackObject);

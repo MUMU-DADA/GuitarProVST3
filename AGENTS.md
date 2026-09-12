@@ -20,8 +20,6 @@
 - [P8 实现记录](docs/P8_IMPLEMENTATION.md)：当前实现、验证摘要和剩余宿主限制。
 - [P9 体验与稳定性计划](docs/P9_AUDIO_SWITCH_UI_PLAN.md)：切换稳定性、UI 重构、About 入口和扫描反馈收敛。
 - [P9 实现记录](docs/P9_IMPLEMENTATION.md)：P9 用户反馈登记、阶段状态和验证入口。
-- [P10 ASIO、低延迟与输入链计划](docs/P10_ASIO_LATENCY_INPUT_PLAN.md)：ASIO 输入路由、端到端延迟、曲谱加载性能和音轨身份显示。
-- [P10 实现记录](docs/P10_IMPLEMENTATION.md)：P10 代码入口、专项夹具、MCP 宿主证据和发布边界。
 - [测试与验证](docs/TESTING.md)：构建、免安装宿主回归和常用测试命令。
 
 历史阶段记录和完整计划快照见 [docs/archive](docs/archive/README.md)。

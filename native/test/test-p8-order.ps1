@@ -28,17 +28,24 @@ function Wait-Operation($request, $expected) {
     $operation
 }
 function Trigger([string]$name) {
-    $query = Invoke-McpTool $session gp_objects @{query=$name;limit=20}
-    $item = @($query.objects | Where-Object object_name -eq $name)[0]
-    if (-not $item) { throw "Control missing: $name" }
-    Invoke-McpTool $session gp_trigger @{snapshot=$query.snapshot;id=$item.id} | Out-Null
+    $deadline = [DateTime]::UtcNow.AddSeconds(8)
+    do {
+        $query = Invoke-McpTool $session gp_objects @{query=$name;limit=20}
+        $item = @($query.objects | Where-Object object_name -eq $name)[0]
+        if ($item) {
+            Invoke-McpTool $session gp_trigger @{snapshot=$query.snapshot;id=$item.id} | Out-Null
+            return
+        }
+        Start-Sleep -Milliseconds 150
+    } while ([DateTime]::UtcNow -lt $deadline)
+    throw "Control missing: $name"
 }
 function Set-Property([string]$name, [string]$property, $value) {
     $deadline = [DateTime]::UtcNow.AddSeconds(8)
     do {
         $query = Invoke-McpTool $session gp_objects @{query=$name;limit=20}
         $item = @($query.objects | Where-Object object_name -eq $name)[0]
-        if (-not $item) { throw "Control missing: $name" }
+        if (-not $item) { Start-Sleep -Milliseconds 150; continue }
         try { Invoke-McpTool $session gp_set_property @{snapshot=$query.snapshot;id=$item.id;property=$property;value=$value} | Out-Null } catch { Start-Sleep -Milliseconds 150; continue }
         Start-Sleep -Milliseconds 250
         $readback = Invoke-McpTool $session gp_objects @{query=$name;limit=20}
@@ -66,7 +73,7 @@ function Read-Order([string]$scope) {
     $chain = Get-Content -LiteralPath (Join-Path $run 'effect-chain.json') -Raw | ConvertFrom-Json
     $effects = if ($scope -eq 'global') { $chain.global.effects } else {
         $score = @($chain.scores.PSObject.Properties | Where-Object { [IO.Path]::GetFullPath($_.Name) -ieq [IO.Path]::GetFullPath($scorePath) })[0].Value
-        @($score.tracks.PSObject.Properties.Value | Where-Object { $_.track_index -eq 0 })[0].effects
+        @($score.tracks.PSObject.Properties.Value | Where-Object { $_.present -and $_.track_index -eq 0 })[0].effects
     }
     @($effects | Where-Object enabled | ForEach-Object name) -join '|'
 }
@@ -129,7 +136,6 @@ try {
         Set-Property $listName 'currentRow' 2
         Trigger ((Prefix $scope) + 'MoveUp')
         Start-Sleep -Milliseconds 300
-        Set-Property $listName 'currentRow' 1
         Trigger ((Prefix $scope) + 'MoveUp')
         Start-Sleep -Milliseconds 300
         $cab = Assert-AudioOrder $scope @(2,0,1)
@@ -165,6 +171,24 @@ try {
     $session = New-McpSession -SessionFile $sessionPath
     $document = (Wait-Operation (Invoke-McpTool $session gp_open @{path=$scorePath}).request 'opened').document
     Invoke-McpTool $session gp_activate @{document=$document} | Out-Null
+    $restartSaved = Get-Content -LiteralPath (Join-Path $run 'effect-chain.json') -Raw | ConvertFrom-Json
+    $restartEffects = @($restartSaved.global.effects)
+    foreach ($score in $restartSaved.scores.PSObject.Properties.Value) {
+        foreach ($track in $score.tracks.PSObject.Properties.Value) { $restartEffects += @($track.effects) }
+    }
+    if (@($restartEffects | Where-Object enabled).Count -ne 0 -or
+        $restartStatus.gp_hook.runtime_processor_ready -or $restartStatus.gp_hook.runtime_effect_instances -ne 0) {
+        throw 'Restart automatically enabled a persisted VST3 processor.'
+    }
+    $result.restart_disabled_effects = $restartEffects.Count
+    # Startup intentionally leaves every persisted VST3 entry disabled. Re
+    # enable the chains explicitly before checking post-restart processing.
+    foreach ($scope in @('track','global')) {
+        foreach ($index in @(2,0,1)) {
+            $candidate = $candidates[$index]
+            Set-Property ((Prefix $scope) + 'Enabled_' + $candidate.class_id) 'checked' $true
+        }
+    }
     Start-Sleep -Seconds 1
     $result.restart_orders = @(Assert-AudioOrder 'track' @(2,0,1); Assert-AudioOrder 'global' @(2,0,1))
     $result.observation = Get-Content -LiteralPath (Join-Path $run 'p2-observation.json') -Raw | ConvertFrom-Json

@@ -19,7 +19,6 @@
 #include <vector>
 #include <unordered_map>
 #include <thread>
-#include <chrono>
 
 #include "audio_adapter.h"
 #include "effect_chain.h"
@@ -29,6 +28,9 @@
 #include "qt_ui.h"
 #include "pluginterfaces/vst/ivstmessage.h"
 #include <memory>
+#include <QtCore/QCoreApplication>
+#include <QtCore/QMetaObject>
+#include <QtCore/QThread>
 #include "portaudio_capture_abi.h"
 #include "pluginterfaces/base/funknownimpl.h"
 #include "pluginterfaces/base/ipluginbase.h"
@@ -54,10 +56,9 @@ int streamCallbackHook(const void *input, void *output, unsigned long frames,
                        const void *timeInfo, unsigned long status, void *userData);
 void reconfigureInputRouterIfNeeded() noexcept;
 bool configureSelectedChain(const std::vector<Vst3SelectionEntry> &selection, std::string *error) noexcept;
+State prepare(const host::Verification &verification, bool enableForSelection) noexcept;
 
 namespace {
-
-bool configureInputEffectSelection(const std::vector<Vst3SelectionEntry> &selection) noexcept;
 
 constexpr char kMasterProcess[] =
     "?process@Master@rse@gp@@QEAAXAEAVAudioBuffer@audio@am@@AEBV?$vector@VTick@audio@am@@V?$allocator@VTick@audio@am@@@std@@@std@@AEBV?$vector@PEAVMusician@rse@gp@@V?$allocator@PEAVMusician@rse@gp@@@std@@@8@AEBV?$shared_ptr@VBackingTrack@rse@gp@@@8@@Z";
@@ -124,6 +125,7 @@ using Steinberg::ViewRect;
 
 struct RuntimeEffect;
 bool succeeded(tresult result) noexcept;
+void mirrorInputParameter(RuntimeEffect *source, ParamID id, ParamValue value) noexcept;
 
 class RuntimeComponentHandler final
     : public Steinberg::U::Implements<Steinberg::U::Directly<IComponentHandler>> {
@@ -138,19 +140,29 @@ private:
     RuntimeEffect *owner_ = nullptr;
 };
 
+bool succeeded(tresult result) noexcept;
+bool onQtThread() noexcept;
+
 class RuntimePlugFrame final
     : public Steinberg::U::Implements<Steinberg::U::Directly<Steinberg::IPlugFrame>> {
 public:
     explicit RuntimePlugFrame(HWND hostWindow) : hostWindow_(hostWindow) {}
     Steinberg::tresult PLUGIN_API resizeView(Steinberg::IPlugView *view,
                                              ViewRect *newSize) override {
-        if (!newSize || !hostWindow_) return Steinberg::kInvalidArgument;
+        if (!onQtThread()) return Steinberg::kResultFalse;
+        if (!newSize || !hostWindow_ || !IsWindow(hostWindow_)) return Steinberg::kInvalidArgument;
         if (resizing_) return Steinberg::kResultTrue;
         resizing_ = true;
         const int width = (std::max)(1, newSize->getWidth());
         const int height = (std::max)(1, newSize->getHeight());
-        gpvst3::ui::resizeNativeEditor(reinterpret_cast<void *>(hostWindow_), width, height);
-        const bool resized = view && succeeded(view->onSize(newSize));
+        try {
+            gpvst3::ui::resizeNativeEditor(reinterpret_cast<void *>(hostWindow_), width, height);
+        } catch (...) {
+            resizing_ = false;
+            return Steinberg::kResultFalse;
+        }
+        bool resized = false;
+        try { resized = view && succeeded(view->onSize(newSize)); } catch (...) { resized = false; }
         resizing_ = false;
         return resized ? Steinberg::kResultTrue : Steinberg::kResultFalse;
     }
@@ -162,6 +174,11 @@ private:
 
 bool succeeded(tresult result) noexcept {
     return result == Steinberg::kResultOk || result == Steinberg::kResultTrue;
+}
+
+bool onQtThread() noexcept {
+    const auto *application = QCoreApplication::instance();
+    return application && QThread::currentThread() == application->thread();
 }
 
 class RuntimeHostApplication final
@@ -238,6 +255,10 @@ struct RuntimeEffect {
     std::atomic<std::size_t> parameterEdits{0};
     HWND editorParent = nullptr;
     std::atomic<bool> editorAttached{false};
+    // Only a global effect receives a mirror to the independent live-input
+    // instance. Track effects must remain playback-only even when they use
+    // the same VST3 class as the global chain.
+    std::weak_ptr<RuntimeEffect> inputParameterMirror;
     std::string editorError;
     RuntimeHostApplication host;
     audio::PlanarBuffer scratch;
@@ -248,7 +269,6 @@ struct RuntimeEffect {
     std::atomic<bool> ownerObserved{false};
     std::atomic<int> configuredRate{0};
     std::atomic<std::size_t> configuredBlock{0};
-    std::atomic<unsigned int> reportedLatencySamples{0};
     bool forceError = false;
     std::atomic_flag processing = ATOMIC_FLAG_INIT;
 
@@ -256,15 +276,28 @@ struct RuntimeEffect {
 
     void shutdown() noexcept {
         ready.store(false, std::memory_order_release);
-        closeEditor();
-        if (componentConnection && controllerConnection) {
-            componentConnection->disconnect(controllerConnection);
-            controllerConnection->disconnect(componentConnection);
+        if (editor && !onQtThread()) {
+            auto *application = QCoreApplication::instance();
+            if (application) {
+                const bool invoked = QMetaObject::invokeMethod(
+                    application, [this] { closeEditor(); }, Qt::BlockingQueuedConnection);
+                if (!invoked && editor) closeEditor();
+            } else {
+                closeEditor();
+            }
+        } else {
+            closeEditor();
         }
+        try {
+            if (componentConnection && controllerConnection) {
+                componentConnection->disconnect(controllerConnection);
+                controllerConnection->disconnect(componentConnection);
+            }
+        } catch (...) {}
         componentConnection = nullptr;
         controllerConnection = nullptr;
-        if (controller) controller->setComponentHandler(nullptr);
-        if (controller && separateControllerInitialized) controller->terminate();
+        try { if (controller) controller->setComponentHandler(nullptr); } catch (...) {}
+        try { if (controller && separateControllerInitialized) controller->terminate(); } catch (...) {}
         separateControllerInitialized = false;
         componentHandler = nullptr;
         controller = nullptr;
@@ -275,12 +308,13 @@ struct RuntimeEffect {
         ownerObserved.store(false, std::memory_order_release);
         configuredRate.store(0, std::memory_order_release);
         configuredBlock.store(0, std::memory_order_release);
-        reportedLatencySamples.store(0, std::memory_order_release);
-        if (processor) processor->setProcessing(false);
-        if (component) {
-            component->setActive(false);
-            component->terminate();
-        }
+        try { if (processor) processor->setProcessing(false); } catch (...) {}
+        try {
+            if (component) {
+                component->setActive(false);
+                component->terminate();
+            }
+        } catch (...) {}
         processor = nullptr;
         component = nullptr;
         factory = nullptr;
@@ -297,6 +331,7 @@ struct RuntimeEffect {
     bool initialize(double sampleRate = 44100.0, std::size_t maxSamplesPerBlock = 16384,
                     const fs::path &requestedPath = {}, const std::string &requestedClassId = {},
                     const Vst3SelectionEntry *saved = nullptr) noexcept {
+        try {
         shutdown();
         forceError = false;
         if (const char *forced = std::getenv("GPVST3_FORCE_P3_ERROR");
@@ -454,9 +489,13 @@ struct RuntimeEffect {
         ready.store(true, std::memory_order_release);
         configuredRate.store(static_cast<int>(sampleRate), std::memory_order_release);
         configuredBlock.store(maxSamplesPerBlock, std::memory_order_release);
-        reportedLatencySamples.store(processor->getLatencySamples(), std::memory_order_release);
         error.clear();
         return true;
+        } catch (...) {
+            shutdown();
+            error = "runtime_vst3_exception";
+            return false;
+        }
     }
 
     bool restoreState(const Vst3SelectionEntry &saved) {
@@ -508,64 +547,79 @@ struct RuntimeEffect {
     bool queueParameter(ParamID id, ParamValue value) noexcept {
         if (!std::isfinite(value) || !parameterChanges.publish(id, value)) return false;
         parameterEdits.fetch_add(1, std::memory_order_relaxed);
+        mirrorInputParameter(this, id, value);
         return true;
     }
 
     bool openEditor(HWND parentWindow) noexcept {
+        if (!onQtThread()) {
+            editorError = "editor_ui_thread_required";
+            return false;
+        }
         if (!ready.load(std::memory_order_acquire) || !controller || !parentWindow) {
             editorError = editorError.empty() ? "editor_host_unavailable" : editorError;
             return false;
         }
+        if (!IsWindow(parentWindow)) {
+            editorError = "editor_host_invalid";
+            return false;
+        }
         if (editor && editorAttached.load(std::memory_order_acquire) && editorParent == parentWindow) {
-            editor->onFocus(true);
+            try { editor->onFocus(true); } catch (...) { editorError = "editor_focus_failed"; return false; }
             return true;
         }
-        closeEditor();
-        Steinberg::IPlugView *rawView = controller->createView("editor");
-        if (!rawView) {
-            editorError = "editor_view_unavailable";
+        try {
+            closeEditor();
+            Steinberg::IPlugView *rawView = controller->createView("editor");
+            if (!rawView) {
+                editorError = "editor_view_unavailable";
+                return false;
+            }
+            editor = Steinberg::owned(rawView);
+            if (!succeeded(editor->isPlatformTypeSupported(Steinberg::kPlatformTypeHWND))) {
+                editor = nullptr;
+                editorError = "editor_hwnd_unsupported";
+                return false;
+            }
+            auto frame = Steinberg::owned(new RuntimePlugFrame(parentWindow));
+            if (!frame || !succeeded(editor->setFrame(frame.get()))) {
+                editor = nullptr;
+                editorError = "editor_frame_failed";
+                return false;
+            }
+            if (auto scale = FUnknownPtr<Steinberg::IPlugViewContentScaleSupport>(editor.get()))
+                scale->setContentScaleFactor(static_cast<float>(gpvst3::ui::nativeEditorScale(reinterpret_cast<void *>(parentWindow))));
+            ViewRect rect{};
+            if (!succeeded(editor->getSize(&rect))) rect = ViewRect(0, 0, 420, 260);
+            gpvst3::ui::resizeNativeEditor(reinterpret_cast<void *>(parentWindow), rect.getWidth(), rect.getHeight());
+            if (!succeeded(editor->attached(reinterpret_cast<void *>(parentWindow),
+                                            Steinberg::kPlatformTypeHWND))) {
+                editor->setFrame(nullptr);
+                editor = nullptr;
+                editorError = "editor_attach_failed";
+                return false;
+            }
+            plugFrame = std::move(frame);
+            editorParent = parentWindow;
+            editorAttached.store(true, std::memory_order_release);
+            editor->onSize(&rect);
+            editorError.clear();
+            return true;
+        } catch (...) {
+            closeEditor();
+            editorError = "editor_exception";
             return false;
         }
-        editor = Steinberg::owned(rawView);
-        if (!succeeded(editor->isPlatformTypeSupported(Steinberg::kPlatformTypeHWND))) {
-            editor = nullptr;
-            editorError = "editor_hwnd_unsupported";
-            return false;
-        }
-        auto frame = Steinberg::owned(new RuntimePlugFrame(parentWindow));
-        if (!frame || !succeeded(editor->setFrame(frame.get()))) {
-            editor = nullptr;
-            editorError = "editor_frame_failed";
-            return false;
-        }
-        if (auto scale = FUnknownPtr<Steinberg::IPlugViewContentScaleSupport>(editor.get()))
-            scale->setContentScaleFactor(static_cast<float>(gpvst3::ui::nativeEditorScale(reinterpret_cast<void *>(parentWindow))));
-        ViewRect rect{};
-        if (!succeeded(editor->getSize(&rect))) {
-            rect = ViewRect(0, 0, 420, 260);
-        }
-        gpvst3::ui::resizeNativeEditor(reinterpret_cast<void *>(parentWindow), rect.getWidth(), rect.getHeight());
-        if (!succeeded(editor->attached(reinterpret_cast<void *>(parentWindow),
-                                        Steinberg::kPlatformTypeHWND))) {
-            editor->setFrame(nullptr);
-            editor = nullptr;
-            editorError = "editor_attach_failed";
-            return false;
-        }
-        plugFrame = std::move(frame);
-        editorParent = parentWindow;
-        editor->onSize(&rect);
-        editorAttached.store(true, std::memory_order_release);
-        editorError.clear();
-        return true;
     }
 
     void closeEditor() noexcept {
         editorParent = nullptr;
         if (editor) {
-            if (editorAttached.exchange(false, std::memory_order_acq_rel))
-                editor->removed();
-            editor->setFrame(nullptr);
+            const bool attached = editorAttached.exchange(false, std::memory_order_acq_rel);
+            if (attached) {
+                try { editor->removed(); } catch (...) {}
+            }
+            try { editor->setFrame(nullptr); } catch (...) {}
             editor = nullptr;
         }
         plugFrame = nullptr;
@@ -574,23 +628,28 @@ struct RuntimeEffect {
     bool reconfigure(double sampleRate, std::size_t maxSamplesPerBlock) noexcept {
         if (!ready.load(std::memory_order_acquire) || !processor || maxSamplesPerBlock == 0)
             return false;
-        processor->setProcessing(false);
-        component->setActive(false);
-        Steinberg::Vst::ProcessSetup setup{};
-        setup.processMode = Steinberg::Vst::kRealtime;
-        setup.symbolicSampleSize = Steinberg::Vst::kSample32;
-        setup.maxSamplesPerBlock = static_cast<Steinberg::int32>(maxSamplesPerBlock);
-        setup.sampleRate = sampleRate;
-        if (!succeeded(processor->setupProcessing(setup)) || !scratch.prepare(2, maxSamplesPerBlock) ||
-            !succeeded(component->setActive(true)) || !succeeded(processor->setProcessing(true))) {
-            error = "runtime_vst3_reconfigure_failed";
+        try {
+            processor->setProcessing(false);
+            component->setActive(false);
+            Steinberg::Vst::ProcessSetup setup{};
+            setup.processMode = Steinberg::Vst::kRealtime;
+            setup.symbolicSampleSize = Steinberg::Vst::kSample32;
+            setup.maxSamplesPerBlock = static_cast<Steinberg::int32>(maxSamplesPerBlock);
+            setup.sampleRate = sampleRate;
+            if (!succeeded(processor->setupProcessing(setup)) || !scratch.prepare(2, maxSamplesPerBlock) ||
+                !succeeded(component->setActive(true)) || !succeeded(processor->setProcessing(true))) {
+                error = "runtime_vst3_reconfigure_failed";
+                ready.store(false, std::memory_order_release);
+                return false;
+            }
+        } catch (...) {
+            error = "runtime_vst3_reconfigure_exception";
             ready.store(false, std::memory_order_release);
             return false;
         }
         error.clear();
         configuredRate.store(static_cast<int>(sampleRate), std::memory_order_release);
         configuredBlock.store(maxSamplesPerBlock, std::memory_order_release);
-        reportedLatencySamples.store(processor->getLatencySamples(), std::memory_order_release);
         ready.store(true, std::memory_order_release);
         return true;
     }
@@ -608,9 +667,16 @@ struct RuntimeEffect {
             if (!input) return false;
         }
         if (processing.test_and_set(std::memory_order_acquire)) return false;
-        parameterChanges.drain();
-        const auto result = audio::process(*processor, block, scratch, false, &parameterChanges);
-        parameterChanges.clear();
+        audio::ProcessResult result{};
+        try {
+            parameterChanges.drain();
+            result = audio::process(*processor, block, scratch, false, &parameterChanges);
+            parameterChanges.clear();
+        } catch (...) {
+            parameterChanges.clear();
+            processing.clear(std::memory_order_release);
+            return false;
+        }
         processing.clear(std::memory_order_release);
         if (result.outputWritten) outputWritten.store(true, std::memory_order_release);
         if (result.ownerPointerObserved) ownerObserved.store(true, std::memory_order_release);
@@ -917,17 +983,6 @@ struct Runtime {
     std::atomic<unsigned long> outputThread{0};
     std::atomic<std::uintptr_t> outputFirstBuffer{0};
     std::atomic<std::uintptr_t> outputLastBuffer{0};
-    std::atomic<std::uint64_t> audioCallbackBlocks{0};
-    std::atomic<std::uint64_t> firstAudioCallbackNanoseconds{0};
-    std::atomic<std::uint64_t> audioCallbackProcessingNanoseconds{0};
-    std::atomic<std::uint64_t> audioCallbackMaxNanoseconds{0};
-    std::atomic<std::uint64_t> audioCallbackDeadlineNanoseconds{0};
-    std::atomic<std::size_t> audioCallbackDeadlineOverruns{0};
-    std::atomic<std::size_t> audioCallbackExtraCopyOperations{0};
-    std::atomic<std::size_t> audioCallbackSampleIndex{0};
-    std::array<std::atomic<std::uint64_t>, 256> audioCallbackSamples{};
-    std::atomic<std::size_t> deviceInputLatencySamples{0};
-    std::atomic<std::size_t> deviceOutputLatencySamples{0};
     std::atomic<bool> bufferWriteObserved{false};
     std::atomic<bool> dspInsideMaster{false};
     std::atomic<std::size_t> frames{0};
@@ -960,7 +1015,12 @@ struct Runtime {
     std::atomic<std::size_t> reconfigurationPassed{0};
     std::atomic<std::size_t> reconfigurationFailed{0};
     std::atomic<bool> reconfigurationValidated{false};
-    RuntimeEffect inputEffect;
+    // Live guitar input uses an independent copy of the selected global chain.
+    // It must not share RuntimeEffect instances with the score/master chain:
+    // Guitar Pro can call both paths concurrently from different audio
+    // callbacks, while a RuntimeEffect intentionally rejects re-entrant calls.
+    SelectionSlot inputSelectionSlots[2];
+    effects::Chain inputChain;
     std::atomic<std::size_t> inputAfterOriginalBlocks{0};
     std::atomic<std::uint64_t> inputPostOriginalHash{0}, inputPostRouteHash{0};
     std::atomic<bool> inputOrderEvidenceClaimed{false};
@@ -1007,6 +1067,64 @@ std::atomic<bool> g_selectionStateChanged{false};
 thread_local bool g_inMasterHook = false;
 thread_local bool g_inEditorCallback = false;
 
+void mirrorInputParameter(RuntimeEffect *source, ParamID id, ParamValue value) noexcept {
+    if (!source) return;
+    // The worker can replace input slots while a plug-in editor sends a
+    // parameter callback. Do not wait behind initialization; a missed mirror
+    // is harmless because the next explicit edit publishes a fresh value.
+    std::unique_lock<std::recursive_mutex> editorLock(g_runtime.editorMutex,
+                                                       std::try_to_lock);
+    if (!editorLock.owns_lock()) return;
+    const auto target = source->inputParameterMirror.lock();
+    if (!target || target.get() == source) return;
+    if (target->parameterChanges.publish(id, value))
+        target->parameterEdits.fetch_add(1, std::memory_order_relaxed);
+}
+
+void refreshInputParameterMirrors() noexcept {
+    for (auto &slot : g_runtime.selectionSlots)
+        for (std::size_t index = 0; index < slot.count; ++index)
+            if (slot.effects[index]) slot.effects[index]->inputParameterMirror.reset();
+
+    const int globalActive = g_runtime.chain.snapshot().activeSlot;
+    const int inputActive = g_runtime.inputChain.snapshot().activeSlot;
+    if (globalActive < 0 || globalActive >= 2 || inputActive < 0 || inputActive >= 2 ||
+        !g_runtime.selectionMode.load(std::memory_order_acquire)) return;
+    auto &global = g_runtime.selectionSlots[globalActive];
+    auto &input = g_runtime.inputSelectionSlots[inputActive];
+    for (std::size_t globalIndex = 0; globalIndex < global.count; ++globalIndex) {
+        const auto &source = global.effects[globalIndex];
+        if (!source) continue;
+        for (std::size_t inputIndex = 0; inputIndex < input.count; ++inputIndex) {
+            const auto &target = input.effects[inputIndex];
+            if (!target || source->identity.module != target->identity.module ||
+                source->identity.classId != target->identity.classId) continue;
+            source->inputParameterMirror = target;
+            break;
+        }
+    }
+}
+
+bool processInputChain(void *context, const audio::BlockView &block) noexcept {
+    auto *chain = static_cast<effects::Chain *>(context);
+    if (!chain) return false;
+    const auto result = chain->process(block);
+    return result.completed && !result.bypassed && !result.error;
+}
+
+void lockInputProcessing() noexcept {
+    while (g_runtime.inputProcessing.test_and_set(std::memory_order_acquire))
+        std::this_thread::yield();
+}
+
+void unlockInputProcessing() noexcept {
+    g_runtime.inputProcessing.clear(std::memory_order_release);
+}
+
+struct InputProcessingGuard {
+    ~InputProcessingGuard() { unlockInputProcessing(); }
+};
+
 struct EditorCallbackScope {
     const bool previous = g_inEditorCallback;
     EditorCallbackScope() noexcept { g_inEditorCallback = true; }
@@ -1014,6 +1132,10 @@ struct EditorCallbackScope {
 };
 
 double callbackSampleRate() noexcept;
+bool configureInputSelection(const std::vector<Vst3SelectionEntry> &selection,
+                             std::string *error = nullptr) noexcept;
+void refreshInputParameterMirrors() noexcept;
+bool processInputChain(void *context, const audio::BlockView &block) noexcept;
 void rejectSavedEntry(const Vst3SelectionEntry &entry, const std::string &error,
                       state::ScopeKind scope, const std::string &score = {},
                       const std::string &track = {}, int trackIndex = -1);
@@ -1031,11 +1153,6 @@ bool trackSelectionQueued(const std::string &trackKey) noexcept {
         g_runtime.pendingTrackSelections.end();
 }
 
-bool catalogIsReady() noexcept {
-    std::lock_guard<std::mutex> lock(g_runtime.catalogMutex);
-    return g_runtime.catalogReady;
-}
-
 void selectionWorkerLoop() {
     for (;;) {
         std::vector<Vst3SelectionEntry> selection;
@@ -1048,7 +1165,9 @@ void selectionWorkerLoop() {
                        !g_runtime.pendingTrackSelections.empty();
             });
             if (g_runtime.selectionWorkerStop && !g_runtime.selectionRequestPending &&
-                g_runtime.pendingTrackSelections.empty()) return;
+                g_runtime.pendingTrackSelections.empty()) {
+                return;
+            }
             if (g_runtime.selectionRequestPending) {
                 selection = std::move(g_runtime.pendingSelection);
                 generation = g_runtime.selectionRequestGeneration;
@@ -1065,12 +1184,24 @@ void selectionWorkerLoop() {
             // Only the worker waits for runtime ownership. Qt's observation,
             // capture and editor paths try this lock and defer while busy.
             std::lock_guard<std::recursive_mutex> editorLock(g_runtime.editorMutex);
+            std::string prepareError;
+            bool prepared = true;
+            if (!selection.empty() && ((trackKey.empty() && !g_runtime.master.installed) ||
+                                       (!trackKey.empty() && !g_runtime.dsp.installed))) {
+                const auto preparedState = prepare(g_verification, true);
+                prepared = preparedState.installed;
+                if (!prepared) prepareError = preparedState.reason;
+            }
             std::lock_guard<std::mutex> lock(g_runtime.selectionMutex);
             if (trackKey.empty()) {
                 std::string error;
-                const bool accepted = configureSelectedChain(selection, &error);
+                const bool accepted = prepared && configureSelectedChain(selection, &error);
+                if (!accepted && error.empty()) error = prepareError;
                 if (accepted) {
-                    configureInputEffectSelection(selection);
+                    // Prepare the live-input copy on this worker as well. The
+                    // UI request is already asynchronous, so a slow third
+                    // party factory cannot block the Qt event loop.
+                    configureInputSelection(selection);
                     g_runtime.requestedSelection = selection;
                     g_runtime.appliedSelection = selection;
                     g_runtime.selectionAppliedGeneration = generation;
@@ -1089,7 +1220,7 @@ void selectionWorkerLoop() {
                                             });
                 if (runtime != std::end(g_runtime.trackRuntimes)) {
                     std::string error;
-                    if (runtime->prepare(selection, callbackSampleRate(), 16384, &error)) {
+                    if (prepared && runtime->prepare(selection, callbackSampleRate(), 16384, &error)) {
                         runtime->requested = selection;
                         g_runtime.requestedTrackSelections[trackKey] = selection;
                         runtime->error.clear();
@@ -1099,7 +1230,7 @@ void selectionWorkerLoop() {
                                 rejectSavedEntry(entry, "runtime_vst3_selection_prepare_failed",
                                                  state::ScopeKind::Track, runtime->scoreKey,
                                                  runtime->trackKey, runtime->trackIndex);
-                        runtime->error = error;
+                        runtime->error = error.empty() ? prepareError : error;
                         runtime->failedSelection = selection;
                     }
                 }
@@ -1180,23 +1311,6 @@ struct TrackDispatchUpdate {
     ~TrackDispatchUpdate() { g_runtime.trackDispatchGeneration.fetch_add(1); }
 };
 
-std::vector<Vst3SelectionEntry> savedSelection(const QJsonArray &effects) {
-    std::vector<Vst3SelectionEntry> result;
-    std::lock_guard<std::mutex> lock(g_runtime.catalogMutex);
-    for (const auto &value : effects) {
-        const auto effect = value.toObject();
-        if (!effect.value("enabled").toBool()) continue;
-        const auto module = effect.value("module").toString().toStdString();
-        const auto classId = effect.value("class_id").toString().toStdString();
-        if (std::none_of(g_runtime.catalogEntries.begin(), g_runtime.catalogEntries.end(),
-            [&](const Vst3SelectionEntry &entry) { return entry.module == module && entry.classId == classId; })) continue;
-        const auto component = QByteArray::fromBase64(effect.value("component_state").toString().toLatin1());
-        const auto controller = QByteArray::fromBase64(effect.value("controller_state").toString().toLatin1());
-        result.push_back({module, classId, {component.begin(), component.end()}, {controller.begin(), controller.end()}});
-    }
-    return result;
-}
-
 void persistRuntimeEntries(const std::vector<Vst3SelectionEntry> &entries, state::ScopeKind scope,
                            const std::string &score = {}, const std::string &track = {}, int trackIndex = -1) {
     if (entries.empty()) return;
@@ -1238,24 +1352,6 @@ void rejectSavedEntry(const Vst3SelectionEntry &entry, const std::string &error,
     }
     state::setScopeEffects(chain, scope, entries, QString::fromStdString(score), QString::fromStdString(track), trackIndex);
     if (state::writeChain(chain)) g_selectionStateChanged = true;
-}
-
-// Restore healthy entries even when one saved processor rejects its state.
-// Explicit UI requests still use the atomic, all-or-nothing selection API.
-template <typename Configure>
-std::vector<Vst3SelectionEntry> restoreSavedEntries(const std::vector<Vst3SelectionEntry> &requested,
-        state::ScopeKind scope, const std::string &score, const std::string &track, int trackIndex, Configure configure) {
-    std::string error;
-    if (configure(requested, &error)) return requested;
-    std::vector<Vst3SelectionEntry> accepted;
-    for (const auto &entry : requested) {
-        auto candidate = accepted;
-        candidate.push_back(entry);
-        if (configure(candidate, &error)) accepted = std::move(candidate);
-        else rejectSavedEntry(entry, error, scope, score, track, trackIndex);
-    }
-    if (accepted.empty()) configure(accepted, &error);
-    return accepted;
 }
 
 void saveTrackRuntime(TrackRuntime &runtime) {
@@ -1318,7 +1414,6 @@ void refreshTrackContextImpl() noexcept {
     for (const auto &runtime : g_runtime.trackRuntimes) {
         if (runtime.trackKey.empty()) continue;
         const auto requested = g_runtime.requestedTrackSelections.find(runtime.trackKey);
-        pending |= catalogIsReady() && requested == g_runtime.requestedTrackSelections.end();
         pending |= requested != g_runtime.requestedTrackSelections.end() && !sameSelection(runtime.requested, requested->second) &&
             (runtime.error.empty() || !sameSelection(runtime.failedSelection, requested->second));
         pending |= runtime.count > 0 && runtime.configuredRate.load() != rate;
@@ -1331,7 +1426,6 @@ void refreshTrackContextImpl() noexcept {
     bool stable = true;
     std::size_t published = 0;
     std::array<bool, 32> used{};
-    QJsonObject savedChain;
     const auto globalActive = g_runtime.chain.snapshot().activeSlot;
     if (globalActive >= 0 && g_runtime.selectionMode.load() && g_runtime.chain.faulted()) {
         auto &slot = g_runtime.selectionSlots[globalActive];
@@ -1364,7 +1458,6 @@ void refreshTrackContextImpl() noexcept {
         runtime.trackKey.clear(); runtime.trackId.clear(); runtime.requested.clear();
         runtime.error.clear(); runtime.failedSelection.clear();
     }
-    if (catalogIsReady()) state::loadChain(savedChain);
     for (const auto &binding : bindings) {
         if (!binding.chain || !binding.activeDocument) continue;
         const auto runtimeIndex = trackRuntimeIndexFor(binding.trackKey);
@@ -1376,10 +1469,6 @@ void refreshTrackContextImpl() noexcept {
         if (!runtime.scoreKey.empty() && runtime.scoreKey != binding.scoreKey) saveTrackRuntime(runtime);
         runtime.scoreKey = binding.scoreKey;
         runtime.trackIndex = binding.trackIndex;
-        const bool restoring = catalogIsReady() && !g_runtime.requestedTrackSelections.count(runtime.trackKey);
-        if (restoring)
-            g_runtime.requestedTrackSelections[runtime.trackKey] = savedSelection(state::scopeEffects(
-                savedChain, state::ScopeKind::Track, QString::fromStdString(binding.scoreKey), QString::fromStdString(binding.trackKey)));
         const auto faultSlot = runtime.chain.snapshot().activeSlot;
         if (faultSlot >= 0 && runtime.chain.faulted()) {
             const int failed = runtime.trackSlots[faultSlot].failedIndex.load(std::memory_order_acquire);
@@ -1399,15 +1488,7 @@ void refreshTrackContextImpl() noexcept {
              !sameSelection(runtime.requested, requested->second)) &&
             (runtime.error.empty() || !sameSelection(runtime.failedSelection, requested->second))) {
             std::string error;
-            if (restoring) {
-                requested->second = restoreSavedEntries(requested->second, state::ScopeKind::Track,
-                    runtime.scoreKey, runtime.trackKey, runtime.trackIndex,
-                    [&](const std::vector<Vst3SelectionEntry> &entries, std::string *failure) {
-                        return runtime.prepare(entries, callbackSampleRate(), 16384, failure);
-                    });
-                runtime.requested = requested->second;
-                runtime.error.clear();
-            } else if (runtime.prepare(requested->second, callbackSampleRate(), 16384, &error)) {
+            if (runtime.prepare(requested->second, callbackSampleRate(), 16384, &error)) {
                 runtime.requested = requested->second;
                 runtime.error.clear();
             } else {
@@ -1607,8 +1688,9 @@ bool configureRuntimeChain() noexcept {
 
 input::Route configuredInputRoute() noexcept {
     const char *configured = std::getenv("GPVST3_P4_ROUTE");
-    // The installed plugin should process the guitar input by default. Keep
-    // an explicit "disabled" value for hosts/users that want the native path.
+    // A selected VST3 chain is also the live-input chain by default. Keep the
+    // old environment override for diagnostics and for hosts that explicitly
+    // want the native input path.
     if (!configured || !*configured)
         return input::Route::InputInsert;
     if (std::strcmp(configured, "disabled") == 0)
@@ -1658,52 +1740,97 @@ bool configureInputRouter() noexcept {
     g_runtime.inputRouter.setEnabled(false);
     g_runtime.inputRouter.setStreamRunning(true);
     g_runtime.inputRouter.setProcessor({});
-    g_runtime.inputEffect.shutdown();
+    g_runtime.inputChain.setBypassed(true);
+    g_runtime.inputChain.deactivate();
+    g_runtime.inputSelectionSlots[0].shutdown();
+    g_runtime.inputSelectionSlots[1].shutdown();
     if (route == input::Route::Disabled) return true;
     const double initialRate = callbackSampleRate();
-    if (!g_runtime.inputRouter.prepare(2, portaudio::kMaxFrames) ||
-        !g_runtime.inputEffect.initialize(initialRate, 16384))
+    if (!g_runtime.inputRouter.prepare(2, portaudio::kMaxFrames))
         return false;
     g_runtime.inputConfiguredRate.store(static_cast<int>(initialRate), std::memory_order_release);
     g_runtime.inputConfiguredChannels.store(g_runtime.inputChannelCount, std::memory_order_release);
     g_runtime.inputConfiguredOutputChannels.store(g_runtime.outputChannelCount, std::memory_order_release);
-    g_runtime.inputRouter.setProcessor(
-        {&g_runtime.inputEffect, &RuntimeEffect::processCallback});
-    const auto *bypass = std::getenv("GPVST3_TOTAL_BYPASS");
-    g_runtime.inputRouter.setBypassed(bypass && std::strcmp(bypass, "1") == 0);
-    g_runtime.inputRouter.setEnabled(true);
+    g_runtime.inputRouter.setBypassed(true);
     updateAudioLayerState();
     return true;
-}
-
-// The guitar-input processor must be the effect the user selected for the
-// global chain. Previously inputEffect always loaded GPVST3_RUNTIME_VST3
-// (or ParametricOD), so a selected VST3 could process playback while the
-// capture path silently used a different plug-in.
-bool configureInputEffectSelection(const std::vector<Vst3SelectionEntry> &selection) noexcept {
-    if (selection.empty() || !g_runtime.inputRouter.snapshot().enabled) return true;
-    if (g_runtime.inputProcessing.test_and_set(std::memory_order_acquire)) return false;
-    g_runtime.inputRouter.setEnabled(false);
-    const auto rate = callbackSampleRate() > 0.0 ? callbackSampleRate() : 44100.0;
-    const auto &entry = selection.front();
-    const bool configured = g_runtime.inputEffect.initialize(rate, 16384,
-                                                              fs::u8path(entry.module),
-                                                              entry.classId, &entry);
-    if (configured) {
-        g_runtime.inputConfiguredRate.store(static_cast<int>(rate), std::memory_order_release);
-        g_runtime.inputConfigurationPending.store(false, std::memory_order_release);
-    } else {
-        g_runtime.inputConfigurationErrors.fetch_add(1, std::memory_order_relaxed);
-        g_runtime.inputConfigurationPending.store(true, std::memory_order_release);
-    }
-    g_runtime.inputRouter.setEnabled(configured);
-    g_runtime.inputProcessing.clear(std::memory_order_release);
-    return configured;
 }
 
 bool inputFeatureEnabled() noexcept {
     const char *enabled = std::getenv("GPVST3_ENABLE_P4_INPUT");
     return !enabled || std::strcmp(enabled, "0") != 0;
+}
+
+bool configureInputSelection(const std::vector<Vst3SelectionEntry> &selection,
+                             std::string *error) noexcept {
+    if (error) error->clear();
+    if (!g_runtime.stream.installed || !inputFeatureEnabled()) return true;
+
+    // Stop accepting new input blocks, then wait for the callback currently
+    // inside the router before replacing its processor/context pointers.
+    g_runtime.inputRouter.setEnabled(false);
+    lockInputProcessing();
+    const InputProcessingGuard release;
+
+    if (selection.empty() || configuredInputRoute() == input::Route::Disabled) {
+        g_runtime.inputChain.setBypassed(true);
+        g_runtime.inputChain.deactivate();
+        g_runtime.inputSelectionSlots[0].shutdown();
+        g_runtime.inputSelectionSlots[1].shutdown();
+        g_runtime.inputRouter.setProcessor({});
+        g_runtime.inputRouter.setRoute(configuredInputRoute());
+        g_runtime.inputRouter.setBypassed(true);
+        refreshInputParameterMirrors();
+        return true;
+    }
+    if (g_runtime.inputRouter.channelCapacity() == 0 && !configureInputRouter()) {
+        if (error) *error = "input_router_prepare_failed";
+        return false;
+    }
+
+    const auto rate = callbackSampleRate() > 0.0 ? callbackSampleRate() : 44100.0;
+    std::vector<Vst3SelectionEntry> inputSelection = selection;
+    // GPVST3_P4_ROUTE is the old isolated P4 fixture switch. When it is
+    // explicitly supplied, retain its standalone test processor semantics;
+    // normal installed use (no override) follows the selected global chain.
+    if (const char *legacyRoute = std::getenv("GPVST3_P4_ROUTE");
+        legacyRoute && *legacyRoute && std::strcmp(legacyRoute, "disabled") != 0) {
+        if (const char *runtimePath = std::getenv("GPVST3_RUNTIME_VST3");
+            runtimePath && *runtimePath)
+            inputSelection = {{runtimePath, {}}};
+    }
+    const auto old = g_runtime.inputChain.snapshot().activeSlot;
+    const auto target = old == 0 ? 1U : 0U;
+    if (!g_runtime.inputChain.prepareSlot(target,
+            {&g_runtime.inputSelectionSlots[target], &SelectionSlot::processCallback})) {
+        if (error) *error = "input_vst3_chain_prepare_failed";
+        return false;
+    }
+    const auto *previous = old >= 0 ? &g_runtime.inputSelectionSlots[old] : nullptr;
+    if (!g_runtime.inputSelectionSlots[target].prepare(inputSelection, rate, 16384, previous, error))
+        return false;
+    if (!g_runtime.inputChain.prepareSlot(target,
+            {&g_runtime.inputSelectionSlots[target], &SelectionSlot::processCallback}) ||
+        !g_runtime.inputChain.activate(target)) {
+        if (error && error->empty()) *error = "input_vst3_chain_activate_failed";
+        g_runtime.inputSelectionSlots[target].shutdown();
+        return false;
+    }
+    g_runtime.inputChain.clearFault();
+    g_runtime.inputChain.setBypassed(false);
+    g_runtime.inputRouter.setRoute(configuredInputRoute());
+    g_runtime.inputRouter.setProcessor({&g_runtime.inputChain, &processInputChain});
+    g_runtime.inputRouter.setBypassed(false);
+    // A PortAudio callback can begin before AudioLayer's observation accessor
+    // reports its first running state. The callback itself is the authoritative
+    // liveness signal; the maintenance path will still clear this flag when GP
+    // stops the stream.
+    g_runtime.inputRouter.setStreamRunning(true);
+    g_runtime.inputRouter.setEnabled(true);
+    g_runtime.inputConfiguredRate.store(static_cast<int>(rate), std::memory_order_release);
+    g_runtime.inputConfigurationPending.store(false, std::memory_order_release);
+    refreshInputParameterMirrors();
+    return true;
 }
 
 bool validateReconfiguration() noexcept {
@@ -1981,17 +2108,28 @@ State prepare(const host::Verification &verification, bool enableForSelection) n
             g_runtime.effects[0].shutdown();
             g_runtime.effects[1].shutdown();
         }
-        {
+        if (result.installed && inputFeatureEnabled()) {
+            // Prepare the capture adapter before restoring a pre-existing
+            // requested selection. configureInputRouter() resets the input
+            // slots; doing it afterwards would erase the live copy just
+            // prepared for that selection.
+            configureInputRouter();
             std::lock_guard<std::mutex> lock(g_runtime.selectionMutex);
-            if (result.installed && !g_runtime.requestedSelection.empty() &&
-                configureSelectedChain(g_runtime.requestedSelection))
+            if (!g_runtime.requestedSelection.empty() &&
+                configureSelectedChain(g_runtime.requestedSelection)) {
+                configureInputSelection(g_runtime.requestedSelection);
                 g_runtime.appliedSelection = g_runtime.requestedSelection;
-        }
-        if (result.installed && inputFeatureEnabled()) configureInputRouter();
-        else {
+            }
+        } else {
             g_runtime.inputRouter.setEnabled(false);
             g_runtime.inputRouter.setRoute(input::Route::Disabled);
-            g_runtime.inputEffect.shutdown();
+            lockInputProcessing();
+            g_runtime.inputChain.setBypassed(true);
+            g_runtime.inputChain.deactivate();
+            g_runtime.inputSelectionSlots[0].shutdown();
+            g_runtime.inputSelectionSlots[1].shutdown();
+            g_runtime.inputRouter.setProcessor({});
+            unlockInputProcessing();
         }
         result.reason = result.installed ? "runtime_observation_active" : "hook_install_failed";
     }
@@ -2167,8 +2305,6 @@ State snapshot() noexcept {
     result.lastProcessNanoseconds = chain.lastProcessNanoseconds;
     result.maxProcessNanoseconds = chain.maxProcessNanoseconds;
     result.totalProcessNanoseconds = chain.totalProcessNanoseconds;
-    result.chainDeadlineNanoseconds = chain.deadlineNanoseconds;
-    result.chainDeadlineExceededBlocks = chain.deadlineExceededBlocks;
     result.chainSwitchCount = chain.switchCount;
     result.runtimeEffectInstances = 0;
     if (g_runtime.selectionMode.load(std::memory_order_acquire)) {
@@ -2198,10 +2334,9 @@ State snapshot() noexcept {
         result.inputOrderGeneratedSample = g_runtime.inputOrderGeneratedSample.load(std::memory_order_relaxed);
         result.inputOrderOutputSample = g_runtime.inputOrderOutputSample.load(std::memory_order_relaxed);
     }
-    result.inputProcessorReady = input.enabled && g_runtime.inputEffect.ready.load(std::memory_order_acquire);
-    result.inputProcessorModule = g_runtime.inputEffect.identity.module;
-    result.inputProcessorClassId = g_runtime.inputEffect.identity.classId;
-    result.inputProcessorName = g_runtime.inputEffect.name;
+    const auto inputChain = g_runtime.inputChain.snapshot();
+    result.inputProcessorReady = input.enabled && inputChain.activeSlot >= 0 &&
+        !inputChain.bypassed && !inputChain.faulted;
     result.inputRoute = input::routeName(input.route);
     if (input.route == input::Route::Disabled)
         result.inputRouteReason = "p4_route_disabled";
@@ -2231,7 +2366,6 @@ State snapshot() noexcept {
     result.inputInterleavedBlocks = input.interleavedBlocks;
     result.inputInterleavedFormatErrors = input.interleavedFormatErrors;
     result.inputInterleavedMissingBlocks = input.interleavedMissingBlocks;
-    result.inputInterleavedCopyOperations = input.interleavedCopyOperations;
     result.inputInterleavedInputChannelCount = input.interleavedInputChannelCount;
     result.inputInterleavedOutputChannelCount = input.interleavedOutputChannelCount;
     result.inputFirstCaptureAddress = input.firstCaptureAddress;
@@ -2253,59 +2387,6 @@ State snapshot() noexcept {
         g_runtime.inputObservedRate.load(std::memory_order_relaxed));
     result.inputConfigurationErrors =
         g_runtime.inputConfigurationErrors.load(std::memory_order_relaxed);
-    result.audioCallbackBlocks = g_runtime.audioCallbackBlocks.load(std::memory_order_relaxed);
-    result.firstAudioCallbackNanoseconds =
-        g_runtime.firstAudioCallbackNanoseconds.load(std::memory_order_relaxed);
-    result.audioCallbackProcessingNanoseconds =
-        g_runtime.audioCallbackProcessingNanoseconds.load(std::memory_order_relaxed);
-    result.audioCallbackMaxNanoseconds =
-        g_runtime.audioCallbackMaxNanoseconds.load(std::memory_order_relaxed);
-    result.audioCallbackDeadlineNanoseconds =
-        g_runtime.audioCallbackDeadlineNanoseconds.load(std::memory_order_relaxed);
-    result.audioCallbackDeadlineOverruns =
-        g_runtime.audioCallbackDeadlineOverruns.load(std::memory_order_relaxed);
-    result.audioCallbackExtraCopyOperations =
-        g_runtime.audioCallbackExtraCopyOperations.load(std::memory_order_relaxed);
-    std::vector<std::uint64_t> callbackSamples;
-    const auto sampleCount = (std::min)(g_runtime.audioCallbackSampleIndex.load(std::memory_order_relaxed),
-                                        g_runtime.audioCallbackSamples.size());
-    callbackSamples.reserve(sampleCount);
-    for (std::size_t index = 0; index < sampleCount; ++index) {
-        const auto value = g_runtime.audioCallbackSamples[index].load(std::memory_order_relaxed);
-        if (value != 0) callbackSamples.push_back(value);
-    }
-    std::sort(callbackSamples.begin(), callbackSamples.end());
-    const auto percentile = [&callbackSamples](double fraction) -> std::uint64_t {
-        if (callbackSamples.empty()) return 0;
-        const auto index = (std::min)(callbackSamples.size() - 1,
-            static_cast<std::size_t>(fraction * static_cast<double>(callbackSamples.size() - 1)));
-        return callbackSamples[index];
-    };
-    result.audioCallbackP95Nanoseconds = percentile(0.95);
-    result.audioCallbackP99Nanoseconds = percentile(0.99);
-    result.deviceInputLatencySamples =
-        g_runtime.deviceInputLatencySamples.load(std::memory_order_relaxed);
-    result.deviceOutputLatencySamples =
-        g_runtime.deviceOutputLatencySamples.load(std::memory_order_relaxed);
-    std::size_t vst3Latency = g_runtime.inputEffect.reportedLatencySamples.load(std::memory_order_relaxed);
-    const auto activeGlobal = chain.activeSlot;
-    if (activeGlobal >= 0 && activeGlobal < 2) {
-        if (g_runtime.selectionMode.load(std::memory_order_acquire)) {
-            const auto &slot = g_runtime.selectionSlots[activeGlobal];
-            for (std::size_t index = 0; index < slot.count; ++index)
-                if (slot.effects[index])
-                    vst3Latency += slot.effects[index]->reportedLatencySamples.load(std::memory_order_relaxed);
-        } else if (!selectionPublished) {
-            vst3Latency += g_runtime.effects[activeGlobal].reportedLatencySamples.load(std::memory_order_relaxed);
-        }
-    }
-    result.vst3LatencySamples = vst3Latency;
-    result.adapterLatencySamples = 0;
-    result.roundtripLatencySamples = result.deviceInputLatencySamples +
-        result.deviceOutputLatencySamples + result.vst3LatencySamples;
-    result.roundtripLatencyMeasured = false;
-    result.roundtripLatencyStatus = result.audioCallbackBlocks == 0
-        ? "unavailable" : "reported_components_only";
     std::atomic_store(&previous, std::make_shared<const State>(result));
     return result;
 }
@@ -2355,6 +2436,7 @@ bool configureSelectedChain(const std::vector<Vst3SelectionEntry> &selection, st
     g_runtime.chain.setBypassed(selection.empty());
     g_runtime.effects[0].shutdown();
     g_runtime.effects[1].shutdown();
+    refreshInputParameterMirrors();
     return true;
 }
 
@@ -2366,32 +2448,53 @@ void reconfigureInputRouterIfNeeded() noexcept {
     if (observedRate <= 0 || observedInput == 0 || observedOutput == 0 ||
         observedRate == g_runtime.inputConfiguredRate.load(std::memory_order_acquire))
         return;
-    if (g_runtime.inputProcessing.test_and_set(std::memory_order_acquire)) return;
     g_runtime.inputRouter.setEnabled(false);
-    const bool configured = g_runtime.inputEffect.reconfigure(static_cast<double>(observedRate), 16384);
+    lockInputProcessing();
+    const InputProcessingGuard release;
+    const auto active = g_runtime.inputChain.snapshot().activeSlot;
+    bool configured = active >= 0;
+    g_runtime.inputChain.setBypassed(true);
+    if (configured) {
+        auto &slot = g_runtime.inputSelectionSlots[active];
+        for (std::size_t index = 0; index < slot.count; ++index)
+            configured = slot.effects[index] &&
+                slot.effects[index]->reconfigure(static_cast<double>(observedRate), 16384) && configured;
+    }
     if (configured) {
         g_runtime.inputConfiguredRate.store(observedRate, std::memory_order_release);
         g_runtime.inputConfiguredChannels.store(observedInput, std::memory_order_release);
         g_runtime.inputConfiguredOutputChannels.store(observedOutput, std::memory_order_release);
         g_runtime.inputConfigurationPending.store(false, std::memory_order_release);
+        g_runtime.inputChain.clearFault();
+        g_runtime.inputChain.setBypassed(false);
     } else {
         g_runtime.inputConfigurationPending.store(true, std::memory_order_release);
         g_runtime.inputConfigurationErrors.fetch_add(1, std::memory_order_relaxed);
     }
     g_runtime.inputRouter.setEnabled(configured);
-    g_runtime.inputProcessing.clear(std::memory_order_release);
 }
 
 void shutdown() noexcept {
     stopSelectionWorker();
     std::lock_guard<std::recursive_mutex> editorLock(g_runtime.editorMutex);
+    const auto openEditor = std::atomic_exchange(&g_openEditorEffect, std::shared_ptr<RuntimeEffect>{});
+    if (openEditor) {
+        EditorCallbackScope callbackScope;
+        openEditor->closeEditor();
+    }
     const TrackDispatchUpdate trackUpdate;
     state::clearRuntimeTrackContext();
     g_runtime.chain.setBypassed(true);
     g_runtime.chain.deactivate();
     g_runtime.inputRouter.setEnabled(false);
     g_runtime.inputRouter.setRoute(input::Route::Disabled);
-    g_runtime.inputEffect.shutdown();
+    lockInputProcessing();
+    g_runtime.inputChain.setBypassed(true);
+    g_runtime.inputChain.deactivate();
+    g_runtime.inputSelectionSlots[0].shutdown();
+    g_runtime.inputSelectionSlots[1].shutdown();
+    g_runtime.inputRouter.setProcessor({});
+    unlockInputProcessing();
     g_runtime.outputEvidenceClaimed.store(false, std::memory_order_release);
     g_runtime.outputBeforeHash.store(0, std::memory_order_relaxed);
     g_runtime.outputAfterHash.store(0, std::memory_order_relaxed);
@@ -2402,17 +2505,6 @@ void shutdown() noexcept {
     g_runtime.outputThread.store(0, std::memory_order_relaxed);
     g_runtime.outputFirstBuffer.store(0, std::memory_order_relaxed);
     g_runtime.outputLastBuffer.store(0, std::memory_order_relaxed);
-    g_runtime.audioCallbackBlocks.store(0, std::memory_order_relaxed);
-    g_runtime.firstAudioCallbackNanoseconds.store(0, std::memory_order_relaxed);
-    g_runtime.audioCallbackProcessingNanoseconds.store(0, std::memory_order_relaxed);
-    g_runtime.audioCallbackMaxNanoseconds.store(0, std::memory_order_relaxed);
-    g_runtime.audioCallbackDeadlineNanoseconds.store(0, std::memory_order_relaxed);
-    g_runtime.audioCallbackDeadlineOverruns.store(0, std::memory_order_relaxed);
-    g_runtime.audioCallbackExtraCopyOperations.store(0, std::memory_order_relaxed);
-    g_runtime.audioCallbackSampleIndex.store(0, std::memory_order_relaxed);
-    for (auto &sample : g_runtime.audioCallbackSamples) sample.store(0, std::memory_order_relaxed);
-    g_runtime.deviceInputLatencySamples.store(0, std::memory_order_relaxed);
-    g_runtime.deviceOutputLatencySamples.store(0, std::memory_order_relaxed);
     remove(g_runtime.stream);
     remove(g_runtime.dsp);
     remove(g_runtime.master);
@@ -2487,7 +2579,6 @@ std::uint64_t outputHash(const void *output, unsigned long frames) noexcept {
 
 int streamCallbackHook(const void *input, void *output, unsigned long frames,
                        const void *timeInfo, unsigned long status, void *userData) {
-    const auto started = std::chrono::steady_clock::now();
     const auto original = reinterpret_cast<StreamCallback>(g_runtime.stream.trampoline);
     const auto outputAddress = reinterpret_cast<std::uintptr_t>(output);
     auto firstBuffer = g_runtime.outputFirstBuffer.load(std::memory_order_relaxed);
@@ -2496,60 +2587,14 @@ int streamCallbackHook(const void *input, void *output, unsigned long frames,
                                                               std::memory_order_relaxed);
     g_runtime.outputLastBuffer.store(outputAddress, std::memory_order_relaxed);
     g_runtime.outputCalls.fetch_add(1, std::memory_order_relaxed);
-    // Hashing the callback buffer is diagnostic only; after the first
-    // observation it must disappear from the realtime path.
-    const bool collectOutputEvidence = !g_runtime.outputEvidenceClaimed.load(std::memory_order_relaxed);
-    const auto before = collectOutputEvidence ? outputHash(output, frames) : 0;
+    const auto before = outputHash(output, frames);
     const auto result = original(input, output, frames, timeInfo, status, userData);
     const auto inputState = g_runtime.inputRouter.snapshot();
-    double callbackRate = callbackSampleRate();
-    const auto finish = [&] {
-        const auto after = collectOutputEvidence ? outputHash(output, frames) : 0;
-        g_runtime.outputObserved.store(output != nullptr && frames != 0, std::memory_order_release);
-        if (collectOutputEvidence) {
-            bool expected = false;
-            if (g_runtime.outputEvidenceClaimed.compare_exchange_strong(expected, true) && before != after) {
-                g_runtime.outputBeforeHash.store(before, std::memory_order_relaxed);
-                g_runtime.outputAfterHash.store(after, std::memory_order_relaxed);
-                g_runtime.outputWriteObserved.store(true, std::memory_order_release);
-            }
-        }
-        g_runtime.outputFrames.store(frames, std::memory_order_relaxed);
-        g_runtime.outputThread.store(GetCurrentThreadId(), std::memory_order_relaxed);
-        const auto elapsed = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
-            std::chrono::steady_clock::now() - started).count());
-        const auto deadline = callbackRate > 0.0
-            ? static_cast<std::uint64_t>((static_cast<double>(frames) / callbackRate) * 1.0e9) : 0;
-        g_runtime.audioCallbackBlocks.fetch_add(1, std::memory_order_relaxed);
-        auto firstCallback = g_runtime.firstAudioCallbackNanoseconds.load(std::memory_order_relaxed);
-        if (firstCallback == 0) {
-            const auto sinceEpoch = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
-                std::chrono::steady_clock::now().time_since_epoch()).count());
-            g_runtime.firstAudioCallbackNanoseconds.compare_exchange_strong(firstCallback, sinceEpoch,
-                                                                            std::memory_order_relaxed);
-        }
-        g_runtime.audioCallbackProcessingNanoseconds.store(elapsed, std::memory_order_relaxed);
-        g_runtime.audioCallbackDeadlineNanoseconds.store(deadline, std::memory_order_relaxed);
-        auto maximum = g_runtime.audioCallbackMaxNanoseconds.load(std::memory_order_relaxed);
-        while (maximum < elapsed && !g_runtime.audioCallbackMaxNanoseconds.compare_exchange_weak(
-                   maximum, elapsed, std::memory_order_relaxed)) {}
-        const auto sample = g_runtime.audioCallbackSampleIndex.fetch_add(1, std::memory_order_relaxed);
-        g_runtime.audioCallbackSamples[sample % g_runtime.audioCallbackSamples.size()].store(
-            elapsed, std::memory_order_relaxed);
-        if (deadline != 0 && elapsed > deadline)
-            g_runtime.audioCallbackDeadlineOverruns.fetch_add(1, std::memory_order_relaxed);
-        return result;
-    };
-    // A disabled or bypassed input chain leaves the native callback's output
-    // in place. Do not parse stream internals or copy capture data in this path.
-    if (!inputState.enabled || inputState.bypassed ||
-        inputState.route == input::Route::Disabled) return finish();
     portaudio::Configuration configuration;
     const bool configurationValid = frames > 0 &&
         frames <= portaudio::kMaxFrames &&
         portaudio::configuration(g_runtime.audioModule, userData, configuration);
     if (configurationValid) {
-        callbackRate = configuration.sampleRate;
         g_runtime.inputObservedRate.store(static_cast<int>(configuration.sampleRate),
                                            std::memory_order_relaxed);
         g_runtime.inputObservedChannels.store(configuration.inputChannels,
@@ -2560,14 +2605,6 @@ int streamCallbackHook(const void *input, void *output, unsigned long frames,
                                                 std::memory_order_release);
         g_runtime.inputConfiguredOutputChannels.store(configuration.outputChannels,
                                                        std::memory_order_release);
-        const auto latencySamples = [callbackRate](double latency) noexcept {
-            return std::isfinite(latency) && latency > 0.0
-                ? static_cast<std::size_t>(latency * callbackRate + 0.5) : std::size_t{0};
-        };
-        g_runtime.deviceInputLatencySamples.store(latencySamples(configuration.inputSuggestedLatency),
-                                                  std::memory_order_relaxed);
-        g_runtime.deviceOutputLatencySamples.store(latencySamples(configuration.outputSuggestedLatency),
-                                                   std::memory_order_relaxed);
     } else {
         g_runtime.inputConfigurationErrors.fetch_add(1, std::memory_order_relaxed);
     }
@@ -2584,8 +2621,7 @@ int streamCallbackHook(const void *input, void *output, unsigned long frames,
             static_cast<std::size_t>(frames),
             userData, static_cast<std::uint64_t>(g_runtime.outputCalls.load(std::memory_order_relaxed)),
             input::InterleavedSampleFormat::Float32};
-        const bool collectInputEvidence = !g_runtime.inputOrderEvidenceClaimed.load(std::memory_order_relaxed);
-        const auto postOriginal = collectInputEvidence ? outputHash(output, frames) : 0;
+        const auto postOriginal = outputHash(output, frames);
         const bool observeSamples = input && output &&
             !g_runtime.inputOrderSamplesObserved.load(std::memory_order_acquire) &&
             g_runtime.trackChainProcessedBlocks.load(std::memory_order_relaxed) > 0 &&
@@ -2593,14 +2629,12 @@ int streamCallbackHook(const void *input, void *output, unsigned long frames,
         const float captureSample = observeSamples ? static_cast<const float *>(input)[0] : 0.0F;
         const float generatedSample = observeSamples ? static_cast<const float *>(output)[0] : 0.0F;
         if (processExternalInputInterleaved(view)) {
-            const auto postRoute = collectInputEvidence ? outputHash(output, frames) : 0;
+            const auto postRoute = outputHash(output, frames);
             g_runtime.inputAfterOriginalBlocks.fetch_add(1, std::memory_order_release);
             bool expected = false;
-            if (collectInputEvidence && g_runtime.inputOrderEvidenceClaimed.compare_exchange_strong(expected, true)) {
-                if (postOriginal != postRoute) {
-                    g_runtime.inputPostOriginalHash.store(postOriginal, std::memory_order_relaxed);
-                    g_runtime.inputPostRouteHash.store(postRoute, std::memory_order_relaxed);
-                }
+            if (postOriginal != postRoute && g_runtime.inputOrderEvidenceClaimed.compare_exchange_strong(expected, true)) {
+                g_runtime.inputPostOriginalHash.store(postOriginal, std::memory_order_relaxed);
+                g_runtime.inputPostRouteHash.store(postRoute, std::memory_order_relaxed);
             }
             // Copy one non-silent sample from this same callback. Never retain
             // borrowed device pointers; publish the tuple only after all stores.
@@ -2614,11 +2648,22 @@ int streamCallbackHook(const void *input, void *output, unsigned long frames,
             }
         }
     }
-    const auto copies = g_runtime.inputRouter.snapshot().interleavedCopyOperations;
-    if (copies >= inputState.interleavedCopyOperations)
-        g_runtime.audioCallbackExtraCopyOperations.fetch_add(copies - inputState.interleavedCopyOperations,
-                                                            std::memory_order_relaxed);
-    return finish();
+    const auto after = outputHash(output, frames);
+    g_runtime.outputObserved.store(output != nullptr && frames != 0, std::memory_order_release);
+    if (before != after) {
+        bool expected = false;
+        if (g_runtime.outputEvidenceClaimed.compare_exchange_strong(
+                expected, true, std::memory_order_acq_rel)) {
+        // Keep the first changed pair so a later silent block cannot overwrite
+        // the evidence that the device callback actually wrote its output.
+            g_runtime.outputBeforeHash.store(before, std::memory_order_relaxed);
+            g_runtime.outputAfterHash.store(after, std::memory_order_relaxed);
+            g_runtime.outputWriteObserved.store(true, std::memory_order_release);
+        }
+    }
+    g_runtime.outputFrames.store(frames, std::memory_order_relaxed);
+    g_runtime.outputThread.store(GetCurrentThreadId(), std::memory_order_relaxed);
+    return result;
 }
 
 void setTotalBypass(bool bypassed) noexcept {
@@ -2644,10 +2689,6 @@ bool setVst3Selection(const std::vector<Vst3SelectionEntry> &selection, std::str
         return true;
     }
     if (!configureSelectedChain(selection, error)) return false;
-    if (!configureInputEffectSelection(selection)) {
-        if (error && error->empty()) *error = "input_vst3_selection_prepare_failed";
-        return false;
-    }
     g_runtime.requestedSelection = selection;
     return true;
 }
@@ -2663,13 +2704,6 @@ bool requestGlobalVst3Selection(const std::vector<Vst3SelectionEntry> &selection
     if (selection.size() > SelectionSlot::kMaxEffects) {
         if (error) *error = "runtime_vst3_chain_full";
         return false;
-    }
-    if (!g_runtime.master.installed && !selection.empty()) {
-        const auto prepared = prepare(g_verification, true);
-        if (!prepared.installed) {
-            if (error) *error = prepared.reason;
-            return false;
-        }
     }
     startSelectionWorker();
     {
@@ -2714,40 +2748,14 @@ void setVst3Catalog(const QJsonArray &catalog) {
         std::lock_guard<std::mutex> lock(g_runtime.catalogMutex);
         if (g_runtime.catalogReady && sameSelection(entries, g_runtime.catalogEntries)) return;
     }
-    saveVst3States();
     {
         std::lock_guard<std::mutex> lock(g_runtime.catalogMutex);
         g_runtime.catalogEntries = entries;
         g_runtime.catalogReady = true;
     }
-    {
-        std::lock_guard<std::mutex> lock(g_runtime.selectionMutex);
-        g_runtime.requestedTrackSelections.clear();
-    }
-    QJsonObject chain;
-    state::loadChain(chain);
-    const auto global = savedSelection(state::scopeEffects(chain, state::ScopeKind::Global));
-    bool anyEnabled = !global.empty();
-    const auto scores = chain.value("scores").toObject();
-    for (const auto &score : scores) {
-        const auto tracks = score.toObject().value("tracks").toObject();
-        for (const auto &track : tracks)
-            anyEnabled |= !savedSelection(track.toObject().value("effects").toArray()).empty();
-    }
-    if (anyEnabled && !g_runtime.master.installed) {
-        const auto prepared = prepare(g_verification, true);
-        if (!prepared.installed) return;
-    }
-    if (g_runtime.master.installed && (!global.empty() || g_runtime.selectionPublished.load())) {
-        startSelectionWorker();
-        {
-            std::lock_guard<std::mutex> lock(g_runtime.selectionRequestMutex);
-            g_runtime.pendingSelection = global;
-            g_runtime.selectionRequestPending = true;
-            ++g_runtime.selectionRequestGeneration;
-        }
-        g_runtime.selectionCondition.notify_one();
-    }
+    // Catalog delivery is metadata-only. Persisted selections are deliberately
+    // not restored here: loading a factory/processor belongs exclusively to an
+    // explicit user request handled by the selection worker.
     refreshTrackContextImpl();
 }
 
@@ -2828,13 +2836,6 @@ bool requestTrackVst3Selection(const std::string &trackKey,
         if (error) *error = "runtime_vst3_chain_full";
         return false;
     }
-    if (!g_runtime.dsp.installed && !selection.empty()) {
-        const auto prepared = prepare(g_verification, true);
-        if (!prepared.installed) {
-            if (error) *error = prepared.reason;
-            return false;
-        }
-    }
     // Track runtimes already have an independent fixed table. Queueing the
     // request through the same worker keeps processor construction off Qt;
     // the current binding is validated before accepting it.
@@ -2893,7 +2894,7 @@ std::vector<Vst3SelectionEntry> captureVst3States() {
 }
 
 bool openVst3Editor(const Vst3SelectionEntry &entry, void *parentWindow) noexcept {
-    if (g_inEditorCallback) return false;
+    if (g_inEditorCallback || !onQtThread()) return false;
     std::unique_lock<std::recursive_mutex> editorLock(g_runtime.editorMutex, std::try_to_lock);
     if (!editorLock.owns_lock()) return false;
     std::unique_lock<std::mutex> lock(g_runtime.selectionMutex, std::try_to_lock);
@@ -2911,10 +2912,11 @@ bool openVst3Editor(const Vst3SelectionEntry &entry, void *parentWindow) noexcep
             slot.effects[index]->identity.classId == entry.classId) {
             const auto effect = slot.effects[index];
             lock.unlock();
-            closeVst3Editors();
-            g_openEditorEffect = effect;
             EditorCallbackScope callbackScope;
-            return effect->openEditor(static_cast<HWND>(parentWindow));
+            closeVst3Editors();
+            if (!effect->openEditor(static_cast<HWND>(parentWindow))) return false;
+            std::atomic_store(&g_openEditorEffect, effect);
+            return true;
         }
     }
     return false;
@@ -2922,7 +2924,7 @@ bool openVst3Editor(const Vst3SelectionEntry &entry, void *parentWindow) noexcep
 
 bool openTrackVst3Editor(const std::string &trackKey, const Vst3SelectionEntry &entry,
                          void *parentWindow) noexcept {
-    if (!parentWindow || g_inEditorCallback) return false;
+    if (!parentWindow || g_inEditorCallback || !onQtThread()) return false;
     std::unique_lock<std::recursive_mutex> editorLock(g_runtime.editorMutex, std::try_to_lock);
     if (!editorLock.owns_lock()) return false;
     std::unique_lock<std::mutex> lock(g_runtime.selectionMutex, std::try_to_lock);
@@ -2936,10 +2938,11 @@ bool openTrackVst3Editor(const std::string &trackKey, const Vst3SelectionEntry &
             const auto effect = slot.effects[index];
             if (effect->identity.module == entry.module && effect->identity.classId == entry.classId) {
                 lock.unlock();
-                closeVst3Editors();
-                g_openEditorEffect = effect;
                 EditorCallbackScope callbackScope;
-                return effect->openEditor(static_cast<HWND>(parentWindow));
+                closeVst3Editors();
+                if (!effect->openEditor(static_cast<HWND>(parentWindow))) return false;
+                std::atomic_store(&g_openEditorEffect, effect);
+                return true;
             }
         }
     }
@@ -2947,33 +2950,33 @@ bool openTrackVst3Editor(const std::string &trackKey, const Vst3SelectionEntry &
 }
 
 void scaleVst3Editor(void *host, double factor) noexcept {
+    if (!onQtThread()) return;
+    const auto keepAlive = std::atomic_load(&g_openEditorEffect);
+    if (!keepAlive || !host || !std::isfinite(factor) || factor <= 0.0) return;
     std::unique_lock<std::recursive_mutex> editorLock(g_runtime.editorMutex, std::try_to_lock);
     if (!editorLock.owns_lock()) return;
-    const auto keepAlive = g_openEditorEffect;
-    if (keepAlive) {
-        EditorCallbackScope callbackScope;
-        auto &effect = *keepAlive;
-        if (effect.editorParent != host || !effect.editor) return;
-        if (auto scale = FUnknownPtr<Steinberg::IPlugViewContentScaleSupport>(effect.editor.get())) {
+    if (keepAlive->editorParent != static_cast<HWND>(host) || !keepAlive->editor) return;
+    EditorCallbackScope callbackScope;
+    try {
+        if (auto scale = FUnknownPtr<Steinberg::IPlugViewContentScaleSupport>(keepAlive->editor.get())) {
             if (!succeeded(scale->setContentScaleFactor(static_cast<float>(factor)))) return;
             ViewRect size{};
-            if (succeeded(effect.editor->getSize(&size)) && effect.plugFrame)
-                effect.plugFrame->resizeView(effect.editor.get(), &size);
+            if (succeeded(keepAlive->editor->getSize(&size)) && keepAlive->plugFrame)
+                keepAlive->plugFrame->resizeView(keepAlive->editor.get(), &size);
         }
+    } catch (...) {
+        keepAlive->editorError = "editor_scale_exception";
     }
 }
 
 void closeVst3Editors() noexcept {
+    if (!onQtThread()) return;
     std::unique_lock<std::recursive_mutex> editorLock(g_runtime.editorMutex, std::try_to_lock);
     if (!editorLock.owns_lock()) return;
-    // The visible editor pins its processor independently of the two DSP
-    // slots. No plug-in UI call may hold the worker's selection mutex:
-    // attached/removed can pump Qt events and re-enter observation/capture.
-    const auto effect = std::move(g_openEditorEffect);
-    if (effect) {
-        EditorCallbackScope callbackScope;
-        effect->closeEditor();
-    }
+    const auto effect = std::atomic_exchange(&g_openEditorEffect, std::shared_ptr<RuntimeEffect>{});
+    if (!effect) return;
+    EditorCallbackScope callbackScope;
+    effect->closeEditor();
 }
 
 bool processExternalInput(const input::CaptureView &capture,

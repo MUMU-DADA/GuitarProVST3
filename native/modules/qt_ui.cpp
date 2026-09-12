@@ -102,29 +102,6 @@ QString configuredTrackLabel() {
                      : QStringLiteral("当前音轨：Track %1").arg(index);
 }
 
-QString titleTrackIdentity() {
-    const auto index = configuredTrackIndex();
-    if (index < 0) return QStringLiteral("VST3 · 未选择音轨");
-    int enabled = 0;
-    for (auto *widget : QApplication::allWidgets()) {
-        auto *toggle = qobject_cast<QCheckBox *>(widget);
-        if (toggle && toggle->objectName().startsWith(QStringLiteral("gpvst3Enabled_")) && toggle->isChecked()) ++enabled;
-    }
-    return QStringLiteral("Track %1 · VST3 (%2)").arg(index).arg(enabled);
-}
-
-void refreshTitleTrackIdentity() {
-    const auto label = titleTrackIdentity();
-    for (auto *widget : QApplication::allWidgets()) {
-        auto *button = qobject_cast<QPushButton *>(widget);
-        if (!button || button->objectName() != QStringLiteral("gpvst3SoundEffectChainButton")) continue;
-        button->setText(label);
-        button->setToolTip(label + QStringLiteral("\n打开或刷新 VST3 插件清单"));
-        button->setAccessibleName(label);
-        button->setProperty("gpvst3TrackIdentity", label);
-    }
-}
-
 class ChainPanel final : public QWidget {
 public:
     ChainPanel() {
@@ -459,7 +436,7 @@ QDialog *aboutDialog() {
     title->setFont(titleFont);
     layout->addWidget(title);
     auto *details = new QLabel(
-        QStringLiteral("版本：0.9.2\n"
+        QStringLiteral("版本：0.9.1\n"
                        "已验证宿主：Guitar Pro 8.1.1.17（Windows x64）\n"
                        "许可证：MIT License\n"
                        "第三方声明：VST3 SDK 及插件各自遵循其许可证。\n"
@@ -551,7 +528,6 @@ QToolBar *findTitleToolBar(QMainWindow *window) {
 void ensureAboutEntry() {
     auto *window = mainWindow();
     if (!window) return;
-    refreshTitleTrackIdentity();
     if (g_aboutObservedWindow != window) {
         if (g_aboutObserver && g_aboutObservedWindow)
             g_aboutObservedWindow->removeEventFilter(g_aboutObserver);
@@ -886,7 +862,14 @@ private:
     }
 
     void loadChain() {
+        const auto previousTrackKey = trackKey_;
+        QString selectedIdentity;
+        if (list_ && list_->currentRow() >= 0) {
+            if (auto *selected = list_->itemWidget(list_->currentItem()))
+                selectedIdentity = selected->property("gpvst3EntryId").toString();
+        }
         bindTrackContext();
+        if (previousTrackKey != trackKey_) selectedIdentity.clear();
         QString error;
         if (!state::loadChain(sidecar_, &error))
             status_->setText(QStringLiteral("状态恢复失败：%1").arg(error));
@@ -970,6 +953,11 @@ private:
             appendRow(effect, displayName(effect, counts) + suffix);
         }
         for (const auto &value : preservedMissing) effects_.append(value);
+        if (!selectedIdentity.isEmpty()) {
+            const auto selectedRow = indexFor(selectedIdentity);
+            if (selectedRow >= 0 && selectedRow < activeList()->count())
+                activeList()->setCurrentRow(selectedRow);
+        }
         const auto rowHeight = qMax(32, qRound(32 * devicePixelRatioF()));
         list_->setFixedHeight(qMin(150, qMax(1, list_->count()) * rowHeight + 4));
         availableList_->setFixedHeight(qMin(120, qMax(1, availableList_->count()) * rowHeight + 4));
@@ -1073,17 +1061,17 @@ private:
             QTimer::singleShot(0, this, [this] { loadChain(); });
         });
         const auto openEditorForEntry = [this, identity] {
-            const int index = indexFor(identity); if (index >= 0) this->openEditor(index);
+            const int index = indexFor(identity);
+            if (index >= 0) openEditor(index);
         };
         name->onDoubleClick = openEditorForEntry;
-        // Keep the user-facing entry as a compact name control while exposing
-        // the same command to keyboard/context-menu and MCP validation.
+        // Keep the native GUI command addressable by the host bridge and by
+        // keyboard/context-menu users. Both entry points share the same
+        // guarded Qt-thread editor path.
         auto *editorAction = new QAction(QStringLiteral("打开原生 GUI"), name);
         editorAction->setObjectName(prefix + QStringLiteral("Editor_") + token);
         editorAction->setToolTip(QStringLiteral("打开原生 GUI"));
-        QObject::connect(editorAction, &QAction::triggered, this, [openEditorForEntry] {
-            openEditorForEntry();
-        });
+        QObject::connect(editorAction, &QAction::triggered, name, openEditorForEntry);
         name->addAction(editorAction);
         name->setContextMenuPolicy(Qt::ActionsContextMenu);
     }
@@ -1506,7 +1494,6 @@ void syncVst3Selection() {
 
 void refreshVst3TrackContext() {
     if (g_p7Panel) g_p7Panel->refreshTrackContext();
-    refreshTitleTrackIdentity();
 }
 
 void reloadVst3Selections() {
@@ -1580,7 +1567,7 @@ void showEffectChainPanel(bool show) {
                 {globalAnchor ? globalAnchor->objectName() : QString{}}, {});
         }
         if (soundHost && !soundHost->findChild<QPushButton *>("gpvst3SoundEffectChainButton")) {
-            auto *button = new QPushButton(titleTrackIdentity(), soundHost);
+            auto *button = new QPushButton(g_scanButtonText, soundHost);
             button->setObjectName(QStringLiteral("gpvst3SoundEffectChainButton"));
             button->setToolTip(QStringLiteral("打开或刷新 VST3 插件清单"));
             soundHost->layout()->addWidget(button);
@@ -1589,7 +1576,6 @@ void showEffectChainPanel(bool show) {
                 if (g_refreshControl) g_refreshControl();
             });
         }
-        refreshTitleTrackIdentity();
         if (useP7Panel) {
             const auto mount = [](QWidget *content, QWidget *section, bool expanded) {
                 if (!content) return;

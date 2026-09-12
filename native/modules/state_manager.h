@@ -18,6 +18,10 @@ QString sidecarPath();
 QString settingsPath();
 bool pluginEnabled();
 bool setPluginEnabled(bool enabled);
+// Clear persisted effect activation flags for a new host process. Processor
+// instances are always opt-in for the current session; plugin state bytes and
+// catalog identities remain intact for the user to re-enable explicitly.
+bool disableAllEffectsAtStartup();
 bool loadChain(QJsonObject &chain, QString *error = nullptr);
 bool writeChain(const QJsonObject &chain);
 QJsonArray scopeEffects(const QJsonObject &chain, ScopeKind scope,

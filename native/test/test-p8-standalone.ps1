@@ -43,7 +43,7 @@ try {
     $result.mcp_bridge_modules = @($process.Modules | Where-Object ModuleName -ieq 'guitarpro_mcp.dll' | ForEach-Object FileName)
     if ($result.mcp_bridge_modules.Count -or (Test-Path (Join-Path $run 'mcp/native-session.json'))) { throw 'Standalone process loaded an MCP bridge.' }
     if ($observation.gp_hook.track_binding_source -ne 'native_document_registry') { throw 'Independent native discovery was not selected.' }
-    $expected = @($score.tracks.PSObject.Properties.Value | Where-Object { @($_.effects | Where-Object enabled).Count })
+    $expected = @($score.tracks.PSObject.Properties.Value | Where-Object { $_.present -and @($_.effects | Where-Object enabled).Count })
     $actual = @($observation.gp_hook.track_runtime_evidence | Where-Object configured_effects -gt 0)
     $result.before_play = $observation
     $deadline = [DateTime]::UtcNow.AddSeconds(40)

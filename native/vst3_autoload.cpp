@@ -52,7 +52,9 @@ void initializePlugin() {
         // audio hook is started while disabled.
         return;
     }
-    gpvst3::ui::syncVst3Selection();
+    // A new Guitar Pro session starts with every VST3 effect bypassed. The
+    // persisted chain is shown in the selector, but processors are created
+    // only after an explicit user enable action.
     auto *scanTimer = new QTimer(application);
     scanTimer->setInterval(100);
     QObject::connect(scanTimer, &QTimer::timeout, application,

@@ -51,6 +51,30 @@ int main(int argc, char **argv) {
                    loadedEffect.value("parameters").toObject().value("0").toDouble() == 0.75,
                "effect fields round trip")) return 1;
 
+    QJsonObject startupChain;
+    startupChain.insert("schema", gpvst3::state::kSchema);
+    startupChain.insert("effects", QJsonArray{});
+    startupChain.insert("global", QJsonObject{{"effects", QJsonArray{
+        QJsonObject{{"module", "C:/VST3/Global.vst3"}, {"class_id", "GLOBAL"},
+                     {"enabled", true}, {"bypass", false}}}}});
+    startupChain.insert("scores", QJsonObject{{"C:/scores/p5.gp", QJsonObject{{"tracks", QJsonObject{
+        {"track-1", QJsonObject{{"track_index", 1}, {"effects", QJsonArray{
+            QJsonObject{{"module", "C:/VST3/Track.vst3"}, {"class_id", "TRACK"},
+                         {"enabled", true}, {"bypass", false}}}}}}}}}}});
+    if (!check(gpvst3::state::writeChain(startupChain), "write startup activation fixture")) return 1;
+    if (!check(gpvst3::state::disableAllEffectsAtStartup(), "disable saved effects at startup")) return 1;
+    QJsonObject startupLoaded;
+    if (!check(gpvst3::state::loadChain(startupLoaded), "load startup activation fixture")) return 1;
+    const auto startupGlobal = startupLoaded.value("global").toObject().value("effects").toArray().first().toObject();
+    const auto startupTrack = startupLoaded.value("scores").toObject().value("C:/scores/p5.gp")
+        .toObject().value("tracks").toObject().value("track-1").toObject()
+        .value("effects").toArray().first().toObject();
+    if (!check(!startupGlobal.value("enabled").toBool() && startupGlobal.value("bypass").toBool() &&
+                   startupGlobal.value("desired_enabled").toBool() &&
+                   !startupTrack.value("enabled").toBool() && startupTrack.value("bypass").toBool() &&
+                   startupTrack.value("desired_enabled").toBool(),
+               "global and track effects start bypassed with intent preserved")) return 1;
+
     QFile corrupt(gpvst3::state::sidecarPath());
     if (!check(corrupt.open(QIODevice::WriteOnly | QIODevice::Truncate), "open corrupt sidecar")) return 1;
     corrupt.write("{bad json");

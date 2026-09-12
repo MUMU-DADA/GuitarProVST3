@@ -12,38 +12,8 @@
 #include <QtCore/QString>
 #include <QtCore/QTimer>
 #include <QtCore/QCoreApplication>
-#include <chrono>
-#include <cstdint>
 
 namespace {
-
-using StartupClock = std::chrono::steady_clock;
-StartupClock::time_point g_startupBegin;
-std::uint64_t g_hookReadyMs = 0;
-std::uint64_t g_scanScheduledMs = 0;
-std::uint64_t g_uiReadyMs = 0;
-
-std::uint64_t startupElapsedMs() {
-    if (g_startupBegin.time_since_epoch().count() == 0) g_startupBegin = StartupClock::now();
-    return static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
-        StartupClock::now() - g_startupBegin).count());
-}
-
-QJsonObject startupTimeline(const gpvst3::hook::State &hook) {
-    const auto now = startupElapsedMs();
-    std::uint64_t firstCallbackMs = 0;
-    if (hook.firstAudioCallbackNanoseconds != 0 && g_startupBegin.time_since_epoch().count() != 0) {
-        const auto beginNs = std::chrono::duration_cast<std::chrono::nanoseconds>(
-            g_startupBegin.time_since_epoch()).count();
-        firstCallbackMs = hook.firstAudioCallbackNanoseconds > static_cast<std::uint64_t>(beginNs)
-            ? (hook.firstAudioCallbackNanoseconds - static_cast<std::uint64_t>(beginNs)) / 1000000ULL : 0;
-    }
-    return QJsonObject{{"initialize_ms", 0}, {"hook_ready_ms", static_cast<qint64>(g_hookReadyMs)},
-                       {"scan_scheduled_ms", static_cast<qint64>(g_scanScheduledMs)},
-                       {"ui_ready_ms", static_cast<qint64>(g_uiReadyMs)},
-                       {"first_audio_callback_ms", static_cast<qint64>(firstCallbackMs)},
-                       {"elapsed_ms", static_cast<qint64>(now)}};
-}
 
 QJsonObject classStatus(const gpvst3::vst3::ClassState &value) {
     return QJsonObject{
@@ -255,8 +225,6 @@ QJsonObject hookStatus(const gpvst3::hook::State &value) {
         {"last_process_nanoseconds", static_cast<qint64>(value.lastProcessNanoseconds)},
         {"max_process_nanoseconds", static_cast<qint64>(value.maxProcessNanoseconds)},
         {"total_process_nanoseconds", static_cast<qint64>(value.totalProcessNanoseconds)},
-        {"chain_deadline_nanoseconds", static_cast<qint64>(value.chainDeadlineNanoseconds)},
-        {"chain_deadline_exceeded_blocks", static_cast<qint64>(value.chainDeadlineExceededBlocks)},
         {"chain_switch_count", static_cast<qint64>(value.chainSwitchCount)},
         {"global_chain_enabled", value.globalChainEnabled},
         {"global_chain_process_blocks", static_cast<qint64>(value.globalChainProcessBlocks)},
@@ -296,24 +264,7 @@ QJsonObject hookStatus(const gpvst3::hook::State &value) {
         {"input_order_generated_sample", value.inputOrderGeneratedSample},
         {"input_order_output_sample", value.inputOrderOutputSample},
         {"input_processor_ready", value.inputProcessorReady},
-        {"input_processor_module", QString::fromUtf8(value.inputProcessorModule.data())},
-        {"input_processor_class_id", QString::fromUtf8(value.inputProcessorClassId.data())},
-        {"input_processor_name", QString::fromUtf8(value.inputProcessorName.data())},
         {"input_route", QString::fromUtf8(value.inputRoute.data())},
-        {"input_route_evidence", QJsonObject{
-            {"route", QString::fromUtf8(value.inputRoute.data())},
-            {"reason", QString::fromUtf8(value.inputRouteReason.data())},
-            {"capture_blocks", static_cast<qint64>(value.inputCaptureBlocks)},
-            {"processed_blocks", static_cast<qint64>(value.inputProcessedBlocks)},
-            {"bus_mixed_blocks", static_cast<qint64>(value.inputBusMixedBlocks)},
-            {"bypass_blocks", static_cast<qint64>(value.inputBypassBlocks)},
-            {"error_blocks", static_cast<qint64>(value.inputErrorBlocks)},
-            {"dropped_blocks", static_cast<qint64>(value.inputDroppedBlocks)},
-            {"interleaved_copy_operations", static_cast<qint64>(value.inputInterleavedCopyOperations)},
-            {"output_written", value.inputInterleavedOutputWritten},
-            {"capture_format", QString::fromUtf8(value.inputCaptureFormat.data())},
-            {"channel_layout", QString::fromUtf8(value.inputCaptureChannelLayout.data())},
-            {"ownership", QString::fromUtf8(value.inputCaptureOwnership.data())}}},
         {"input_route_reason", QString::fromUtf8(value.inputRouteReason.data())},
         {"input_capture_blocks", static_cast<qint64>(value.inputCaptureBlocks)},
         {"input_processed_blocks", static_cast<qint64>(value.inputProcessedBlocks)},
@@ -333,7 +284,6 @@ QJsonObject hookStatus(const gpvst3::hook::State &value) {
         {"input_interleaved_blocks", static_cast<qint64>(value.inputInterleavedBlocks)},
         {"input_interleaved_format_errors", static_cast<qint64>(value.inputInterleavedFormatErrors)},
         {"input_interleaved_missing_blocks", static_cast<qint64>(value.inputInterleavedMissingBlocks)},
-        {"input_interleaved_copy_operations", static_cast<qint64>(value.inputInterleavedCopyOperations)},
         {"input_interleaved_input_channel_count", static_cast<qint64>(value.inputInterleavedInputChannelCount)},
         {"input_interleaved_output_channel_count", static_cast<qint64>(value.inputInterleavedOutputChannelCount)},
         {"input_first_capture_address", QString::number(static_cast<qulonglong>(value.inputFirstCaptureAddress), 16)},
@@ -350,24 +300,6 @@ QJsonObject hookStatus(const gpvst3::hook::State &value) {
         {"input_configured_output_channels", static_cast<qint64>(value.inputConfiguredOutputChannels)},
         {"input_configured_sample_rate", value.inputConfiguredSampleRate},
         {"input_configuration_errors", static_cast<qint64>(value.inputConfigurationErrors)},
-        {"audio_deadline", QJsonObject{
-            {"blocks", static_cast<qint64>(value.audioCallbackBlocks)},
-            {"first_callback_nanoseconds", static_cast<qint64>(value.firstAudioCallbackNanoseconds)},
-            {"processing_nanoseconds", static_cast<qint64>(value.audioCallbackProcessingNanoseconds)},
-            {"max_nanoseconds", static_cast<qint64>(value.audioCallbackMaxNanoseconds)},
-            {"p95_nanoseconds", static_cast<qint64>(value.audioCallbackP95Nanoseconds)},
-            {"p99_nanoseconds", static_cast<qint64>(value.audioCallbackP99Nanoseconds)},
-            {"deadline_nanoseconds", static_cast<qint64>(value.audioCallbackDeadlineNanoseconds)},
-            {"overruns", static_cast<qint64>(value.audioCallbackDeadlineOverruns)},
-            {"extra_copy_operations", static_cast<qint64>(value.audioCallbackExtraCopyOperations)}}},
-        {"roundtrip_latency", QJsonObject{
-            {"device_input_samples", static_cast<qint64>(value.deviceInputLatencySamples)},
-            {"device_output_samples", static_cast<qint64>(value.deviceOutputLatencySamples)},
-            {"vst3_samples", static_cast<qint64>(value.vst3LatencySamples)},
-            {"adapter_samples", static_cast<qint64>(value.adapterLatencySamples)},
-            {"reported_samples", static_cast<qint64>(value.roundtripLatencySamples)},
-            {"measured", value.roundtripLatencyMeasured},
-            {"status", QString::fromStdString(value.roundtripLatencyStatus)}}},
         {"reason", QString::fromUtf8(value.reason.data())},
         {"master_process", entryStatus(value.masterProcess)},
         {"effects_chain_processDSP", entryStatus(value.effectsChainProcessDsp)},
@@ -379,14 +311,13 @@ QJsonObject hookStatus(const gpvst3::hook::State &value) {
 namespace gpvst3::bootstrap {
 
 QJsonObject initialize() {
-    g_startupBegin = StartupClock::now();
-    g_hookReadyMs = g_scanScheduledMs = g_uiReadyMs = 0;
     const auto host = host::verify();
     const bool enabled = state::pluginEnabled();
+    if (enabled) state::disableAllEffectsAtStartup();
     if (enabled) {
         gpvst3::gp_audio::initialize();
         hook::prepare(host);
-        g_hookReadyMs = startupElapsedMs();
+        hook::refreshTrackContext();
         ui::setRealtimeBypassControl(&hook::setTotalBypass);
         ui::setVst3SelectionControl(&hook::setGlobalVst3Selection);
         ui::setVst3SelectionRequestControl(&hook::requestGlobalVst3Selection);
@@ -411,20 +342,20 @@ QJsonObject initialize() {
     if (enabled) {
         vst3::setRecognitionControl(&vst3::identifyBundle);
         ui::setVst3DiscoveryControl([] { refreshCatalog(true); }, &identifyBundle);
+        auto *refreshTimer = new QTimer(QCoreApplication::instance());
+        refreshTimer->setInterval(60000);
+        QObject::connect(refreshTimer, &QTimer::timeout, refreshTimer, [] { refreshCatalog(); });
+        refreshTimer->start();
         auto *trackTimer = new QTimer(QCoreApplication::instance());
-        // Do not walk the host object tree during score opening. The first
-        // discovery starts after the UI has had time to present its frame;
-        // subsequent refreshes are only maintenance for host-side changes.
-        trackTimer->setInterval(1000);
+        trackTimer->setInterval(250);
         QObject::connect(trackTimer, &QTimer::timeout, trackTimer, [] {
             hook::refreshTrackContext();
             if (hook::consumeSelectionStateChanges()) ui::reloadVst3Selections();
             ui::refreshVst3TrackContext();
         });
-        QTimer::singleShot(1500, trackTimer, [trackTimer] { trackTimer->start(); });
+        trackTimer->start();
         vst3 = qEnvironmentVariable("GPVST3_RUN_LIFECYCLE_PROBE") == "1"
             ? vst3::prepare(host.supported) : vst3::beginAsync(host.supported);
-        g_scanScheduledMs = startupElapsedMs();
     } else {
         vst3.status = "disabled_by_user";
         ui::setVst3DiscoveryControl(nullptr, nullptr);
@@ -438,7 +369,6 @@ QJsonObject initialize() {
     }
     ui::setVst3Catalog(catalog);
     scanFeedback(vst3);
-    g_uiReadyMs = startupElapsedMs();
     effects::Chain chain;
     chain.setBypassed(!hookState.runtimeProcessorReady);
 
@@ -464,7 +394,6 @@ QJsonObject initialize() {
             {"scratch_prepared_off_thread", true},
             {"realtime_process", "vst3_process_probe"}}},
         {"gp_hook", hookStatus(hookState)},
-        {"startup_timeline", startupTimeline(hookState)},
         {"qt_ui", ui::state()},
         {"state_manager", QJsonObject{{"status", "sidecar_json_p7_enabled"},
                                         {"path", state::sidecarPath()}}},
@@ -486,7 +415,6 @@ bool pollVst3(QJsonObject &status) {
     scanFeedback(completed);
     status.insert("vst3_host", vst3Status(completed));
     status.insert("vst3_catalog", catalog);
-    status.insert("startup_timeline", startupTimeline(hook::snapshot()));
     state::writeStatus(status);
     return true;
 }

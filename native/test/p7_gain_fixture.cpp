@@ -11,6 +11,7 @@
 #include <QtCore/QJsonDocument>
 #include <QtCore/QJsonObject>
 #include <QtCore/QPointer>
+#include <QtCore/QThread>
 #include <QtCore/QTimer>
 #include <QtWidgets/QDoubleSpinBox>
 #include <QtWidgets/QLabel>
@@ -45,7 +46,11 @@ public:
     std::atomic<unsigned long long> edits{0}, blocks{0};
     std::atomic<unsigned long long> inputHash{0}, outputHash{0}, lastSequence{0};
     std::atomic<double> firstInput{0}, firstOutput{0}, sampleRate{0};
-    tresult PLUGIN_API initialize(FUnknown *) override { return kResultOk; }
+    tresult PLUGIN_API initialize(FUnknown *) override {
+        const int delay = qEnvironmentVariableIntValue("GPVST3_TEST_INITIALIZE_DELAY_MS");
+        if (delay > 0 && delay <= 2000) QThread::msleep(static_cast<unsigned long>(delay));
+        return kResultOk;
+    }
     tresult PLUGIN_API terminate() override { handler = nullptr; return kResultOk; }
     tresult PLUGIN_API getControllerClassId(TUID) override { return kNoInterface; }
     tresult PLUGIN_API setIoMode(IoMode) override { return kResultOk; }

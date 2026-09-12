@@ -107,10 +107,6 @@ void Chain::setRampSamples(std::size_t samples) noexcept {
     rampSamples_.store((std::min)(samples, std::size_t{4096}), std::memory_order_release);
 }
 
-void Chain::setDeadlineNanoseconds(std::uint64_t nanoseconds) noexcept {
-    deadlineOverrideNanoseconds_.store(nanoseconds, std::memory_order_release);
-}
-
 void Chain::clearFault() noexcept {
     faulted_.store(false, std::memory_order_release);
     bypassed_.store(requestedBypass_.load(std::memory_order_acquire), std::memory_order_release);
@@ -142,13 +138,6 @@ Chain::ProcessResult Chain::process(const audio::BlockView &block) noexcept {
             std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - started).count());
         slot.readers.fetch_sub(1, std::memory_order_release);
         result.elapsedNanoseconds = elapsed;
-        auto deadline = deadlineOverrideNanoseconds_.load(std::memory_order_acquire);
-        if (deadline == 0 && block.sampleRate > 0.0 && block.frameCount > 0)
-            deadline = static_cast<std::uint64_t>(
-                (static_cast<double>(block.frameCount) / block.sampleRate) * 1.0e9);
-        deadlineNanoseconds_.store(deadline, std::memory_order_relaxed);
-        if (deadline != 0 && elapsed > deadline)
-            deadlineExceededBlocks_.fetch_add(1, std::memory_order_relaxed);
         lastProcessNanoseconds_.store(elapsed, std::memory_order_relaxed);
         totalProcessNanoseconds_.fetch_add(elapsed, std::memory_order_relaxed);
         updateMax(maxProcessNanoseconds_, elapsed);
@@ -208,8 +197,6 @@ Chain::Snapshot Chain::snapshot() const noexcept {
     result.lastProcessNanoseconds = lastProcessNanoseconds_.load(std::memory_order_relaxed);
     result.maxProcessNanoseconds = maxProcessNanoseconds_.load(std::memory_order_relaxed);
     result.totalProcessNanoseconds = totalProcessNanoseconds_.load(std::memory_order_relaxed);
-    result.deadlineNanoseconds = deadlineNanoseconds_.load(std::memory_order_relaxed);
-    result.deadlineExceededBlocks = deadlineExceededBlocks_.load(std::memory_order_relaxed);
     result.switchCount = switchCount_.load(std::memory_order_relaxed);
     result.switchRequests = switchRequests_.load(std::memory_order_relaxed);
     result.switchPrepared = switchPrepared_.load(std::memory_order_relaxed);

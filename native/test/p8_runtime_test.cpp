@@ -1,8 +1,13 @@
 // Exercise production runtime code with a real test VST3 and deterministic
 // buffers. Only host discovery and editor window placement are substituted.
 #include "../modules/gp_hook.cpp"
+#include <chrono>
 #include <iostream>
 #include <stdexcept>
+#include <QtCore/QCoreApplication>
+#include <QtCore/QThread>
+#include <QtCore/QTimer>
+#include <QtWidgets/QWidget>
 
 namespace {
 std::vector<gpvst3::gp_audio::Binding> testBindings;
@@ -46,11 +51,67 @@ extern "C" __declspec(dllexport) int gpvst3_run_runtime_tests(const char *fixtur
         refreshTrackContext();
         std::string error;
         require(setTrackVst3Selection("track", entries, &error), "prepare track processors");
-        require(setGlobalVst3Selection(entries, &error), "prepare global processors");
+        qputenv("GPVST3_TEST_INITIALIZE_DELAY_MS", "150");
+        int uiTicks = 0;
+        QTimer heartbeat;
+        QObject::connect(&heartbeat, &QTimer::timeout, [&uiTicks] { ++uiTicks; });
+        heartbeat.start(5);
+        const auto requestStarted = std::chrono::steady_clock::now();
+        require(requestGlobalVst3Selection(entries, &error), "queue global processors");
+        const auto requestElapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - requestStarted).count();
+        require(requestElapsed < 100, "global VST3 request returned without waiting for initialization");
+        const auto requestDeadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+        while (vst3SelectionPending() && std::chrono::steady_clock::now() < requestDeadline) {
+            QCoreApplication::processEvents(QEventLoop::AllEvents, 10);
+            QThread::msleep(1);
+        }
+        heartbeat.stop();
+        qunsetenv("GPVST3_TEST_INITIALIZE_DELAY_MS");
+        require(!vst3SelectionPending() && uiTicks >= 10,
+                "Qt event processing continued while VST3 processors initialized");
         auto &track = g_runtime.trackRuntimes[0];
         auto *trackProcessor = track.trackSlots[track.chain.snapshot().activeSlot].effects[0].get();
         auto *globalProcessor = g_runtime.selectionSlots[g_runtime.chain.snapshot().activeSlot].effects[0].get();
         require(trackProcessor != globalProcessor, "scope processors are independent");
+        // Live input must use an independently prepared copy of the same
+        // selected global chain. This proves the capture path is not silently
+        // routed through the playback instance or a default plug-in.
+        g_runtime.stream.installed = true;
+        require(configureInputRouter(), "prepare live input router");
+        require(configureInputSelection(entries, &error), "prepare selected live input chain");
+        g_runtime.inputRouter.setStreamRunning(true);
+        require(g_runtime.inputSelectionSlots[g_runtime.inputChain.snapshot().activeSlot].effects[0].get() !=
+                    globalProcessor,
+                "live input uses an independent VST3 instance");
+        float capture[512]{}, inputOutput[512]{};
+        std::fill(std::begin(capture), std::end(capture), 0.4F);
+        const input::InterleavedView inputView{
+            capture, inputOutput, 256, 2, 2, 44100.0, 256,
+            reinterpret_cast<void *>(0x44), 1, input::InterleavedSampleFormat::Float32};
+        require(processExternalInputInterleaved(inputView), "process guitar input through selected VST3 chain");
+        require(std::abs(inputOutput[200 * 2] - 0.5125F) < 0.000001F,
+                "guitar input follows the selected VST3 chain order");
+        require(g_runtime.inputRouter.snapshot().inputProcessedBlocks > 0 &&
+                    g_runtime.inputRouter.snapshot().interleavedOutputWritten,
+                "guitar input writes the processed block back to the host output");
+        require(globalProcessor->queueParameter(1, 0.25),
+                "global editor parameter publishes to the selected chain");
+        require(processExternalInputInterleaved(inputView),
+                "guitar input accepts a mirrored global parameter");
+        require(std::abs(inputOutput[200 * 2] - 0.575F) < 0.000001F,
+                "global parameter edit reaches the independent live input instance");
+        require(trackProcessor->queueParameter(1, 0.75),
+                "track editor parameter publishes to the track chain");
+        require(processExternalInputInterleaved(inputView),
+                "guitar input remains available after a track parameter edit");
+        require(std::abs(inputOutput[200 * 2] - 0.575F) < 0.000001F,
+                "track parameter edit does not leak into the live input instance");
+        require(globalProcessor->queueParameter(1, 0.125) && trackProcessor->queueParameter(1, 0.125),
+                "restore independent playback and input parameter values");
+        require(processExternalInputInterleaved(inputView), "restore the live input parameter value");
+        require(std::abs(inputOutput[200 * 2] - 0.5125F) < 0.000001F,
+                "restored global parameter reaches the live input instance");
         float left[256], right[256]; float *channels[]{left, right};
         auto block = [&](int rate) { return audio::BlockView{nullptr, nullptr, nullptr, channels, 2, 256, double(rate), 256}; };
         auto reset = [&] { std::fill_n(left, 256, 0.4F); std::fill_n(right, 256, 0.4F); };
@@ -78,16 +139,44 @@ extern "C" __declspec(dllexport) int gpvst3_run_runtime_tests(const char *fixtur
         require(!setTrackVst3Selection("track", missing, &error) && error == "runtime_vst3_not_found", "missing explicit selection rejected");
         reset(); require(track.processBlock(block(testRate)) && std::abs(left[0] - 0.5125F) < 0.000001F,
             "failed selection preserves the previous live track chain");
-        // Saved state rejection disables only the failing entry and restores
-        // the two remaining real processors in their original order.
+        QWidget editorHost;
+        editorHost.setAttribute(Qt::WA_NativeWindow);
+        editorHost.resize(500, 300);
+        editorHost.show();
+        QCoreApplication::processEvents();
+        require(openVst3Editor(entries[0], reinterpret_cast<void *>(editorHost.winId())),
+                "VST3 editor opens on the Qt thread");
+        QCoreApplication::processEvents();
+        require(openVst3Editor(entries[0], reinterpret_cast<void *>(editorHost.winId())),
+                "reopening the same VST3 editor is idempotent");
+        closeVst3Editors();
+        QCoreApplication::processEvents();
+        editorHost.close();
+        const auto externalEditorPath = qEnvironmentVariable("GPVST3_TEST_EXTERNAL_EDITOR");
+        if (!externalEditorPath.isEmpty()) {
+            RuntimeEffect externalEffect;
+            require(externalEffect.initialize(44100.0, 16384, fs::u8path(externalEditorPath.toStdString()), {}),
+                    "third-party VST3 editor processor initializes");
+            QWidget externalHost;
+            externalHost.setAttribute(Qt::WA_NativeWindow);
+            externalHost.resize(640, 420);
+            externalHost.show();
+            QCoreApplication::processEvents();
+            require(externalEffect.openEditor(reinterpret_cast<HWND>(externalHost.winId())),
+                    "third-party VST3 editor opens on the Qt thread");
+            QCoreApplication::processEvents();
+            externalEffect.closeEditor();
+            externalHost.close();
+        }
+        // An invalid state rejects the new selection while preserving the
+        // currently active processor chain.
         auto corrupted = entries; corrupted[1].componentState = {1, 2, 3};
-        const auto restored = restoreSavedEntries(corrupted, state::ScopeKind::Global, {}, {}, -1,
-            [](const auto &candidate, std::string *failure) { return setGlobalVst3Selection(candidate, failure); });
-        require(restored.size() == 2 && restored[0].classId == entries[0].classId && restored[1].classId == entries[2].classId,
-            "restore isolates an invalid component state");
-        require(state::loadChain(saved), "read rejected state");
-        require(!state::scopeEffects(saved, state::ScopeKind::Global)[1].toObject().value("enabled").toBool(),
-            "failed auto restore is not persisted as active");
+        require(!setGlobalVst3Selection(corrupted, &error) &&
+                error.rfind("runtime_vst3_state_restore_failed", 0) == 0,
+                "invalid component state is rejected");
+        reset(); require(g_runtime.chain.process(block(testRate)).completed &&
+                         std::abs(left[0] - 0.5125F) < 0.000001F,
+                         "failed global selection preserves the previous live chain");
         require(setTrackVst3Selection("track", entries, &error), "restore explicit track selection");
         auto &slot = track.trackSlots[track.chain.snapshot().activeSlot];
         slot.effects[1]->forceError = true;
@@ -95,15 +184,16 @@ extern "C" __declspec(dllexport) int gpvst3_run_runtime_tests(const char *fixtur
         refreshTrackContext();
         reset(); require(track.processBlock(block(testRate)) && std::abs(left[0] - 0.775F) < 0.000001F,
             "remaining track processors continue after failure isolation");
-        reset(); require(g_runtime.chain.process(block(testRate)).completed && std::abs(left[0] - 0.775F) < 0.000001F,
+        reset(); require(g_runtime.chain.process(block(testRate)).completed && std::abs(left[0] - 0.5125F) < 0.000001F,
             "a track failure does not change the independent global chain");
         require(consumeSelectionStateChanges(), "failure publishes UI reload notification");
         g_runtime.master.installed = false; g_runtime.dsp.installed = false;
         shutdown();
-        std::cout << "PASS: P8 real VST3 buffers at 44100/48000/96000 Hz, scope/instance/state preservation, missing/invalid state rejection and per-entry process failure isolation.\n";
+        std::cout << "PASS: P8 real VST3 buffers, async selection with Qt heartbeat, editor open/reopen/close, scope/state preservation and process failure isolation.\n";
         return 0;
     } catch (const std::exception &error) {
         g_runtime.master.installed = false; g_runtime.dsp.installed = false;
-        shutdown(); std::cerr << "FAIL: " << error.what() << '\n'; return 1;
+        shutdown(); std::cerr << "FAIL: " << error.what() << '\n';
+        return 1;
     }
 }

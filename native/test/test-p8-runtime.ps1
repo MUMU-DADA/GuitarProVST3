@@ -1,4 +1,4 @@
-param([string]$QtDir = '', [string]$OutputRoot = '', [string]$HostDirectory = 'C:\Program Files\Arobas Music\Guitar Pro 8', [string]$PluginPath = '')
+param([string]$QtDir = '', [string]$OutputRoot = '', [string]$HostDirectory = 'C:\Program Files\Arobas Music\Guitar Pro 8', [string]$PluginPath = '', [string]$ExternalEditorPlugin = '')
 $ErrorActionPreference = 'Stop'
 $root = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
 if (-not $QtDir) { $QtDir = Join-Path (Split-Path -Parent $root) 'GuitarProMCP/.tools/qt/5.15.2/msvc2019_64' }
@@ -22,17 +22,20 @@ $before = Get-Gpvst3HostSnapshot $HostDirectory
 $process = $null
 try {
     $driverRoot = Join-Path $root '.tools/native/p8-standalone-driver/plugins'
-    $process = Start-Gpvst3TestHost -HostDirectory $HostDirectory -PluginPath $PluginPath -RunDirectory $run -Environment @{
+    $environment = @{
         QT_PLUGIN_PATH=($driverRoot + ';' + (Split-Path -Parent (Split-Path -Parent ([IO.Path]::GetFullPath($PluginPath)))))
         QT_QPA_GENERIC_PLUGINS='gpvst3_test_driver';GPVST3_TEST_RUNTIME_DLL=[IO.Path]::GetFullPath($dll)
         GPVST3_TEST_RUNTIME_FIXTURE=(Join-Path $root '.tools/native/p8-order-test/P8 Order Fixture.vst3')
         GPVST3_VST3_ROOT=(Join-Path $run 'empty-catalog')
     }
+    if ($ExternalEditorPlugin) { $environment.GPVST3_TEST_EXTERNAL_EDITOR = [IO.Path]::GetFullPath($ExternalEditorPlugin) }
+    $process = Start-Gpvst3TestHost -HostDirectory $HostDirectory -PluginPath $PluginPath -RunDirectory $run -Environment $environment
     $resultPath = Join-Path $run 'runtime-test.json'
     $deadline = [DateTime]::UtcNow.AddSeconds(30)
     do { Start-Sleep -Milliseconds 200 } while (-not (Test-Path $resultPath) -and [DateTime]::UtcNow -lt $deadline)
     if (-not (Test-Path $resultPath) -or (Get-Content $resultPath -Raw | ConvertFrom-Json).result -ne 0) { throw "P8 in-Guitar Pro runtime behavior verification failed. Evidence: $run" }
-    Write-Output "PASS: P8 in-Guitar Pro real VST3 rate/state/failure behavior fixture. Evidence: $run"
+    $scope = if ($ExternalEditorPlugin) { 'async selection, editor lifecycle and third-party editor behavior' } else { 'async selection, editor lifecycle and real VST3 rate/state/failure behavior' }
+    Write-Output "PASS: P8 in-Guitar Pro $scope fixture. Evidence: $run"
 } finally {
     if ($process) { [Gpvst3TestProcess]::WaitForSingleObject($process.Handle, 5000) | Out-Null }
     try { Stop-Gpvst3TestHost $process -RunDirectory $run }
