@@ -459,7 +459,7 @@ QDialog *aboutDialog() {
     title->setFont(titleFont);
     layout->addWidget(title);
     auto *details = new QLabel(
-        QStringLiteral("版本：1.0.0\n"
+        QStringLiteral("版本：0.9.2\n"
                        "已验证宿主：Guitar Pro 8.1.1.17（Windows x64）\n"
                        "许可证：MIT License\n"
                        "第三方声明：VST3 SDK 及插件各自遵循其许可证。\n"
