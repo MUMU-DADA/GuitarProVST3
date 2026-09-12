@@ -78,6 +78,30 @@ struct State {
     bool runtimeConfigurationMatches = false;
     std::string runtimeEffectName;
     std::string runtimeEffectError;
+    // Selection/activation timeline. Timestamps use steady_clock nanoseconds
+    // and are intended for ordering and latency diagnostics only.
+    std::uint64_t selectionRequestId = 0;
+    std::uint64_t selectionQueuedNanoseconds = 0;
+    std::uint64_t selectionWorkerStartedNanoseconds = 0;
+    std::uint64_t selectionPreparedNanoseconds = 0;
+    std::uint64_t selectionCommittedNanoseconds = 0;
+    std::uint64_t selectionAppliedGeneration = 0;
+    std::uint64_t audioGeneration = 0;
+    std::string selectionStatus;
+    std::uint64_t chainActivationNanoseconds = 0;
+    std::uint64_t chainFirstProcessedNanoseconds = 0;
+    std::uint64_t chainActivationSequence = 0;
+    std::uint64_t chainFirstProcessedSequence = 0;
+    std::size_t chainCallbacksToFirstProcess = 0;
+    std::uint64_t inputActivationNanoseconds = 0;
+    std::uint64_t inputFirstProcessedNanoseconds = 0;
+    std::uint64_t inputFirstProcessedSequence = 0;
+    std::size_t inputCallbacksToFirstProcess = 0;
+    std::string editorStage;
+    std::string editorIdentity;
+    std::string editorError;
+    long editorResultCode = 0;
+    std::uint64_t editorRequestGeneration = 0;
     bool totalBypass = true;
     bool chainFaulted = false;
     int chainActiveSlot = -1;

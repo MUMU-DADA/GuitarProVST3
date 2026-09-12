@@ -436,7 +436,7 @@ QDialog *aboutDialog() {
     title->setFont(titleFont);
     layout->addWidget(title);
     auto *details = new QLabel(
-        QStringLiteral("版本：0.9.1\n"
+        QStringLiteral("版本：0.9.7\n"
                        "已验证宿主：Guitar Pro 8.1.1.17（Windows x64）\n"
                        "许可证：MIT License\n"
                        "第三方声明：VST3 SDK 及插件各自遵循其许可证。\n"
@@ -702,7 +702,17 @@ public:
 
     void reloadSavedSelection() {
         loadChain();
-        setProperty("gpvst3SelectionState", "applied");
+        bool failed = false, anyEnabled = false;
+        for (const auto &value : effects_) {
+            const auto effect = value.toObject();
+            anyEnabled |= effect.value("enabled").toBool();
+            failed |= !effect.value("last_error").toString().isEmpty();
+        }
+        setProperty("gpvst3SelectionState", failed ? "failed_reverted" : "applied");
+        if (status_) {
+            if (failed) status_->setText(QStringLiteral("启用失败，已恢复到实际状态；可重新勾选重试。"));
+            else if (anyEnabled) status_->setText(QStringLiteral("已生效。"));
+        }
     }
 
     void refreshTrackContext() {
@@ -732,12 +742,20 @@ public:
     }
 
     void syncSelection() {
-        bool anyEnabled = false;
-        for (const auto &value : effects_)
-            anyEnabled |= value.toObject().value("enabled").toBool();
-        if (anyEnabled && (scope_ == state::ScopeKind::Global || contextReady_)) {
-            selectionDirty_ = true;
-            restoreSelection();
+        // Selection completion is delivered by the control maintenance tick
+        // (the same tick that reloads failed entries). This avoids a 50 ms
+        // UI polling loop while still retrying exactly once after the worker
+        // has published the prepared slot.
+        if (!g_pendingEditorKey.isEmpty() && (!g_vst3BusyControl || !g_vst3BusyControl())) {
+            for (int index = 0; index < effects_.size(); ++index) {
+                const auto effect = effects_.at(index).toObject();
+                const auto keyValue = (scope_ == state::ScopeKind::Global ? QStringLiteral("global") : trackKey_)
+                    + '\n' + key(effect);
+                if (keyValue == g_pendingEditorKey) {
+                    openEditor(index);
+                    break;
+                }
+            }
         }
     }
 
@@ -1086,12 +1104,6 @@ private:
         g_pendingEditorKey = editorKey;
         if (g_vst3BusyControl && g_vst3BusyControl()) {
             status_->setText(QStringLiteral("正在准备插件，完成后自动打开 GUI。"));
-            const auto identity = key(effect);
-            QTimer::singleShot(50, this, [this, identity, editorKey] {
-                if (g_pendingEditorKey != editorKey) return;
-                const int current = indexFor(identity);
-                if (current >= 0) openEditor(current);
-            });
             return;
         }
         g_pendingEditorKey.clear();

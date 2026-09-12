@@ -55,6 +55,14 @@ public:
         std::uint64_t lastSequence = 0;
         std::size_t rampSamples = 128;
         std::size_t rampRemaining = 0;
+        // Activation and first successful callback evidence are kept per
+        // handoff so diagnostics can distinguish preparation time from the
+        // time the host actually started processing the new slot.
+        std::uint64_t activationNanoseconds = 0;
+        std::uint64_t firstProcessedNanoseconds = 0;
+        std::uint64_t activationSequence = 0;
+        std::uint64_t firstProcessedSequence = 0;
+        std::size_t callbacksToFirstProcess = 0;
     };
 
     Chain() = default;
@@ -120,6 +128,11 @@ private:
     std::atomic<std::uint64_t> lastSequence_{0};
     std::atomic<std::size_t> rampSamples_{128};
     std::atomic<std::size_t> rampRemaining_{0};
+    std::atomic<std::uint64_t> activationNanoseconds_{0};
+    std::atomic<std::uint64_t> firstProcessedNanoseconds_{0};
+    std::atomic<std::uint64_t> activationSequence_{0};
+    std::atomic<std::uint64_t> firstProcessedSequence_{0};
+    std::atomic<std::size_t> callbacksToFirstProcess_{0};
 };
 
 }

@@ -20,7 +20,7 @@ P8 交付范围已在 **Guitar Pro 8.1.1.17 / Windows x64** 上完成专项验�
 
 验证证据和实现细节见 [P8 实现记录](docs/P8_IMPLEMENTATION.md)。
 
-P9 已完成：切换请求在控制 worker 合并并准备双槽链，音频块边界只做原子交接并记录连续性/ramp 观测；音轨与 global 侧栏统一为紧凑行；标题工具栏提供可幂等复用的 About 窗口；扫描错误详情保留在 `status.json`/日志而不进入产品文本或 tooltip。夹具和 MCP 宿主回归入口见 [P9 实现记录](docs/P9_IMPLEMENTATION.md)，真实听感和设备矩阵仍按证据边界单独记录。
+P9 的切换框架、紧凑侧栏、About 窗口和扫描反馈已通过夹具及 MCP 流程验证。P10 已补齐原生 editor 生命周期、首次启停旁路/提交时序和首个处理块诊断，并通过 Qt/HWND 夹具与 MCP 宿主回归；实现细节见 [P10 实现记录](docs/P10_IMPLEMENTATION.md)。
 
 ## 运行边界
 
@@ -94,6 +94,8 @@ git diff --check
 - [P8 实现记录](docs/P8_IMPLEMENTATION.md)
 - [P9 体验与稳定性计划](docs/P9_AUDIO_SWITCH_UI_PLAN.md)
 - [P9 实现记录](docs/P9_IMPLEMENTATION.md)
+- [P10 editor/音频生效优化计划](docs/P10_EDITOR_AUDIO_ACTIVATION_PLAN.md)
+- [P10 实现记录](docs/P10_IMPLEMENTATION.md)
 - [测试与验证](docs/TESTING.md)
 - [免责声明](DISCLAIMER.md)
 - [VST3 SDK 许可](third_party/vst3sdk/LICENSE.txt)

@@ -20,6 +20,8 @@
 - [P8 实现记录](docs/P8_IMPLEMENTATION.md)：当前实现、验证摘要和剩余宿主限制。
 - [P9 体验与稳定性计划](docs/P9_AUDIO_SWITCH_UI_PLAN.md)：切换稳定性、UI 重构、About 入口和扫描反馈收敛。
 - [P9 实现记录](docs/P9_IMPLEMENTATION.md)：P9 用户反馈登记、阶段状态和验证入口。
+- [P10 editor/音频生效优化计划](docs/P10_EDITOR_AUDIO_ACTIVATION_PLAN.md)：原生 VST3 UI 打开链路、首次启停生效时序、诊断和真实宿主验收。
+- [P10 实现记录](docs/P10_IMPLEMENTATION.md)：P10 当前实现、验证证据和宿主受限项。
 - [测试与验证](docs/TESTING.md)：构建、免安装宿主回归和常用测试命令。
 
 历史阶段记录和完整计划快照见 [docs/archive](docs/archive/README.md)。

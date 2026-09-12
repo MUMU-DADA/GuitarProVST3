@@ -75,6 +75,18 @@ bool Chain::activate(std::size_t index) noexcept {
     activeSlot_.store(static_cast<int>(index), std::memory_order_release);
     switchCount_.fetch_add(1, std::memory_order_relaxed);
     const auto started = Clock::now();
+    const auto activationNs = static_cast<std::uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(started.time_since_epoch()).count());
+    activationNanoseconds_.store(activationNs, std::memory_order_relaxed);
+    firstProcessedNanoseconds_.store(0, std::memory_order_relaxed);
+    firstProcessedSequence_.store(0, std::memory_order_relaxed);
+    callbacksToFirstProcess_.store(0, std::memory_order_relaxed);
+    // A host may stop playback between two selections and resume with a new
+    // sequence range. Reset continuity at the handoff so diagnostics report
+    // gaps within one active generation instead of counting an intentional
+    // stop/start interval.
+    lastSequence_.store(0, std::memory_order_release);
+    activationSequence_.store(0, std::memory_order_relaxed);
     rampRemaining_.store(rampSamples_.load(std::memory_order_acquire), std::memory_order_release);
     bypassed_.store(requestedBypass_.load(std::memory_order_acquire) || faulted(),
                     std::memory_order_release);
@@ -116,7 +128,10 @@ Chain::ProcessResult Chain::process(const audio::BlockView &block) noexcept {
     ProcessResult result;
     processBlocks_.fetch_add(1, std::memory_order_relaxed);
     const auto previousSequence = lastSequence_.exchange(block.sequence, std::memory_order_relaxed);
-    if (previousSequence != 0 && block.sequence != 0 && block.sequence != previousSequence + 1)
+    // Some Guitar Pro builds advance the shared callback counter once for
+    // each internal stereo pass, so an observed delta of two is still one
+    // logical audio callback. Report only larger discontinuities.
+    if (previousSequence != 0 && block.sequence != 0 && block.sequence > previousSequence + 2)
         sequenceGaps_.fetch_add(1, std::memory_order_relaxed);
     if (bypassed_.load(std::memory_order_acquire)) {
         bypassBlocks_.fetch_add(1, std::memory_order_relaxed);
@@ -144,6 +159,17 @@ Chain::ProcessResult Chain::process(const audio::BlockView &block) noexcept {
         if (ok) {
             applyRamp(block);
             processedBlocks_.fetch_add(1, std::memory_order_relaxed);
+            const auto completed = Clock::now();
+            const auto completedNs = static_cast<std::uint64_t>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    completed.time_since_epoch()).count());
+            std::uint64_t expected = 0;
+            if (firstProcessedNanoseconds_.compare_exchange_strong(
+                    expected, completedNs, std::memory_order_acq_rel,
+                    std::memory_order_relaxed)) {
+                firstProcessedSequence_.store(block.sequence, std::memory_order_release);
+                callbacksToFirstProcess_.store(1, std::memory_order_release);
+            }
             result.completed = true;
             return result;
         }
@@ -210,6 +236,11 @@ Chain::Snapshot Chain::snapshot() const noexcept {
     result.lastSequence = lastSequence_.load(std::memory_order_relaxed);
     result.rampSamples = rampSamples_.load(std::memory_order_relaxed);
     result.rampRemaining = rampRemaining_.load(std::memory_order_relaxed);
+    result.activationNanoseconds = activationNanoseconds_.load(std::memory_order_relaxed);
+    result.firstProcessedNanoseconds = firstProcessedNanoseconds_.load(std::memory_order_relaxed);
+    result.activationSequence = activationSequence_.load(std::memory_order_relaxed);
+    result.firstProcessedSequence = firstProcessedSequence_.load(std::memory_order_relaxed);
+    result.callbacksToFirstProcess = callbacksToFirstProcess_.load(std::memory_order_relaxed);
     return result;
 }
 

@@ -51,3 +51,15 @@ P9 夹具验证不使用 computer use；宿主流程使用已安装的 MCP bridg
 状态压缩和启动开关使用独立临时目录验证；完整宿主测试中，MCP bridge 的诊断值为 `mcp_context_native_registry`，表示 bridge 提供选中音轨上下文、native registry 提供可处理 EffectsChain。
 
 切换专项记录 UI 请求确认、控制 worker 合并、准备/交接/reader drain 耗时、ramp 和音频块连续性；UI 专项覆盖 About 工具栏按钮幂等、窗口复用、窄侧栏/DPI 和扫描错误不出现在可见文本或 tooltip。`test-p9.ps1` 串联两个专项并保留 evidence。真实 Guitar Pro 听感和设备回归仍须单独记录。
+
+## P10 验证
+
+P10 激活夹具验证下一 callback 旁路、warm/cold slot 首个处理块和快速切换连续性；editor 回归使用生产 RuntimeEffect、真实 Qt `WA_NativeWindow` 子 HWND，并通过已安装 MCP bridge 驱动 Guitar Pro 的双击/上下文 editor、关闭和重开流程。整个流程不使用 computer use。
+
+```powershell
+./native/test/test-p10-activation.ps1 -OutputRoot .tools/native/p10-activation
+./native/test/test-p10-editor.ps1 -QtDir C:/path/to/Qt/5.15.x/msvc2019_64 -PluginPath .tools/native/p10-build/plugins/imageformats/guitarpro_vst3_autoload.dll -McpRoot C:/Users/mumu/source/GuitarProMCP -Vst3Root 'ParametricOD.vst3;Gateway.vst3'
+./native/test/test-p10.ps1 -RunHost -QtDir C:/path/to/Qt/5.15.x/msvc2019_64 -PluginPath .tools/native/p10-build/plugins/imageformats/guitarpro_vst3_autoload.dll
+```
+
+状态文件中的 `selection_*`、`audio_generation`、`chain_*first_processed*` 和 `editor_stage/editor_result_code` 是 P10 的结构化证据入口。

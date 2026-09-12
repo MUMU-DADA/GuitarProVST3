@@ -201,6 +201,28 @@ QJsonObject hookStatus(const gpvst3::hook::State &value) {
         {"runtime_configuration_matches", value.runtimeConfigurationMatches},
         {"runtime_effect_name", QString::fromUtf8(value.runtimeEffectName.data())},
         {"runtime_effect_error", QString::fromUtf8(value.runtimeEffectError.data())},
+        {"selection_request_id", static_cast<qint64>(value.selectionRequestId)},
+        {"selection_queued_nanoseconds", static_cast<qint64>(value.selectionQueuedNanoseconds)},
+        {"selection_worker_started_nanoseconds", static_cast<qint64>(value.selectionWorkerStartedNanoseconds)},
+        {"selection_prepared_nanoseconds", static_cast<qint64>(value.selectionPreparedNanoseconds)},
+        {"selection_committed_nanoseconds", static_cast<qint64>(value.selectionCommittedNanoseconds)},
+        {"selection_applied_generation", static_cast<qint64>(value.selectionAppliedGeneration)},
+        {"audio_generation", static_cast<qint64>(value.audioGeneration)},
+        {"selection_status", QString::fromStdString(value.selectionStatus)},
+        {"editor_stage", QString::fromStdString(value.editorStage)},
+        {"editor_identity", QString::fromStdString(value.editorIdentity)},
+        {"editor_error", QString::fromStdString(value.editorError)},
+        {"editor_result_code", static_cast<qint64>(value.editorResultCode)},
+        {"editor_request_generation", static_cast<qint64>(value.editorRequestGeneration)},
+        {"chain_activation_nanoseconds", static_cast<qint64>(value.chainActivationNanoseconds)},
+        {"chain_first_processed_nanoseconds", static_cast<qint64>(value.chainFirstProcessedNanoseconds)},
+        {"chain_activation_sequence", static_cast<qint64>(value.chainActivationSequence)},
+        {"chain_first_processed_sequence", static_cast<qint64>(value.chainFirstProcessedSequence)},
+        {"chain_callbacks_to_first_process", static_cast<qint64>(value.chainCallbacksToFirstProcess)},
+        {"input_activation_nanoseconds", static_cast<qint64>(value.inputActivationNanoseconds)},
+        {"input_first_processed_nanoseconds", static_cast<qint64>(value.inputFirstProcessedNanoseconds)},
+        {"input_first_processed_sequence", static_cast<qint64>(value.inputFirstProcessedSequence)},
+        {"input_callbacks_to_first_process", static_cast<qint64>(value.inputCallbacksToFirstProcess)},
         {"total_bypass", value.totalBypass},
         {"chain_faulted", value.chainFaulted},
         {"chain_active_slot", value.chainActiveSlot},
@@ -351,6 +373,7 @@ QJsonObject initialize() {
         QObject::connect(trackTimer, &QTimer::timeout, trackTimer, [] {
             hook::refreshTrackContext();
             if (hook::consumeSelectionStateChanges()) ui::reloadVst3Selections();
+            ui::syncVst3Selection();
             ui::refreshVst3TrackContext();
         });
         trackTimer->start();
