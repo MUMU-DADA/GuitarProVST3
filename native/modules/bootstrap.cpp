@@ -320,6 +320,7 @@ QJsonObject initialize() {
         ui::setRealtimeBypassControl(&hook::setTotalBypass);
         ui::setVst3SelectionControl(&hook::setGlobalVst3Selection);
         ui::setVst3SelectionRequestControl(&hook::requestGlobalVst3Selection);
+        ui::setVst3BusyControl(&hook::vst3SelectionPending);
         ui::setVst3TrackSelectionControl(&hook::setTrackVst3Selection);
         ui::setVst3TrackSelectionRequestControl(&hook::requestTrackVst3Selection);
         ui::setVst3StateControl(&hook::captureGlobalVst3States);

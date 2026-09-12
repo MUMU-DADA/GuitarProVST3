@@ -142,15 +142,19 @@ public:
     Steinberg::tresult PLUGIN_API resizeView(Steinberg::IPlugView *view,
                                              ViewRect *newSize) override {
         if (!newSize || !hostWindow_) return Steinberg::kInvalidArgument;
+        if (resizing_) return Steinberg::kResultTrue;
+        resizing_ = true;
         const int width = (std::max)(1, newSize->getWidth());
         const int height = (std::max)(1, newSize->getHeight());
         gpvst3::ui::resizeNativeEditor(reinterpret_cast<void *>(hostWindow_), width, height);
-        return view && succeeded(view->onSize(newSize)) ? Steinberg::kResultTrue
-                                                        : Steinberg::kResultFalse;
+        const bool resized = view && succeeded(view->onSize(newSize));
+        resizing_ = false;
+        return resized ? Steinberg::kResultTrue : Steinberg::kResultFalse;
     }
 
 private:
     HWND hostWindow_ = nullptr;
+    bool resizing_ = false;
 };
 
 bool succeeded(tresult result) noexcept {
@@ -656,6 +660,11 @@ struct SelectionSlot {
 
     bool prepare(const std::vector<Vst3SelectionEntry> &entries, double rate,
                  std::size_t maxBlock, const SelectionSlot *previous, std::string *error) {
+        // Preserve a warm, disabled instance even when the slot being reused
+        // is also the last active slot. Copy ownership before clearing it.
+        std::array<std::shared_ptr<RuntimeEffect>, kMaxEffects> reusable;
+        const auto previousCount = previous ? previous->count : 0;
+        for (std::size_t i = 0; i < previousCount; ++i) reusable[i] = previous->effects[i];
         shutdown();
         if (entries.empty()) return true;
         if (entries.size() > kMaxEffects || !pipeline[0].prepare(2, maxBlock) ||
@@ -664,8 +673,8 @@ struct SelectionSlot {
             return false;
         }
         for (std::size_t index = 0; index < entries.size(); ++index) {
-            if (previous) for (std::size_t old = 0; old < previous->count; ++old) {
-                const auto &effect = previous->effects[old];
+            for (std::size_t old = 0; old < previousCount; ++old) {
+                const auto &effect = reusable[old];
                 if (effect->identity.module == entries[index].module &&
                     effect->identity.classId == entries[index].classId &&
                     effect->identity.componentState == entries[index].componentState &&
@@ -910,7 +919,12 @@ struct Runtime {
     std::atomic<unsigned long> dspThread{0};
     RuntimeEffect effects[2];
     SelectionSlot selectionSlots[2];
+    std::recursive_mutex editorMutex;
     std::mutex selectionMutex;
+    std::mutex selectionRequestMutex;
+    std::mutex catalogMutex;
+    std::atomic<bool> selectionWorkerBusy{false};
+    int retainedSelectionSlot = -1;
     std::vector<Vst3SelectionEntry> requestedSelection;
     std::unordered_map<std::string, std::vector<Vst3SelectionEntry>> requestedTrackSelections;
     std::vector<Vst3SelectionEntry> catalogEntries;
@@ -969,8 +983,18 @@ struct Runtime {
 
 Runtime g_runtime;
 State g_initial;
+host::Verification g_verification;
+std::shared_ptr<RuntimeEffect> g_openEditorEffect; // Owned and accessed on Qt.
 std::atomic<bool> g_selectionStateChanged{false};
 thread_local bool g_inMasterHook = false;
+thread_local bool g_inEditorCallback = false;
+
+struct EditorCallbackScope {
+    const bool previous = g_inEditorCallback;
+    EditorCallbackScope() noexcept { g_inEditorCallback = true; }
+    ~EditorCallbackScope() { g_inEditorCallback = previous; }
+};
+
 double callbackSampleRate() noexcept;
 void rejectSavedEntry(const Vst3SelectionEntry &entry, const std::string &error,
                       state::ScopeKind scope, const std::string &score = {},
@@ -983,13 +1007,24 @@ bool containsIdentity(const std::vector<Vst3SelectionEntry> &entries,
     });
 }
 
+bool trackSelectionQueued(const std::string &trackKey) noexcept {
+    std::lock_guard<std::mutex> lock(g_runtime.selectionRequestMutex);
+    return g_runtime.pendingTrackSelections.find(trackKey) !=
+        g_runtime.pendingTrackSelections.end();
+}
+
+bool catalogIsReady() noexcept {
+    std::lock_guard<std::mutex> lock(g_runtime.catalogMutex);
+    return g_runtime.catalogReady;
+}
+
 void selectionWorkerLoop() {
     for (;;) {
         std::vector<Vst3SelectionEntry> selection;
         std::string trackKey;
         std::uint64_t generation = 0;
         {
-            std::unique_lock<std::mutex> lock(g_runtime.selectionMutex);
+            std::unique_lock<std::mutex> lock(g_runtime.selectionRequestMutex);
             g_runtime.selectionCondition.wait(lock, [] {
                 return g_runtime.selectionWorkerStop || g_runtime.selectionRequestPending ||
                        !g_runtime.pendingTrackSelections.empty();
@@ -1000,6 +1035,20 @@ void selectionWorkerLoop() {
                 selection = std::move(g_runtime.pendingSelection);
                 generation = g_runtime.selectionRequestGeneration;
                 g_runtime.selectionRequestPending = false;
+            } else {
+                auto it = g_runtime.pendingTrackSelections.begin();
+                trackKey = it->first;
+                selection = std::move(it->second);
+                g_runtime.pendingTrackSelections.erase(it);
+            }
+            g_runtime.selectionWorkerBusy.store(true, std::memory_order_release);
+        }
+        {
+            // Only the worker waits for runtime ownership. Qt's observation,
+            // capture and editor paths try this lock and defer while busy.
+            std::lock_guard<std::recursive_mutex> editorLock(g_runtime.editorMutex);
+            std::lock_guard<std::mutex> lock(g_runtime.selectionMutex);
+            if (trackKey.empty()) {
                 std::string error;
                 const bool accepted = configureSelectedChain(selection, &error);
                 if (accepted) {
@@ -1014,10 +1063,6 @@ void selectionWorkerLoop() {
                     g_runtime.requestedSelection = g_runtime.appliedSelection;
                 }
             } else {
-                auto it = g_runtime.pendingTrackSelections.begin();
-                trackKey = it->first;
-                selection = std::move(it->second);
-                g_runtime.pendingTrackSelections.erase(it);
                 auto runtime = std::find_if(std::begin(g_runtime.trackRuntimes),
                                             std::end(g_runtime.trackRuntimes),
                                             [&](const TrackRuntime &value) {
@@ -1027,6 +1072,7 @@ void selectionWorkerLoop() {
                     std::string error;
                     if (runtime->prepare(selection, callbackSampleRate(), 16384, &error)) {
                         runtime->requested = selection;
+                        g_runtime.requestedTrackSelections[trackKey] = selection;
                         runtime->error.clear();
                     } else {
                         for (const auto &entry : selection)
@@ -1041,11 +1087,12 @@ void selectionWorkerLoop() {
             }
             g_selectionStateChanged.store(true, std::memory_order_release);
         }
+        g_runtime.selectionWorkerBusy.store(false, std::memory_order_release);
     }
 }
 
 void startSelectionWorker() {
-    std::lock_guard<std::mutex> lock(g_runtime.selectionMutex);
+    std::lock_guard<std::mutex> lock(g_runtime.selectionRequestMutex);
     if (g_runtime.selectionWorker.joinable()) return;
     g_runtime.selectionWorkerStop = false;
     g_runtime.selectionWorker = std::thread(selectionWorkerLoop);
@@ -1053,7 +1100,7 @@ void startSelectionWorker() {
 
 void stopSelectionWorker() noexcept {
     {
-        std::lock_guard<std::mutex> lock(g_runtime.selectionMutex);
+        std::lock_guard<std::mutex> lock(g_runtime.selectionRequestMutex);
         if (!g_runtime.selectionWorker.joinable()) return;
         g_runtime.selectionWorkerStop = true;
         g_runtime.selectionRequestPending = false;
@@ -1062,7 +1109,7 @@ void stopSelectionWorker() noexcept {
     }
     g_runtime.selectionCondition.notify_all();
     g_runtime.selectionWorker.join();
-    std::lock_guard<std::mutex> lock(g_runtime.selectionMutex);
+    std::lock_guard<std::mutex> lock(g_runtime.selectionRequestMutex);
     g_runtime.selectionWorkerStop = false;
 }
 
@@ -1116,6 +1163,7 @@ struct TrackDispatchUpdate {
 
 std::vector<Vst3SelectionEntry> savedSelection(const QJsonArray &effects) {
     std::vector<Vst3SelectionEntry> result;
+    std::lock_guard<std::mutex> lock(g_runtime.catalogMutex);
     for (const auto &value : effects) {
         const auto effect = value.toObject();
         if (!effect.value("enabled").toBool()) continue;
@@ -1219,6 +1267,7 @@ bool reconfigureSlot(SelectionSlot &slot, effects::Chain &chain, int rate) {
 }
 
 void refreshTrackContextImpl() noexcept {
+    if (g_inEditorCallback) return;
     if (!g_initial.hostSupported) return;
     const auto discovered = gpvst3::gp_audio::refresh();
     const auto bindings = gpvst3::gp_audio::snapshot();
@@ -1233,7 +1282,10 @@ void refreshTrackContextImpl() noexcept {
     } else {
         gpvst3::state::clearRuntimeTrackContext();
     }
-    std::lock_guard<std::mutex> lock(g_runtime.selectionMutex);
+    std::unique_lock<std::recursive_mutex> editorLock(g_runtime.editorMutex, std::try_to_lock);
+    if (!editorLock.owns_lock()) return;
+    std::unique_lock<std::mutex> lock(g_runtime.selectionMutex, std::try_to_lock);
+    if (!lock.owns_lock()) return;
     g_runtime.currentTrackKey = haveSelectedBinding ? selectedBinding.trackKey : "";
     const int rate = static_cast<int>(callbackSampleRate());
     const auto sameBindings = bindings.size() == g_runtime.publishedBindings.size() &&
@@ -1247,7 +1299,7 @@ void refreshTrackContextImpl() noexcept {
     for (const auto &runtime : g_runtime.trackRuntimes) {
         if (runtime.trackKey.empty()) continue;
         const auto requested = g_runtime.requestedTrackSelections.find(runtime.trackKey);
-        pending |= g_runtime.catalogReady && requested == g_runtime.requestedTrackSelections.end();
+        pending |= catalogIsReady() && requested == g_runtime.requestedTrackSelections.end();
         pending |= requested != g_runtime.requestedTrackSelections.end() && !sameSelection(runtime.requested, requested->second) &&
             (runtime.error.empty() || !sameSelection(runtime.failedSelection, requested->second));
         pending |= runtime.count > 0 && runtime.configuredRate.load() != rate;
@@ -1293,7 +1345,7 @@ void refreshTrackContextImpl() noexcept {
         runtime.trackKey.clear(); runtime.trackId.clear(); runtime.requested.clear();
         runtime.error.clear(); runtime.failedSelection.clear();
     }
-    if (g_runtime.catalogReady) state::loadChain(savedChain);
+    if (catalogIsReady()) state::loadChain(savedChain);
     for (const auto &binding : bindings) {
         if (!binding.chain || !binding.activeDocument) continue;
         const auto runtimeIndex = trackRuntimeIndexFor(binding.trackKey);
@@ -1305,7 +1357,7 @@ void refreshTrackContextImpl() noexcept {
         if (!runtime.scoreKey.empty() && runtime.scoreKey != binding.scoreKey) saveTrackRuntime(runtime);
         runtime.scoreKey = binding.scoreKey;
         runtime.trackIndex = binding.trackIndex;
-        const bool restoring = g_runtime.catalogReady && !g_runtime.requestedTrackSelections.count(runtime.trackKey);
+        const bool restoring = catalogIsReady() && !g_runtime.requestedTrackSelections.count(runtime.trackKey);
         if (restoring)
             g_runtime.requestedTrackSelections[runtime.trackKey] = savedSelection(state::scopeEffects(
                 savedChain, state::ScopeKind::Track, QString::fromStdString(binding.scoreKey), QString::fromStdString(binding.trackKey)));
@@ -1322,8 +1374,7 @@ void refreshTrackContextImpl() noexcept {
             }
         }
         const auto requested = g_runtime.requestedTrackSelections.find(runtime.trackKey);
-        const bool queued = g_runtime.pendingTrackSelections.find(runtime.trackKey) !=
-            g_runtime.pendingTrackSelections.end();
+        const bool queued = trackSelectionQueued(runtime.trackKey);
         if (requested != g_runtime.requestedTrackSelections.end() && !queued &&
             (!runtime.configured.load(std::memory_order_acquire) ||
              !sameSelection(runtime.requested, requested->second)) &&
@@ -1795,6 +1846,8 @@ bool configureSelectedChain(const std::vector<Vst3SelectionEntry> &selection,
                             std::string *error = nullptr) noexcept;
 
 State prepare(const host::Verification &verification, bool enableForSelection) noexcept {
+    std::lock_guard<std::recursive_mutex> editorLock(g_runtime.editorMutex);
+    g_verification = verification;
     State result;
     g_runtime.effectsChainIndex = nullptr;
     result.hostSupported = verification.supported;
@@ -1899,6 +1952,9 @@ State prepare(const host::Verification &verification, bool enableForSelection) n
 }
 
 State snapshot() noexcept {
+    static std::shared_ptr<const State> previous = std::make_shared<const State>();
+    std::unique_lock<std::mutex> runtimeLock(g_runtime.selectionMutex, std::try_to_lock);
+    if (!runtimeLock.owns_lock()) return *std::atomic_load(&previous);
     State result = g_initial;
     result.trackBindingSource = gp_audio::bindingSource();
     updateAudioLayerState();
@@ -1975,7 +2031,6 @@ State snapshot() noexcept {
     result.effectsChainContextCount =
         g_runtime.effectsChainContextCount.load(std::memory_order_relaxed);
     {
-        std::lock_guard<std::mutex> lock(g_runtime.selectionMutex);
         const auto runtimeIndex = g_runtime.lastTrackRuntimeIndex.load(std::memory_order_acquire);
         if (runtimeIndex >= 0 && runtimeIndex < 32 &&
             !g_runtime.trackRuntimes[runtimeIndex].trackKey.empty())
@@ -2144,6 +2199,7 @@ State snapshot() noexcept {
         g_runtime.inputObservedRate.load(std::memory_order_relaxed));
     result.inputConfigurationErrors =
         g_runtime.inputConfigurationErrors.load(std::memory_order_relaxed);
+    std::atomic_store(&previous, std::make_shared<const State>(result));
     return result;
 }
 
@@ -2161,8 +2217,9 @@ bool configureSelectedChain(const std::vector<Vst3SelectionEntry> &selection, st
         if (error) *error = "runtime_vst3_chain_prepare_failed";
         return false;
     }
-    const auto *previous = g_runtime.selectionMode.load(std::memory_order_acquire) && old >= 0
-        ? &g_runtime.selectionSlots[old] : nullptr;
+    const int previousSlot = old >= 0 ? old : g_runtime.retainedSelectionSlot;
+    const auto *previous = previousSlot >= 0 && g_runtime.selectionPublished.load(std::memory_order_acquire)
+        ? &g_runtime.selectionSlots[previousSlot] : nullptr;
     try {
         if (!g_runtime.selectionSlots[target].prepare(selection, rate, 16384, previous, error)) return false;
     } catch (...) {
@@ -2180,6 +2237,7 @@ bool configureSelectedChain(const std::vector<Vst3SelectionEntry> &selection, st
     g_runtime.chain.clearFault();
     if (!selection.empty()) {
         g_runtime.chain.activate(target);
+        g_runtime.retainedSelectionSlot = static_cast<int>(target);
     } else {
         g_runtime.chain.deactivate();
         // Keep the last prepared slot available for a future re-enable while
@@ -2219,6 +2277,7 @@ void reconfigureInputRouterIfNeeded() noexcept {
 
 void shutdown() noexcept {
     stopSelectionWorker();
+    std::lock_guard<std::recursive_mutex> editorLock(g_runtime.editorMutex);
     const TrackDispatchUpdate trackUpdate;
     state::clearRuntimeTrackContext();
     g_runtime.chain.setBypassed(true);
@@ -2247,9 +2306,12 @@ void shutdown() noexcept {
         std::lock_guard<std::mutex> lock(g_runtime.selectionMutex);
         g_runtime.requestedSelection.clear();
         g_runtime.requestedTrackSelections.clear();
-        g_runtime.pendingTrackSelections.clear();
         g_runtime.publishedBindings.clear();
         g_runtime.currentTrackKey.clear();
+    }
+    {
+        std::lock_guard<std::mutex> lock(g_runtime.selectionRequestMutex);
+        g_runtime.pendingTrackSelections.clear();
     }
     g_runtime.trackContextObserved.store(false, std::memory_order_release);
     g_runtime.trackContextStable.store(false, std::memory_order_release);
@@ -2400,11 +2462,12 @@ void setTotalBypass(bool bypassed) noexcept {
 }
 
 bool setVst3Selection(const std::vector<Vst3SelectionEntry> &selection, std::string *error) noexcept {
+    std::lock_guard<std::recursive_mutex> editorLock(g_runtime.editorMutex);
     if (error) error->clear();
     // P7 controls are called on the Qt control thread. Install before taking
     // selectionMutex because prepare() also locks it to restore a saved chain.
     if (!g_runtime.master.installed && !selection.empty()) {
-        const auto prepared = prepare(host::verify(), true);
+        const auto prepared = prepare(g_verification, true);
         if (!prepared.installed) {
             if (error) *error = prepared.reason;
             return false;
@@ -2433,7 +2496,7 @@ bool requestGlobalVst3Selection(const std::vector<Vst3SelectionEntry> &selection
         return false;
     }
     if (!g_runtime.master.installed && !selection.empty()) {
-        const auto prepared = prepare(host::verify(), true);
+        const auto prepared = prepare(g_verification, true);
         if (!prepared.installed) {
             if (error) *error = prepared.reason;
             return false;
@@ -2441,7 +2504,7 @@ bool requestGlobalVst3Selection(const std::vector<Vst3SelectionEntry> &selection
     }
     startSelectionWorker();
     {
-        std::lock_guard<std::mutex> lock(g_runtime.selectionMutex);
+        std::lock_guard<std::mutex> lock(g_runtime.selectionRequestMutex);
         g_runtime.pendingSelection = selection;
         g_runtime.selectionRequestPending = true;
         ++g_runtime.selectionRequestGeneration;
@@ -2451,8 +2514,18 @@ bool requestGlobalVst3Selection(const std::vector<Vst3SelectionEntry> &selection
 }
 
 void saveVst3States() {
-    persistRuntimeEntries(captureVst3States(), state::ScopeKind::Global);
-    std::lock_guard<std::mutex> lock(g_runtime.selectionMutex);
+    std::unique_lock<std::recursive_mutex> editorLock(g_runtime.editorMutex, std::try_to_lock);
+    if (!editorLock.owns_lock()) return;
+    std::unique_lock<std::mutex> lock(g_runtime.selectionMutex, std::try_to_lock);
+    if (!lock.owns_lock()) return;
+    const auto active = g_runtime.chain.snapshot().activeSlot;
+    if (active >= 0 && g_runtime.selectionMode.load(std::memory_order_acquire)) {
+        std::vector<Vst3SelectionEntry> entries;
+        const auto &slot = g_runtime.selectionSlots[active];
+        for (std::size_t index = 0; index < slot.count; ++index)
+            entries.push_back(slot.effects[index]->captureState());
+        persistRuntimeEntries(entries, state::ScopeKind::Global);
+    }
     const TrackDispatchUpdate update;
     for (auto &runtime : g_runtime.trackRuntimes)
         if (!runtime.trackKey.empty()) saveTrackRuntime(runtime);
@@ -2468,11 +2541,20 @@ void setVst3Catalog(const QJsonArray &catalog) {
             !(entry.value("identified").toBool() || entry.value("compatible").toBool())) continue;
         entries.push_back({entry.value("module").toString().toStdString(), entry.value("class_id").toString().toStdString()});
     }
-    if (g_runtime.catalogReady && sameSelection(entries, g_runtime.catalogEntries)) return;
+    {
+        std::lock_guard<std::mutex> lock(g_runtime.catalogMutex);
+        if (g_runtime.catalogReady && sameSelection(entries, g_runtime.catalogEntries)) return;
+    }
     saveVst3States();
-    g_runtime.catalogEntries = entries;
-    g_runtime.catalogReady = true;
-    g_runtime.requestedTrackSelections.clear();
+    {
+        std::lock_guard<std::mutex> lock(g_runtime.catalogMutex);
+        g_runtime.catalogEntries = entries;
+        g_runtime.catalogReady = true;
+    }
+    {
+        std::lock_guard<std::mutex> lock(g_runtime.selectionMutex);
+        g_runtime.requestedTrackSelections.clear();
+    }
     QJsonObject chain;
     state::loadChain(chain);
     const auto global = savedSelection(state::scopeEffects(chain, state::ScopeKind::Global));
@@ -2484,25 +2566,37 @@ void setVst3Catalog(const QJsonArray &catalog) {
             anyEnabled |= !savedSelection(track.toObject().value("effects").toArray()).empty();
     }
     if (anyEnabled && !g_runtime.master.installed) {
-        const auto prepared = prepare(host::verify(), true);
+        const auto prepared = prepare(g_verification, true);
         if (!prepared.installed) return;
     }
-    std::string error;
-    if (g_runtime.master.installed && (!global.empty() || g_runtime.selectionPublished.load()))
-        restoreSavedEntries(global, state::ScopeKind::Global, {}, {}, -1,
-            [](const std::vector<Vst3SelectionEntry> &entries, std::string *failure) {
-                return setGlobalVst3Selection(entries, failure);
-            });
+    if (g_runtime.master.installed && (!global.empty() || g_runtime.selectionPublished.load())) {
+        startSelectionWorker();
+        {
+            std::lock_guard<std::mutex> lock(g_runtime.selectionRequestMutex);
+            g_runtime.pendingSelection = global;
+            g_runtime.selectionRequestPending = true;
+            ++g_runtime.selectionRequestGeneration;
+        }
+        g_runtime.selectionCondition.notify_one();
+    }
     refreshTrackContextImpl();
 }
 
 bool consumeSelectionStateChanges() noexcept {
+    if (vst3SelectionPending()) return false;
     return g_selectionStateChanged.exchange(false, std::memory_order_acq_rel);
+}
+
+bool vst3SelectionPending() noexcept {
+    std::lock_guard<std::mutex> lock(g_runtime.selectionRequestMutex);
+    return g_runtime.selectionWorkerBusy.load(std::memory_order_acquire) ||
+        g_runtime.selectionRequestPending || !g_runtime.pendingTrackSelections.empty();
 }
 
 bool setTrackVst3Selection(const std::string &trackKey,
                            const std::vector<Vst3SelectionEntry> &selection,
                            std::string *error) noexcept {
+    std::lock_guard<std::recursive_mutex> editorLock(g_runtime.editorMutex);
     if (error) error->clear();
     if (trackKey.empty()) {
         if (error) *error = "track_scope_unresolved";
@@ -2513,7 +2607,7 @@ bool setTrackVst3Selection(const std::string &trackKey,
         return false;
     }
     if (!g_runtime.dsp.installed && !selection.empty()) {
-        const auto prepared = prepare(host::verify(), true);
+        const auto prepared = prepare(g_verification, true);
         if (!prepared.installed) {
             if (error) *error = prepared.reason;
             return false;
@@ -2566,7 +2660,7 @@ bool requestTrackVst3Selection(const std::string &trackKey,
         return false;
     }
     if (!g_runtime.dsp.installed && !selection.empty()) {
-        const auto prepared = prepare(host::verify(), true);
+        const auto prepared = prepare(g_verification, true);
         if (!prepared.installed) {
             if (error) *error = prepared.reason;
             return false;
@@ -2575,7 +2669,6 @@ bool requestTrackVst3Selection(const std::string &trackKey,
     // Track runtimes already have an independent fixed table. Queueing the
     // request through the same worker keeps processor construction off Qt;
     // the current binding is validated before accepting it.
-    refreshTrackContextImpl();
     const auto bindings = gp_audio::snapshot();
     if (std::none_of(bindings.begin(), bindings.end(), [&](const gp_audio::Binding &binding) {
             return binding.chain && binding.activeDocument && binding.trackKey == trackKey;
@@ -2585,8 +2678,7 @@ bool requestTrackVst3Selection(const std::string &trackKey,
     }
     startSelectionWorker();
     {
-        std::lock_guard<std::mutex> lock(g_runtime.selectionMutex);
-        g_runtime.requestedTrackSelections[trackKey] = selection;
+        std::lock_guard<std::mutex> lock(g_runtime.selectionRequestMutex);
         g_runtime.pendingTrackSelections[trackKey] = selection;
     }
     g_runtime.selectionCondition.notify_one();
@@ -2598,18 +2690,18 @@ std::vector<Vst3SelectionEntry> captureGlobalVst3States() {
 }
 
 std::vector<Vst3SelectionEntry> captureTrackVst3States(const std::string &trackKey) {
-    std::lock_guard<std::mutex> lock(g_runtime.selectionMutex);
-    const TrackDispatchUpdate update;
+    std::unique_lock<std::recursive_mutex> editorLock(g_runtime.editorMutex, std::try_to_lock);
+    if (!editorLock.owns_lock()) return {};
+    std::unique_lock<std::mutex> lock(g_runtime.selectionMutex, std::try_to_lock);
+    if (!lock.owns_lock()) return {};
     for (auto &runtime : g_runtime.trackRuntimes) {
         if (runtime.trackKey != trackKey) continue;
         const int active = runtime.chain.snapshot().activeSlot;
         if (active < 0) break;
         std::vector<Vst3SelectionEntry> result;
-        runtime.chain.deactivate();
         auto &slot = runtime.trackSlots[active];
         for (std::size_t index = 0; index < slot.count; ++index)
             result.push_back(slot.effects[index]->captureState());
-        runtime.chain.activate(active);
         runtime.requested = result;
         g_runtime.requestedTrackSelections[trackKey] = result;
         return result;
@@ -2619,19 +2711,24 @@ std::vector<Vst3SelectionEntry> captureTrackVst3States(const std::string &trackK
 }
 
 std::vector<Vst3SelectionEntry> captureVst3States() {
-    std::lock_guard<std::mutex> lock(g_runtime.selectionMutex);
+    std::unique_lock<std::recursive_mutex> editorLock(g_runtime.editorMutex, std::try_to_lock);
+    if (!editorLock.owns_lock()) return {};
+    std::unique_lock<std::mutex> lock(g_runtime.selectionMutex, std::try_to_lock);
+    if (!lock.owns_lock()) return {};
     std::vector<Vst3SelectionEntry> result;
     const auto active = g_runtime.chain.snapshot().activeSlot;
     if (active < 0 || !g_runtime.selectionMode.load(std::memory_order_acquire)) return result;
-    g_runtime.chain.deactivate();
     auto &slot = g_runtime.selectionSlots[active];
     for (std::size_t i = 0; i < slot.count; ++i) result.push_back(slot.effects[i]->captureState());
-    g_runtime.chain.activate(active);
     return result;
 }
 
 bool openVst3Editor(const Vst3SelectionEntry &entry, void *parentWindow) noexcept {
-    std::lock_guard<std::mutex> lock(g_runtime.selectionMutex);
+    if (g_inEditorCallback) return false;
+    std::unique_lock<std::recursive_mutex> editorLock(g_runtime.editorMutex, std::try_to_lock);
+    if (!editorLock.owns_lock()) return false;
+    std::unique_lock<std::mutex> lock(g_runtime.selectionMutex, std::try_to_lock);
+    if (!lock.owns_lock()) return false;
     if (!parentWindow || !g_runtime.selectionMode.load(std::memory_order_acquire)) return false;
     const int active = g_runtime.chain.snapshot().activeSlot;
     if (active < 0 || active >= 2) return false;
@@ -2642,55 +2739,72 @@ bool openVst3Editor(const Vst3SelectionEntry &entry, void *parentWindow) noexcep
         // module/class pair is performed against the requested list because
         // RuntimeEffect deliberately stores only the loaded display name.
         if (slot.effects[index]->identity.module == entry.module &&
-            slot.effects[index]->identity.classId == entry.classId)
-            return slot.effects[index]->openEditor(static_cast<HWND>(parentWindow));
+            slot.effects[index]->identity.classId == entry.classId) {
+            const auto effect = slot.effects[index];
+            lock.unlock();
+            closeVst3Editors();
+            g_openEditorEffect = effect;
+            EditorCallbackScope callbackScope;
+            return effect->openEditor(static_cast<HWND>(parentWindow));
+        }
     }
     return false;
 }
 
 bool openTrackVst3Editor(const std::string &trackKey, const Vst3SelectionEntry &entry,
                          void *parentWindow) noexcept {
-    if (!parentWindow) return false;
-    std::lock_guard<std::mutex> lock(g_runtime.selectionMutex);
+    if (!parentWindow || g_inEditorCallback) return false;
+    std::unique_lock<std::recursive_mutex> editorLock(g_runtime.editorMutex, std::try_to_lock);
+    if (!editorLock.owns_lock()) return false;
+    std::unique_lock<std::mutex> lock(g_runtime.selectionMutex, std::try_to_lock);
+    if (!lock.owns_lock()) return false;
     for (auto &runtime : g_runtime.trackRuntimes) {
         if (runtime.trackKey != trackKey) continue;
         const int active = runtime.chain.snapshot().activeSlot;
         if (active < 0) return false;
         auto &slot = runtime.trackSlots[active];
         for (std::size_t index = 0; index < slot.count; ++index) {
-            const auto &effect = slot.effects[index];
-            if (effect->identity.module == entry.module && effect->identity.classId == entry.classId)
+            const auto effect = slot.effects[index];
+            if (effect->identity.module == entry.module && effect->identity.classId == entry.classId) {
+                lock.unlock();
+                closeVst3Editors();
+                g_openEditorEffect = effect;
+                EditorCallbackScope callbackScope;
                 return effect->openEditor(static_cast<HWND>(parentWindow));
+            }
         }
     }
     return false;
 }
 
 void scaleVst3Editor(void *host, double factor) noexcept {
-    const auto scaleSlot = [host, factor](SelectionSlot &slot) {
-        for (std::size_t i = 0; i < slot.count; ++i) {
-            auto &effect = *slot.effects[i];
-            if (effect.editorParent != host || !effect.editor) continue;
-            if (auto scale = FUnknownPtr<Steinberg::IPlugViewContentScaleSupport>(effect.editor.get())) {
-                if (!succeeded(scale->setContentScaleFactor(static_cast<float>(factor)))) continue;
-                ViewRect size{};
-                if (succeeded(effect.editor->getSize(&size)) && effect.plugFrame)
-                    effect.plugFrame->resizeView(effect.editor.get(), &size);
-            }
+    std::unique_lock<std::recursive_mutex> editorLock(g_runtime.editorMutex, std::try_to_lock);
+    if (!editorLock.owns_lock()) return;
+    const auto keepAlive = g_openEditorEffect;
+    if (keepAlive) {
+        EditorCallbackScope callbackScope;
+        auto &effect = *keepAlive;
+        if (effect.editorParent != host || !effect.editor) return;
+        if (auto scale = FUnknownPtr<Steinberg::IPlugViewContentScaleSupport>(effect.editor.get())) {
+            if (!succeeded(scale->setContentScaleFactor(static_cast<float>(factor)))) return;
+            ViewRect size{};
+            if (succeeded(effect.editor->getSize(&size)) && effect.plugFrame)
+                effect.plugFrame->resizeView(effect.editor.get(), &size);
         }
-    };
-    for (auto &slot : g_runtime.selectionSlots) scaleSlot(slot);
-    for (auto &runtime : g_runtime.trackRuntimes)
-        for (auto &slot : runtime.trackSlots) scaleSlot(slot);
+    }
 }
 
 void closeVst3Editors() noexcept {
-    std::lock_guard<std::mutex> lock(g_runtime.selectionMutex);
-    for (auto &slot : g_runtime.selectionSlots)
-        for (std::size_t index = 0; index < slot.count; ++index) slot.effects[index]->closeEditor();
-    for (auto &runtime : g_runtime.trackRuntimes)
-        for (auto &slot : runtime.trackSlots)
-            for (std::size_t index = 0; index < slot.count; ++index) slot.effects[index]->closeEditor();
+    std::unique_lock<std::recursive_mutex> editorLock(g_runtime.editorMutex, std::try_to_lock);
+    if (!editorLock.owns_lock()) return;
+    // The visible editor pins its processor independently of the two DSP
+    // slots. No plug-in UI call may hold the worker's selection mutex:
+    // attached/removed can pump Qt events and re-enter observation/capture.
+    const auto effect = std::move(g_openEditorEffect);
+    if (effect) {
+        EditorCallbackScope callbackScope;
+        effect->closeEditor();
+    }
 }
 
 bool processExternalInput(const input::CaptureView &capture,

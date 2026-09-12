@@ -52,6 +52,8 @@ namespace {
 RealtimeBypassControl g_realtimeBypassControl = nullptr;
 Vst3SelectionControl g_vst3SelectionControl = nullptr;
 Vst3SelectionRequestControl g_vst3SelectionRequestControl = nullptr;
+bool (*g_vst3BusyControl)() noexcept = nullptr;
+QString g_pendingEditorKey;
 Vst3TrackSelectionControl g_vst3TrackSelectionControl = nullptr;
 Vst3TrackSelectionRequestControl g_vst3TrackSelectionRequestControl = nullptr;
 Vst3StateControl g_vst3StateControl = nullptr;
@@ -73,6 +75,8 @@ P7Panel *g_p7Panel = nullptr;
 P7Panel *g_globalPanel = nullptr;
 QPointer<QTimer> g_panelAttachTimer;
 QPointer<QDialog> g_aboutDialog;
+QPointer<QObject> g_aboutObserver;
+QPointer<QMainWindow> g_aboutObservedWindow;
 bool g_panelUsesP7 = true;
 bool g_trackExpanded = true, g_globalExpanded = true;
 
@@ -483,32 +487,74 @@ void showAboutDialog() {
     dialog->activateWindow();
 }
 
+void ensureAboutEntry();
+
+class AboutEntryObserver final : public QObject {
+public:
+    explicit AboutEntryObserver(QObject *parent = nullptr) : QObject(parent) {}
+
+protected:
+    bool eventFilter(QObject *object, QEvent *event) override {
+        if (object && event &&
+            (event->type() == QEvent::ChildAdded || event->type() == QEvent::ChildRemoved ||
+             event->type() == QEvent::LayoutRequest || event->type() == QEvent::Show ||
+             event->type() == QEvent::WindowActivate)) {
+            // Guitar Pro rebuilds the title/sidebar hierarchy while changing
+            // score pages. Reattach after the host finishes that mutation so
+            // the About entry survives toolbar replacement immediately.
+            QTimer::singleShot(0, qApp, [] { ensureAboutEntry(); });
+        }
+        return QObject::eventFilter(object, event);
+    }
+};
+
 QToolBar *findTitleToolBar(QMainWindow *window) {
     if (!window) return nullptr;
     const QStringList names{QStringLiteral("gpvst3TitleToolBar"), QStringLiteral("titleToolBar"),
-                            QStringLiteral("gpTitleToolBar"), QStringLiteral("mainToolBar"),
-                            QStringLiteral("toolBar")};
-    for (const auto &name : names)
-        if (auto *bar = window->findChild<QToolBar *>(name)) return bar;
+                            QStringLiteral("gpTitleToolBar")};
+    for (const auto &name : names) {
+        if (auto *bar = window->findChild<QToolBar *>(name)) {
+            if (bar->isVisible()) return bar;
+        }
+    }
     for (auto *bar : window->findChildren<QToolBar *>()) {
         const auto object = bar->objectName().toLower();
-        if (object.contains(QStringLiteral("title")) || object.contains(QStringLiteral("header"))) return bar;
+        if ((object.contains(QStringLiteral("title")) || object.contains(QStringLiteral("header"))) &&
+            bar->isVisible()) return bar;
     }
-    const auto bars = window->findChildren<QToolBar *>();
-    return bars.isEmpty() ? nullptr : bars.front();
+    return nullptr;
 }
 
 void ensureAboutEntry() {
     auto *window = mainWindow();
     if (!window) return;
+    if (g_aboutObservedWindow != window) {
+        if (g_aboutObserver && g_aboutObservedWindow)
+            g_aboutObservedWindow->removeEventFilter(g_aboutObserver);
+        auto *observer = new AboutEntryObserver(window);
+        g_aboutObserver = observer;
+        g_aboutObservedWindow = window;
+        QObject::connect(window, &QObject::destroyed, qApp, [] {
+            g_aboutObserver = nullptr;
+            g_aboutObservedWindow = nullptr;
+        });
+        window->installEventFilter(observer);
+    }
     if (auto *bar = findTitleToolBar(window)) {
-        if (!bar->findChild<QPushButton *>(QStringLiteral("gpvst3AboutButton"))) {
+        auto *button = bar->findChild<QPushButton *>(QStringLiteral("gpvst3AboutButton"));
+        if (!button) {
             auto *button = new QPushButton(QStringLiteral("关于"), bar);
             button->setObjectName(QStringLiteral("gpvst3AboutButton"));
             button->setToolTip(QStringLiteral("关于 GuitarProVST3"));
             button->setAccessibleName(QStringLiteral("关于 GuitarProVST3"));
             bar->addWidget(button);
             QObject::connect(button, &QPushButton::clicked, button, [] { showAboutDialog(); });
+        } else {
+            // A host can keep the toolbar object but hide/recreate its child
+            // layout during navigation. Restore the plugin control's visible
+            // state on every maintenance pass.
+            button->setVisible(true);
+            button->setEnabled(true);
         }
         if (auto *stale = window->findChild<QAction *>(QStringLiteral("gpvst3AboutAction"))) {
             window->menuBar()->removeAction(stale);
@@ -524,6 +570,10 @@ void ensureAboutEntry() {
         action->setObjectName(QStringLiteral("gpvst3AboutAction"));
         QObject::connect(action, &QAction::triggered, action, [] { showAboutDialog(); });
     }
+    // A score-page transition can rebuild the menu's action list while the
+    // QAction itself is still alive. Object existence alone is insufficient.
+    if (!window->menuBar()->actions().contains(action)) window->menuBar()->addAction(action);
+    action->setVisible(true);
     window->setProperty("gpvst3AboutMount", "menu_fallback");
 }
 
@@ -552,8 +602,11 @@ protected:
     }
 
     void mouseDoubleClickEvent(QMouseEvent *event) override {
-        if (event->button() == Qt::LeftButton && onDoubleClick) onDoubleClick();
+        // Third party editor creation can pump events and rebuild this row.
+        // Keep the callback alive and never touch the button after invoking it.
+        const auto callback = event->button() == Qt::LeftButton ? onDoubleClick : std::function<void()>{};
         QPushButton::mouseDoubleClickEvent(event);
+        if (callback) callback();
     }
 
 private:
@@ -766,9 +819,9 @@ private:
         return false;
     }
 
-    void saveRuntimeState() {
+    void saveRuntimeState(bool capture = true) {
         if (scope_ == state::ScopeKind::Track && !contextReady_) return;
-        const auto runtimeStates = scope_ == state::ScopeKind::Track
+        const auto runtimeStates = !capture ? std::vector<Vst3SelectionEntry>{} : scope_ == state::ScopeKind::Track
             ? (g_vst3TrackStateControl ? g_vst3TrackStateControl(trackKey_.toStdString()) : std::vector<Vst3SelectionEntry>{})
             : (g_vst3StateControl ? g_vst3StateControl() : std::vector<Vst3SelectionEntry>{});
         for (const auto &saved : runtimeStates) {
@@ -957,11 +1010,11 @@ private:
         const auto identity = key(effect);
         row->setProperty("gpvst3EntryId", identity);
         connect(check, &QCheckBox::toggled, this, [this, identity, check](bool enabled) {
-            saveRuntimeState();
             const int index = indexFor(identity); if (index < 0) return;
             auto effect = effects_.at(index).toObject();
             const auto previous = effect;
             const auto editorKey = (scope_ == state::ScopeKind::Global ? QStringLiteral("global") : trackKey_) + '\n' + key(effect);
+            if (!enabled && g_pendingEditorKey == editorKey) g_pendingEditorKey.clear();
             if (!enabled && g_editorWindow && g_editorWindow->openedKey == editorKey) g_editorWindow->close();
             effect.insert("enabled", enabled);
             effect.insert("bypass", !enabled);
@@ -982,7 +1035,7 @@ private:
                 check->setChecked(previous.value("enabled").toBool());
                 return;
             }
-            saveRuntimeState();
+            saveRuntimeState(false);
             status_->setToolTip(QString());
             status_->setText(enabled
                 ? (scope_ == state::ScopeKind::Track && !state::runtimeTrackContextAvailable()
@@ -1006,13 +1059,24 @@ private:
             status_->setText(QStringLiteral("请先勾选启用插件，再打开其 GUI。"));
             return;
         }
-        auto *window = editorWindow();
         const auto editorKey = (scope_ == state::ScopeKind::Global ? QStringLiteral("global") : trackKey_) + '\n' + key(effect);
+        g_pendingEditorKey = editorKey;
+        if (g_vst3BusyControl && g_vst3BusyControl()) {
+            status_->setText(QStringLiteral("正在准备插件，完成后自动打开 GUI。"));
+            const auto identity = key(effect);
+            QTimer::singleShot(50, this, [this, identity, editorKey] {
+                if (g_pendingEditorKey != editorKey) return;
+                const int current = indexFor(identity);
+                if (current >= 0) openEditor(current);
+            });
+            return;
+        }
+        g_pendingEditorKey.clear();
+        auto *window = editorWindow();
         if (window->openedKey == editorKey && window->isVisible()) {
             window->showNormal(); window->raise(); window->activateWindow();
             return;
         }
-        saveRuntimeState();
         if (g_vst3EditorCloseControl) g_vst3EditorCloseControl();
         window->openedKey = editorKey;
         window->setWindowTitle(effect.value("name").toString() + QStringLiteral(" · VST3"));
@@ -1026,9 +1090,11 @@ private:
             return;
         }
         void *editorHost = reinterpret_cast<void *>(window->host->winId());
+        const QPointer<P7Panel> self(this);
         const bool opened = scope_ == state::ScopeKind::Global
             ? g_vst3EditorControl(selection, editorHost)
             : g_vst3TrackEditorControl(trackKey_.toStdString(), selection, editorHost);
+        if (!self) return;
         if (!opened) {
             window->hide();
             status_->setText(QStringLiteral("原生 GUI 不可用：插件未提供可嵌入 editor 或初始化失败。"));
@@ -1301,6 +1367,10 @@ void setVst3SelectionControl(Vst3SelectionControl control) noexcept {
 
 void setVst3SelectionRequestControl(Vst3SelectionRequestControl control) noexcept {
     g_vst3SelectionRequestControl = control;
+}
+
+void setVst3BusyControl(bool (*control)() noexcept) noexcept {
+    g_vst3BusyControl = control;
 }
 
 void setVst3TrackSelectionControl(Vst3TrackSelectionControl control) noexcept {

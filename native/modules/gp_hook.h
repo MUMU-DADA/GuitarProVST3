@@ -194,6 +194,7 @@ void refreshTrackContext() noexcept;
 // Control-thread notification after a failed restored/running entry was
 // persisted as disabled; the UI reloads the actual accepted selection.
 bool consumeSelectionStateChanges() noexcept;
+bool vst3SelectionPending() noexcept;
 
 // Thread-safe control used by the Qt panel. It only changes an atomic bypass
 // flag; processor creation and destruction remain on the worker thread.

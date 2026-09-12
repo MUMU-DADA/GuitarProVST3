@@ -30,6 +30,7 @@ const char *state() noexcept;
 void setRealtimeBypassControl(RealtimeBypassControl control) noexcept;
 void setVst3SelectionControl(Vst3SelectionControl control) noexcept;
 void setVst3SelectionRequestControl(Vst3SelectionRequestControl control) noexcept;
+void setVst3BusyControl(bool (*control)() noexcept) noexcept;
 void setVst3TrackSelectionControl(Vst3TrackSelectionControl control) noexcept;
 void setVst3TrackSelectionRequestControl(Vst3TrackSelectionRequestControl control) noexcept;
 void setVst3StateControl(Vst3StateControl control) noexcept;
