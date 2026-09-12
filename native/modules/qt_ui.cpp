@@ -102,6 +102,29 @@ QString configuredTrackLabel() {
                      : QStringLiteral("当前音轨：Track %1").arg(index);
 }
 
+QString titleTrackIdentity() {
+    const auto index = configuredTrackIndex();
+    if (index < 0) return QStringLiteral("VST3 · 未选择音轨");
+    int enabled = 0;
+    for (auto *widget : QApplication::allWidgets()) {
+        auto *toggle = qobject_cast<QCheckBox *>(widget);
+        if (toggle && toggle->objectName().startsWith(QStringLiteral("gpvst3Enabled_")) && toggle->isChecked()) ++enabled;
+    }
+    return QStringLiteral("Track %1 · VST3 (%2)").arg(index).arg(enabled);
+}
+
+void refreshTitleTrackIdentity() {
+    const auto label = titleTrackIdentity();
+    for (auto *widget : QApplication::allWidgets()) {
+        auto *button = qobject_cast<QPushButton *>(widget);
+        if (!button || button->objectName() != QStringLiteral("gpvst3SoundEffectChainButton")) continue;
+        button->setText(label);
+        button->setToolTip(label + QStringLiteral("\n打开或刷新 VST3 插件清单"));
+        button->setAccessibleName(label);
+        button->setProperty("gpvst3TrackIdentity", label);
+    }
+}
+
 class ChainPanel final : public QWidget {
 public:
     ChainPanel() {
@@ -436,7 +459,7 @@ QDialog *aboutDialog() {
     title->setFont(titleFont);
     layout->addWidget(title);
     auto *details = new QLabel(
-        QStringLiteral("版本：0.9.1\n"
+        QStringLiteral("版本：1.0.0\n"
                        "已验证宿主：Guitar Pro 8.1.1.17（Windows x64）\n"
                        "许可证：MIT License\n"
                        "第三方声明：VST3 SDK 及插件各自遵循其许可证。\n"
@@ -528,6 +551,7 @@ QToolBar *findTitleToolBar(QMainWindow *window) {
 void ensureAboutEntry() {
     auto *window = mainWindow();
     if (!window) return;
+    refreshTitleTrackIdentity();
     if (g_aboutObservedWindow != window) {
         if (g_aboutObserver && g_aboutObservedWindow)
             g_aboutObservedWindow->removeEventFilter(g_aboutObserver);
@@ -1048,9 +1072,20 @@ private:
             // Rebuild after the current signal so enabled rows move immediately.
             QTimer::singleShot(0, this, [this] { loadChain(); });
         });
-        name->onDoubleClick = [this, identity] {
-            const int index = indexFor(identity); if (index >= 0) openEditor(index);
+        const auto openEditorForEntry = [this, identity] {
+            const int index = indexFor(identity); if (index >= 0) this->openEditor(index);
         };
+        name->onDoubleClick = openEditorForEntry;
+        // Keep the user-facing entry as a compact name control while exposing
+        // the same command to keyboard/context-menu and MCP validation.
+        auto *editorAction = new QAction(QStringLiteral("打开原生 GUI"), name);
+        editorAction->setObjectName(prefix + QStringLiteral("Editor_") + token);
+        editorAction->setToolTip(QStringLiteral("打开原生 GUI"));
+        QObject::connect(editorAction, &QAction::triggered, this, [openEditorForEntry] {
+            openEditorForEntry();
+        });
+        name->addAction(editorAction);
+        name->setContextMenuPolicy(Qt::ActionsContextMenu);
     }
 
     void openEditor(int index) {
@@ -1471,6 +1506,7 @@ void syncVst3Selection() {
 
 void refreshVst3TrackContext() {
     if (g_p7Panel) g_p7Panel->refreshTrackContext();
+    refreshTitleTrackIdentity();
 }
 
 void reloadVst3Selections() {
@@ -1544,7 +1580,7 @@ void showEffectChainPanel(bool show) {
                 {globalAnchor ? globalAnchor->objectName() : QString{}}, {});
         }
         if (soundHost && !soundHost->findChild<QPushButton *>("gpvst3SoundEffectChainButton")) {
-            auto *button = new QPushButton(g_scanButtonText, soundHost);
+            auto *button = new QPushButton(titleTrackIdentity(), soundHost);
             button->setObjectName(QStringLiteral("gpvst3SoundEffectChainButton"));
             button->setToolTip(QStringLiteral("打开或刷新 VST3 插件清单"));
             soundHost->layout()->addWidget(button);
@@ -1553,6 +1589,7 @@ void showEffectChainPanel(bool show) {
                 if (g_refreshControl) g_refreshControl();
             });
         }
+        refreshTitleTrackIdentity();
         if (useP7Panel) {
             const auto mount = [](QWidget *content, QWidget *section, bool expanded) {
                 if (!content) return;

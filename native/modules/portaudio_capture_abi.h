@@ -30,6 +30,8 @@ struct Configuration {
     double sampleRate = 0.0;
     int inputDevice = -1;
     int outputDevice = -1;
+    double inputSuggestedLatency = 0.0;
+    double outputSuggestedLatency = 0.0;
 };
 
 inline bool validParameters(const StreamParameters &input, const StreamParameters &output,
@@ -59,7 +61,8 @@ inline bool configuration(const void *module, const void *impl,
     if (!validParameters(input, output, sampleRate)) return false;
     result = {static_cast<std::size_t>(input.channelCount),
               static_cast<std::size_t>(output.channelCount), sampleRate,
-              input.device, output.device};
+              input.device, output.device, input.suggestedLatency,
+              output.suggestedLatency};
     return true;
 }
 

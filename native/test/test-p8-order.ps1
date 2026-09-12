@@ -66,7 +66,7 @@ function Read-Order([string]$scope) {
     $chain = Get-Content -LiteralPath (Join-Path $run 'effect-chain.json') -Raw | ConvertFrom-Json
     $effects = if ($scope -eq 'global') { $chain.global.effects } else {
         $score = @($chain.scores.PSObject.Properties | Where-Object { [IO.Path]::GetFullPath($_.Name) -ieq [IO.Path]::GetFullPath($scorePath) })[0].Value
-        @($score.tracks.PSObject.Properties.Value | Where-Object { $_.present -and $_.track_index -eq 0 })[0].effects
+        @($score.tracks.PSObject.Properties.Value | Where-Object { $_.track_index -eq 0 })[0].effects
     }
     @($effects | Where-Object enabled | ForEach-Object name) -join '|'
 }
@@ -129,6 +129,7 @@ try {
         Set-Property $listName 'currentRow' 2
         Trigger ((Prefix $scope) + 'MoveUp')
         Start-Sleep -Milliseconds 300
+        Set-Property $listName 'currentRow' 1
         Trigger ((Prefix $scope) + 'MoveUp')
         Start-Sleep -Milliseconds 300
         $cab = Assert-AudioOrder $scope @(2,0,1)

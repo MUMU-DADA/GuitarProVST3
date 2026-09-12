@@ -53,6 +53,13 @@ inline Verification verifyDirectory(const QString &directory,
     return result;
 }
 
-inline Verification verify() { return verifyDirectory(QCoreApplication::applicationDirPath()); }
+inline const Verification &cachedVerification() {
+    static const Verification result = verifyDirectory(QCoreApplication::applicationDirPath());
+    return result;
+}
+
+// Host files are immutable for the lifetime of the plugin process. Cache the
+// hash gate so track-context refreshes never rescan the installation.
+inline Verification verify() { return cachedVerification(); }
 
 }

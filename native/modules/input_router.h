@@ -101,6 +101,7 @@ public:
         std::size_t interleavedBlocks = 0;
         std::size_t interleavedFormatErrors = 0;
         std::size_t interleavedMissingBlocks = 0;
+        std::size_t interleavedCopyOperations = 0;
         std::size_t interleavedInputChannelCount = 0;
         std::size_t interleavedOutputChannelCount = 0;
         std::uintptr_t firstCaptureAddress = 0;
@@ -182,6 +183,7 @@ private:
     std::atomic<std::size_t> interleavedBlocks_{0};
     std::atomic<std::size_t> interleavedFormatErrors_{0};
     std::atomic<std::size_t> interleavedMissingBlocks_{0};
+    std::atomic<std::size_t> interleavedCopyOperations_{0};
     std::atomic<std::size_t> interleavedInputChannelCount_{0};
     std::atomic<std::size_t> interleavedOutputChannelCount_{0};
     std::atomic<std::uintptr_t> firstCaptureAddress_{0};

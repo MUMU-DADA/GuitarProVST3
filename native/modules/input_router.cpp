@@ -232,6 +232,7 @@ Router::Result Router::processInterleaved(const InterleavedView &view) noexcept 
         interleavedMissingBlocks_.fetch_add(1, std::memory_order_relaxed);
         return result;
     }
+    interleavedCopyOperations_.fetch_add(1, std::memory_order_relaxed);
     interleavedInputObserved_.store(true, std::memory_order_release);
     const CaptureView originalCapture{interleavedCaptureScratch_.inputChannels(),
         view.inputChannelCount, view.frameCount, view.sampleRate, view.blockSize};
@@ -284,6 +285,8 @@ Router::Result Router::processInterleaved(const InterleavedView &view) noexcept 
         interleavedOutputWritten_.store(true, std::memory_order_release);
     else if (result.completed)
         result.completed = false;
+    if (result.completed)
+        interleavedCopyOperations_.fetch_add(1, std::memory_order_relaxed);
     return result;
 }
 
@@ -395,6 +398,8 @@ Router::Snapshot Router::snapshot() const noexcept {
         interleavedFormatErrors_.load(std::memory_order_relaxed);
     result.interleavedMissingBlocks =
         interleavedMissingBlocks_.load(std::memory_order_relaxed);
+    result.interleavedCopyOperations =
+        interleavedCopyOperations_.load(std::memory_order_relaxed);
     result.interleavedInputChannelCount =
         interleavedInputChannelCount_.load(std::memory_order_relaxed);
     result.interleavedOutputChannelCount =

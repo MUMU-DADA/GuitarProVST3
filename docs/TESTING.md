@@ -20,6 +20,7 @@
 ./native/test/test-p8-order.ps1 -P4Route input_insert
 ./native/test/test-p8-order.ps1 -P4Route bus_mix
 ./native/test/test-p6-package.ps1 -PluginPath .tools/native/p8-track-build/plugins/imageformats/guitarpro_vst3_autoload.dll
+./native/test/test-p10.ps1
 git diff --check
 ```
 
@@ -50,3 +51,16 @@ P9 夹具验证不使用 computer use；宿主流程使用已安装的 MCP bridg
 状态压缩和启动开关使用独立临时目录验证；完整宿主测试中，MCP bridge 的诊断值为 `mcp_context_native_registry`，表示 bridge 提供选中音轨上下文、native registry 提供可处理 EffectsChain。
 
 切换专项记录 UI 请求确认、控制 worker 合并、准备/交接/reader drain 耗时、ramp 和音频块连续性；UI 专项覆盖 About 工具栏按钮幂等、窗口复用、窄侧栏/DPI 和扫描错误不出现在可见文本或 tooltip。`test-p9.ps1` 串联两个专项并保留 evidence。真实 Guitar Pro 听感和设备回归仍须单独记录。
+
+## P10 验证
+
+P10 夹具不使用 computer use，完整入口为 `./native/test/test-p10.ps1`，单项入口为 `test-p10-baseline.ps1`、`test-p10-startup.ps1`、`test-p10-asio.ps1`、`test-p10-input-route.ps1 -Route input_insert|bus_mix` 和 `test-p10-ui.ps1`。
+
+MCP 宿主验证复用 `test-p8-track-runtime.ps1` 的免安装流程，可显式打开输入链：
+
+```powershell
+./native/test/test-p8-track-runtime.ps1 -PluginPath .tools/native/p10-build/plugins/imageformats/guitarpro_vst3_autoload.dll -Vst3Root 'C:/path/to/P7 Gain Fixture.vst3' -P4Route input_insert
+./native/test/test-p8-track-runtime.ps1 -PluginPath .tools/native/p10-build/plugins/imageformats/guitarpro_vst3_autoload.dll -Vst3Root 'C:/path/to/P7 Gain Fixture.vst3' -P4Route bus_mix
+```
+
+宿主运行期间 `p2-observation.json` 的 `gp_hook.audio_deadline` 记录 callback blocks、p95/p99、deadline overruns 和额外 copy；`roundtrip_latency` 拆分设备/VST3/适配器报告值，未接硬件 loopback 时 `measured=false`。`input_route` 同时记录 capture、处理块、写回和借用 buffer 地址，不能用 DLL 加载或菜单枚举替代这些证据。

@@ -42,6 +42,8 @@ public:
         std::uint64_t lastProcessNanoseconds = 0;
         std::uint64_t maxProcessNanoseconds = 0;
         std::uint64_t totalProcessNanoseconds = 0;
+        std::uint64_t deadlineNanoseconds = 0;
+        std::size_t deadlineExceededBlocks = 0;
         std::size_t switchCount = 0;
         std::size_t switchRequests = 0;
         std::size_t switchPrepared = 0;
@@ -73,6 +75,9 @@ public:
     // slot becomes active. The default is intentionally small enough for a
     // realtime block while avoiding a hard step at the handoff.
     void setRampSamples(std::size_t samples) noexcept;
+    // Optional control-thread deadline override. A zero value makes process()
+    // derive the current block duration from sampleRate/frameCount.
+    void setDeadlineNanoseconds(std::uint64_t nanoseconds) noexcept;
     bool bypassed() const noexcept { return bypassed_.load(std::memory_order_acquire); }
     void clearFault() noexcept;
     bool faulted() const noexcept { return faulted_.load(std::memory_order_acquire); }
@@ -107,6 +112,9 @@ private:
     std::atomic<std::uint64_t> lastProcessNanoseconds_{0};
     std::atomic<std::uint64_t> maxProcessNanoseconds_{0};
     std::atomic<std::uint64_t> totalProcessNanoseconds_{0};
+    std::atomic<std::uint64_t> deadlineNanoseconds_{0};
+    std::atomic<std::uint64_t> deadlineOverrideNanoseconds_{0};
+    std::atomic<std::size_t> deadlineExceededBlocks_{0};
     std::atomic<std::size_t> switchCount_{0};
     std::atomic<std::size_t> switchRequests_{0};
     std::atomic<std::size_t> switchPrepared_{0};

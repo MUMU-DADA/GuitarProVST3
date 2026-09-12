@@ -19,6 +19,7 @@
 #include <vector>
 #include <unordered_map>
 #include <thread>
+#include <chrono>
 
 #include "audio_adapter.h"
 #include "effect_chain.h"
@@ -245,6 +246,7 @@ struct RuntimeEffect {
     std::atomic<bool> ownerObserved{false};
     std::atomic<int> configuredRate{0};
     std::atomic<std::size_t> configuredBlock{0};
+    std::atomic<unsigned int> reportedLatencySamples{0};
     bool forceError = false;
     std::atomic_flag processing = ATOMIC_FLAG_INIT;
 
@@ -271,6 +273,7 @@ struct RuntimeEffect {
         ownerObserved.store(false, std::memory_order_release);
         configuredRate.store(0, std::memory_order_release);
         configuredBlock.store(0, std::memory_order_release);
+        reportedLatencySamples.store(0, std::memory_order_release);
         if (processor) processor->setProcessing(false);
         if (component) {
             component->setActive(false);
@@ -449,6 +452,7 @@ struct RuntimeEffect {
         ready.store(true, std::memory_order_release);
         configuredRate.store(static_cast<int>(sampleRate), std::memory_order_release);
         configuredBlock.store(maxSamplesPerBlock, std::memory_order_release);
+        reportedLatencySamples.store(processor->getLatencySamples(), std::memory_order_release);
         error.clear();
         return true;
     }
@@ -584,6 +588,7 @@ struct RuntimeEffect {
         error.clear();
         configuredRate.store(static_cast<int>(sampleRate), std::memory_order_release);
         configuredBlock.store(maxSamplesPerBlock, std::memory_order_release);
+        reportedLatencySamples.store(processor->getLatencySamples(), std::memory_order_release);
         ready.store(true, std::memory_order_release);
         return true;
     }
@@ -910,6 +915,17 @@ struct Runtime {
     std::atomic<unsigned long> outputThread{0};
     std::atomic<std::uintptr_t> outputFirstBuffer{0};
     std::atomic<std::uintptr_t> outputLastBuffer{0};
+    std::atomic<std::uint64_t> audioCallbackBlocks{0};
+    std::atomic<std::uint64_t> firstAudioCallbackNanoseconds{0};
+    std::atomic<std::uint64_t> audioCallbackProcessingNanoseconds{0};
+    std::atomic<std::uint64_t> audioCallbackMaxNanoseconds{0};
+    std::atomic<std::uint64_t> audioCallbackDeadlineNanoseconds{0};
+    std::atomic<std::size_t> audioCallbackDeadlineOverruns{0};
+    std::atomic<std::size_t> audioCallbackExtraCopyOperations{0};
+    std::atomic<std::size_t> audioCallbackSampleIndex{0};
+    std::array<std::atomic<std::uint64_t>, 256> audioCallbackSamples{};
+    std::atomic<std::size_t> deviceInputLatencySamples{0};
+    std::atomic<std::size_t> deviceOutputLatencySamples{0};
     std::atomic<bool> bufferWriteObserved{false};
     std::atomic<bool> dspInsideMaster{false};
     std::atomic<std::size_t> frames{0};
@@ -2119,6 +2135,8 @@ State snapshot() noexcept {
     result.lastProcessNanoseconds = chain.lastProcessNanoseconds;
     result.maxProcessNanoseconds = chain.maxProcessNanoseconds;
     result.totalProcessNanoseconds = chain.totalProcessNanoseconds;
+    result.chainDeadlineNanoseconds = chain.deadlineNanoseconds;
+    result.chainDeadlineExceededBlocks = chain.deadlineExceededBlocks;
     result.chainSwitchCount = chain.switchCount;
     result.runtimeEffectInstances = 0;
     if (g_runtime.selectionMode.load(std::memory_order_acquire)) {
@@ -2178,6 +2196,7 @@ State snapshot() noexcept {
     result.inputInterleavedBlocks = input.interleavedBlocks;
     result.inputInterleavedFormatErrors = input.interleavedFormatErrors;
     result.inputInterleavedMissingBlocks = input.interleavedMissingBlocks;
+    result.inputInterleavedCopyOperations = input.interleavedCopyOperations;
     result.inputInterleavedInputChannelCount = input.interleavedInputChannelCount;
     result.inputInterleavedOutputChannelCount = input.interleavedOutputChannelCount;
     result.inputFirstCaptureAddress = input.firstCaptureAddress;
@@ -2199,6 +2218,59 @@ State snapshot() noexcept {
         g_runtime.inputObservedRate.load(std::memory_order_relaxed));
     result.inputConfigurationErrors =
         g_runtime.inputConfigurationErrors.load(std::memory_order_relaxed);
+    result.audioCallbackBlocks = g_runtime.audioCallbackBlocks.load(std::memory_order_relaxed);
+    result.firstAudioCallbackNanoseconds =
+        g_runtime.firstAudioCallbackNanoseconds.load(std::memory_order_relaxed);
+    result.audioCallbackProcessingNanoseconds =
+        g_runtime.audioCallbackProcessingNanoseconds.load(std::memory_order_relaxed);
+    result.audioCallbackMaxNanoseconds =
+        g_runtime.audioCallbackMaxNanoseconds.load(std::memory_order_relaxed);
+    result.audioCallbackDeadlineNanoseconds =
+        g_runtime.audioCallbackDeadlineNanoseconds.load(std::memory_order_relaxed);
+    result.audioCallbackDeadlineOverruns =
+        g_runtime.audioCallbackDeadlineOverruns.load(std::memory_order_relaxed);
+    result.audioCallbackExtraCopyOperations =
+        g_runtime.audioCallbackExtraCopyOperations.load(std::memory_order_relaxed);
+    std::vector<std::uint64_t> callbackSamples;
+    const auto sampleCount = (std::min)(g_runtime.audioCallbackSampleIndex.load(std::memory_order_relaxed),
+                                        g_runtime.audioCallbackSamples.size());
+    callbackSamples.reserve(sampleCount);
+    for (std::size_t index = 0; index < sampleCount; ++index) {
+        const auto value = g_runtime.audioCallbackSamples[index].load(std::memory_order_relaxed);
+        if (value != 0) callbackSamples.push_back(value);
+    }
+    std::sort(callbackSamples.begin(), callbackSamples.end());
+    const auto percentile = [&callbackSamples](double fraction) -> std::uint64_t {
+        if (callbackSamples.empty()) return 0;
+        const auto index = (std::min)(callbackSamples.size() - 1,
+            static_cast<std::size_t>(fraction * static_cast<double>(callbackSamples.size() - 1)));
+        return callbackSamples[index];
+    };
+    result.audioCallbackP95Nanoseconds = percentile(0.95);
+    result.audioCallbackP99Nanoseconds = percentile(0.99);
+    result.deviceInputLatencySamples =
+        g_runtime.deviceInputLatencySamples.load(std::memory_order_relaxed);
+    result.deviceOutputLatencySamples =
+        g_runtime.deviceOutputLatencySamples.load(std::memory_order_relaxed);
+    std::size_t vst3Latency = g_runtime.inputEffect.reportedLatencySamples.load(std::memory_order_relaxed);
+    const auto activeGlobal = chain.activeSlot;
+    if (activeGlobal >= 0 && activeGlobal < 2) {
+        if (g_runtime.selectionMode.load(std::memory_order_acquire)) {
+            const auto &slot = g_runtime.selectionSlots[activeGlobal];
+            for (std::size_t index = 0; index < slot.count; ++index)
+                if (slot.effects[index])
+                    vst3Latency += slot.effects[index]->reportedLatencySamples.load(std::memory_order_relaxed);
+        } else if (!selectionPublished) {
+            vst3Latency += g_runtime.effects[activeGlobal].reportedLatencySamples.load(std::memory_order_relaxed);
+        }
+    }
+    result.vst3LatencySamples = vst3Latency;
+    result.adapterLatencySamples = 0;
+    result.roundtripLatencySamples = result.deviceInputLatencySamples +
+        result.deviceOutputLatencySamples + result.vst3LatencySamples;
+    result.roundtripLatencyMeasured = false;
+    result.roundtripLatencyStatus = result.audioCallbackBlocks == 0
+        ? "unavailable" : "reported_components_only";
     std::atomic_store(&previous, std::make_shared<const State>(result));
     return result;
 }
@@ -2295,6 +2367,17 @@ void shutdown() noexcept {
     g_runtime.outputThread.store(0, std::memory_order_relaxed);
     g_runtime.outputFirstBuffer.store(0, std::memory_order_relaxed);
     g_runtime.outputLastBuffer.store(0, std::memory_order_relaxed);
+    g_runtime.audioCallbackBlocks.store(0, std::memory_order_relaxed);
+    g_runtime.firstAudioCallbackNanoseconds.store(0, std::memory_order_relaxed);
+    g_runtime.audioCallbackProcessingNanoseconds.store(0, std::memory_order_relaxed);
+    g_runtime.audioCallbackMaxNanoseconds.store(0, std::memory_order_relaxed);
+    g_runtime.audioCallbackDeadlineNanoseconds.store(0, std::memory_order_relaxed);
+    g_runtime.audioCallbackDeadlineOverruns.store(0, std::memory_order_relaxed);
+    g_runtime.audioCallbackExtraCopyOperations.store(0, std::memory_order_relaxed);
+    g_runtime.audioCallbackSampleIndex.store(0, std::memory_order_relaxed);
+    for (auto &sample : g_runtime.audioCallbackSamples) sample.store(0, std::memory_order_relaxed);
+    g_runtime.deviceInputLatencySamples.store(0, std::memory_order_relaxed);
+    g_runtime.deviceOutputLatencySamples.store(0, std::memory_order_relaxed);
     remove(g_runtime.stream);
     remove(g_runtime.dsp);
     remove(g_runtime.master);
@@ -2369,6 +2452,7 @@ std::uint64_t outputHash(const void *output, unsigned long frames) noexcept {
 
 int streamCallbackHook(const void *input, void *output, unsigned long frames,
                        const void *timeInfo, unsigned long status, void *userData) {
+    const auto started = std::chrono::steady_clock::now();
     const auto original = reinterpret_cast<StreamCallback>(g_runtime.stream.trampoline);
     const auto outputAddress = reinterpret_cast<std::uintptr_t>(output);
     auto firstBuffer = g_runtime.outputFirstBuffer.load(std::memory_order_relaxed);
@@ -2380,11 +2464,54 @@ int streamCallbackHook(const void *input, void *output, unsigned long frames,
     const auto before = outputHash(output, frames);
     const auto result = original(input, output, frames, timeInfo, status, userData);
     const auto inputState = g_runtime.inputRouter.snapshot();
+    double callbackRate = callbackSampleRate();
+    const auto finish = [&] {
+        const auto after = outputHash(output, frames);
+        g_runtime.outputObserved.store(output != nullptr && frames != 0, std::memory_order_release);
+        if (before != after) {
+            bool expected = false;
+            if (g_runtime.outputEvidenceClaimed.compare_exchange_strong(expected, true)) {
+                g_runtime.outputBeforeHash.store(before, std::memory_order_relaxed);
+                g_runtime.outputAfterHash.store(after, std::memory_order_relaxed);
+                g_runtime.outputWriteObserved.store(true, std::memory_order_release);
+            }
+        }
+        g_runtime.outputFrames.store(frames, std::memory_order_relaxed);
+        g_runtime.outputThread.store(GetCurrentThreadId(), std::memory_order_relaxed);
+        const auto elapsed = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now() - started).count());
+        const auto deadline = callbackRate > 0.0
+            ? static_cast<std::uint64_t>((static_cast<double>(frames) / callbackRate) * 1.0e9) : 0;
+        g_runtime.audioCallbackBlocks.fetch_add(1, std::memory_order_relaxed);
+        auto firstCallback = g_runtime.firstAudioCallbackNanoseconds.load(std::memory_order_relaxed);
+        if (firstCallback == 0) {
+            const auto sinceEpoch = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now().time_since_epoch()).count());
+            g_runtime.firstAudioCallbackNanoseconds.compare_exchange_strong(firstCallback, sinceEpoch,
+                                                                            std::memory_order_relaxed);
+        }
+        g_runtime.audioCallbackProcessingNanoseconds.store(elapsed, std::memory_order_relaxed);
+        g_runtime.audioCallbackDeadlineNanoseconds.store(deadline, std::memory_order_relaxed);
+        auto maximum = g_runtime.audioCallbackMaxNanoseconds.load(std::memory_order_relaxed);
+        while (maximum < elapsed && !g_runtime.audioCallbackMaxNanoseconds.compare_exchange_weak(
+                   maximum, elapsed, std::memory_order_relaxed)) {}
+        const auto sample = g_runtime.audioCallbackSampleIndex.fetch_add(1, std::memory_order_relaxed);
+        g_runtime.audioCallbackSamples[sample % g_runtime.audioCallbackSamples.size()].store(
+            elapsed, std::memory_order_relaxed);
+        if (deadline != 0 && elapsed > deadline)
+            g_runtime.audioCallbackDeadlineOverruns.fetch_add(1, std::memory_order_relaxed);
+        return result;
+    };
+    // A disabled or bypassed input chain leaves the native callback's output
+    // in place. Do not parse stream internals or copy capture data in this path.
+    if (!inputState.enabled || inputState.bypassed ||
+        inputState.route == input::Route::Disabled) return finish();
     portaudio::Configuration configuration;
     const bool configurationValid = frames > 0 &&
         frames <= portaudio::kMaxFrames &&
         portaudio::configuration(g_runtime.audioModule, userData, configuration);
     if (configurationValid) {
+        callbackRate = configuration.sampleRate;
         g_runtime.inputObservedRate.store(static_cast<int>(configuration.sampleRate),
                                            std::memory_order_relaxed);
         g_runtime.inputObservedChannels.store(configuration.inputChannels,
@@ -2395,6 +2522,14 @@ int streamCallbackHook(const void *input, void *output, unsigned long frames,
                                                 std::memory_order_release);
         g_runtime.inputConfiguredOutputChannels.store(configuration.outputChannels,
                                                        std::memory_order_release);
+        const auto latencySamples = [callbackRate](double latency) noexcept {
+            return std::isfinite(latency) && latency > 0.0
+                ? static_cast<std::size_t>(latency * callbackRate + 0.5) : std::size_t{0};
+        };
+        g_runtime.deviceInputLatencySamples.store(latencySamples(configuration.inputSuggestedLatency),
+                                                  std::memory_order_relaxed);
+        g_runtime.deviceOutputLatencySamples.store(latencySamples(configuration.outputSuggestedLatency),
+                                                   std::memory_order_relaxed);
     } else {
         g_runtime.inputConfigurationErrors.fetch_add(1, std::memory_order_relaxed);
     }
@@ -2438,22 +2573,11 @@ int streamCallbackHook(const void *input, void *output, unsigned long frames,
             }
         }
     }
-    const auto after = outputHash(output, frames);
-    g_runtime.outputObserved.store(output != nullptr && frames != 0, std::memory_order_release);
-    if (before != after) {
-        bool expected = false;
-        if (g_runtime.outputEvidenceClaimed.compare_exchange_strong(
-                expected, true, std::memory_order_acq_rel)) {
-        // Keep the first changed pair so a later silent block cannot overwrite
-        // the evidence that the device callback actually wrote its output.
-            g_runtime.outputBeforeHash.store(before, std::memory_order_relaxed);
-            g_runtime.outputAfterHash.store(after, std::memory_order_relaxed);
-            g_runtime.outputWriteObserved.store(true, std::memory_order_release);
-        }
-    }
-    g_runtime.outputFrames.store(frames, std::memory_order_relaxed);
-    g_runtime.outputThread.store(GetCurrentThreadId(), std::memory_order_relaxed);
-    return result;
+    const auto copies = g_runtime.inputRouter.snapshot().interleavedCopyOperations;
+    if (copies >= inputState.interleavedCopyOperations)
+        g_runtime.audioCallbackExtraCopyOperations.fetch_add(copies - inputState.interleavedCopyOperations,
+                                                            std::memory_order_relaxed);
+    return finish();
 }
 
 void setTotalBypass(bool bypassed) noexcept {

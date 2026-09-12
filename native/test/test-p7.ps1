@@ -73,7 +73,7 @@ try {
         throw "P7 VST3 metadata scan did not complete within $ScanTimeoutSeconds seconds."
     }
     $catalog = @($status.vst3_catalog | Where-Object { $_.identified -or -not $_.class_id })
-    if ($status.qt_ui -ne 'panel_ready_p7') { throw "P7 UI state missing: $($status.qt_ui)" }
+    if ($status.qt_ui -notin @('panel_ready_p7', 'panel_ready_p9')) { throw "P7 UI state missing: $($status.qt_ui)" }
     if ($catalog.Count -eq 0) { throw 'P7 automatic VST3 catalog is empty.' }
     if ([int]$status.vst3_host.modules_discovered -lt 1) { throw 'P7 standard-directory scan found no VST3 bundle.' }
     if ($scanState.modules_loaded -ne 0 -or $scanState.instances_created -ne 0) { throw 'Static scan loaded third-party code.' }
