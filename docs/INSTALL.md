@@ -10,7 +10,15 @@
 ./install.ps1 -Elevate -HostDirectory 'C:/Program Files/Arobas Music/Guitar Pro 8'
 ```
 
-插件安装到 Guitar Pro 的 `Plugins/imageformats`，并写入文件归属收据。只有收据哈希仍与 DLL 相符时，重复安装或卸载才会继续。
+插件安装到 Guitar Pro 的 `Plugins/imageformats`，并写入文件归属收据。已有本安装器收据的版本可直接再次运行 `Install.cmd` 更新；只有收据哈希仍与 DLL 相符时，更新或卸载才会继续。
+
+如果安装目录已有旧的 `guitarpro_vst3_autoload.dll` 但没有 GuitarProVST3 收据，双击 `Install.cmd` 会先备份旧文件再完成安装。PowerShell 中可显式启用同样的迁移：
+
+```powershell
+./install.ps1 -Elevate -MigrateExisting -HostDirectory 'C:/Program Files/Arobas Music/Guitar Pro 8'
+```
+
+迁移会先把旧文件备份到 `Plugins/guitarpro-vst3-backups`，再安装当前版本。
 
 更新已有安装：
 

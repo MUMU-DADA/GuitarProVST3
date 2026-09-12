@@ -37,6 +37,8 @@ $hostFixture = Join-Path $OutputRoot 'host'
 New-Item -ItemType Directory -Force -Path (Join-Path $hostFixture 'Plugins/imageformats') | Out-Null
 [IO.File]::WriteAllText((Join-Path $hostFixture 'GuitarPro.exe'), 'p6 host fixture')
 $installer = Join-Path $packageDirectory 'install.ps1'
+$cmdEntry = Get-Content -LiteralPath (Join-Path $packageDirectory 'Install.cmd') -Raw
+if ($cmdEntry -notmatch '(?i)-Elevate\s+-MigrateExisting') { throw 'Install.cmd does not use the elevated migration entrypoint.' }
 $target = Join-Path $hostFixture 'Plugins/imageformats/guitarpro_vst3_autoload.dll'
 $receipt = Join-Path $hostFixture 'Plugins/guitarpro-vst3-install.json'
 try {
@@ -45,6 +47,16 @@ try {
     try { & $installer -Action Install -HostDirectory $hostFixture -PackageDirectory $packageDirectory | Out-Null }
     catch { $unownedRejected = $true }
     if (-not $unownedRejected) { throw 'Install overwrote an unowned existing plugin.' }
+    $errorLog = Join-Path $OutputRoot 'installer-error.log'
+    $childArguments = @('-NoProfile','-ExecutionPolicy','Bypass','-File',('"' + $installer + '"'),
+        '-Action','Install','-HostDirectory',('"' + $hostFixture + '"'),
+        '-PackageDirectory',('"' + $packageDirectory + '"'),'-ErrorLogPath',('"' + $errorLog + '"'))
+    $child = Start-Process -FilePath (Get-Process -Id $PID).Path -ArgumentList $childArguments -WindowStyle Hidden -Wait -PassThru
+    if ($child.ExitCode -eq 0 -or -not (Test-Path -LiteralPath $errorLog) -or
+        (Get-Content -LiteralPath $errorLog -Raw -Encoding UTF8) -notmatch 'without a GuitarProVST3 receipt') {
+        throw 'Elevated installer error forwarding did not preserve the actionable cause.'
+    }
+    Remove-Item -LiteralPath $errorLog -Force
     Remove-Item -LiteralPath $target -Force
     $installed = & $installer -Action Install -HostDirectory $hostFixture -PackageDirectory $packageDirectory
     if (-not (Test-Path -LiteralPath $target) -or -not (Test-Path -LiteralPath $receipt)) { throw 'Package install did not create the owned plugin and receipt.' }
@@ -63,5 +75,15 @@ try {
     if ((Get-FileHash -LiteralPath $target -Algorithm SHA256).Hash -ine $originalHash) { throw 'Package test could not restore the fixture plugin.' }
     & $installer -Action Uninstall -HostDirectory $hostFixture -PackageDirectory $packageDirectory | Out-Null
     if ((Test-Path -LiteralPath $target) -or (Test-Path -LiteralPath $receipt)) { throw 'Package uninstall left owned files.' }
+    [IO.File]::WriteAllText($target, 'legacy unowned plugin')
+    $migrated = & $installer -Action Install -MigrateExisting -HostDirectory $hostFixture -PackageDirectory $packageDirectory
+    $backupFiles = @(Get-ChildItem -LiteralPath (Join-Path $hostFixture 'Plugins/guitarpro-vst3-backups') -Filter '*.dll.bak' -File)
+    if (-not $migrated.updated -or $backupFiles.Count -ne 1 -or
+        (Get-Content -LiteralPath $backupFiles[0].FullName -Raw) -ne 'legacy unowned plugin') {
+        throw 'Explicit unowned-plugin migration did not preserve a backup.'
+    }
+    & $installer -Action Uninstall -HostDirectory $hostFixture -PackageDirectory $packageDirectory | Out-Null
+    if (Test-Path -LiteralPath $target -PathType Leaf) { throw 'Migrated plugin uninstall left the new target.' }
+    Remove-Item -LiteralPath (Join-Path $hostFixture 'Plugins/guitarpro-vst3-backups') -Recurse -Force
 } finally { }
 Write-Output "PASS: P6 release package manifest, install ownership and uninstall safety. Evidence: $OutputRoot"

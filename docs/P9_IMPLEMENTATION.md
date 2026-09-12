@@ -2,7 +2,7 @@
 
 状态：已完成（2026-09-12）  
 关联计划：[P9：实时切换稳定性与界面体验计划](P9_AUDIO_SWITCH_UI_PLAN.md)  
-基线：`v0.9.0` / Guitar Pro 8.1.1.17 / Windows x64。
+基线：`v0.9.1` / Guitar Pro 8.1.1.17 / Windows x64。
 
 ## 用户反馈与实现状态
 

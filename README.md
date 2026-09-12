@@ -68,6 +68,8 @@ P9 已完成：切换请求在控制 worker 合并并准备双槽链，音频块
 3. 双击 `Install.cmd`，或在 PowerShell 中运行 `./install.ps1 -Elevate -HostDirectory 'C:/Program Files/Arobas Music/Guitar Pro 8'`。
 4. 启动 Guitar Pro，在音源区域打开 `VST3`，识别完成的插件会进入可用列表。
 
+`Install.cmd` 会在发现没有收据的旧同名 DLL 时先把旧文件备份到 `Plugins/guitarpro-vst3-backups`，再完成安装。
+
 音轨链和全局链彼此独立，已启用插件按列表顺序处理，可拖动或使用 `Alt+Up` / `Alt+Down` 调整顺序。双击插件名称打开原生 GUI；关闭 GUI 不会停止效果处理。插件详情中可打开配置并设置“启动时启用插件”，修改在下次启动 Guitar Pro 时生效。
 
 ## 验证
