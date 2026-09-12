@@ -1604,7 +1604,11 @@ bool configureRuntimeChain() noexcept {
 
 input::Route configuredInputRoute() noexcept {
     const char *configured = std::getenv("GPVST3_P4_ROUTE");
-    if (!configured || !*configured || std::strcmp(configured, "disabled") == 0)
+    // The installed plugin should process the guitar input by default. Keep
+    // an explicit "disabled" value for hosts/users that want the native path.
+    if (!configured || !*configured)
+        return input::Route::InputInsert;
+    if (std::strcmp(configured, "disabled") == 0)
         return input::Route::Disabled;
     if (std::strcmp(configured, "input_insert") == 0)
         return input::Route::InputInsert;
@@ -1671,7 +1675,7 @@ bool configureInputRouter() noexcept {
 
 bool inputFeatureEnabled() noexcept {
     const char *enabled = std::getenv("GPVST3_ENABLE_P4_INPUT");
-    return enabled && std::strcmp(enabled, "1") == 0;
+    return !enabled || std::strcmp(enabled, "0") != 0;
 }
 
 bool validateReconfiguration() noexcept {
@@ -2461,16 +2465,19 @@ int streamCallbackHook(const void *input, void *output, unsigned long frames,
                                                               std::memory_order_relaxed);
     g_runtime.outputLastBuffer.store(outputAddress, std::memory_order_relaxed);
     g_runtime.outputCalls.fetch_add(1, std::memory_order_relaxed);
-    const auto before = outputHash(output, frames);
+    // Hashing the callback buffer is diagnostic only; after the first
+    // observation it must disappear from the realtime path.
+    const bool collectOutputEvidence = !g_runtime.outputEvidenceClaimed.load(std::memory_order_relaxed);
+    const auto before = collectOutputEvidence ? outputHash(output, frames) : 0;
     const auto result = original(input, output, frames, timeInfo, status, userData);
     const auto inputState = g_runtime.inputRouter.snapshot();
     double callbackRate = callbackSampleRate();
     const auto finish = [&] {
-        const auto after = outputHash(output, frames);
+        const auto after = collectOutputEvidence ? outputHash(output, frames) : 0;
         g_runtime.outputObserved.store(output != nullptr && frames != 0, std::memory_order_release);
-        if (before != after) {
+        if (collectOutputEvidence) {
             bool expected = false;
-            if (g_runtime.outputEvidenceClaimed.compare_exchange_strong(expected, true)) {
+            if (g_runtime.outputEvidenceClaimed.compare_exchange_strong(expected, true) && before != after) {
                 g_runtime.outputBeforeHash.store(before, std::memory_order_relaxed);
                 g_runtime.outputAfterHash.store(after, std::memory_order_relaxed);
                 g_runtime.outputWriteObserved.store(true, std::memory_order_release);
@@ -2546,7 +2553,8 @@ int streamCallbackHook(const void *input, void *output, unsigned long frames,
             static_cast<std::size_t>(frames),
             userData, static_cast<std::uint64_t>(g_runtime.outputCalls.load(std::memory_order_relaxed)),
             input::InterleavedSampleFormat::Float32};
-        const auto postOriginal = outputHash(output, frames);
+        const bool collectInputEvidence = !g_runtime.inputOrderEvidenceClaimed.load(std::memory_order_relaxed);
+        const auto postOriginal = collectInputEvidence ? outputHash(output, frames) : 0;
         const bool observeSamples = input && output &&
             !g_runtime.inputOrderSamplesObserved.load(std::memory_order_acquire) &&
             g_runtime.trackChainProcessedBlocks.load(std::memory_order_relaxed) > 0 &&
@@ -2554,12 +2562,14 @@ int streamCallbackHook(const void *input, void *output, unsigned long frames,
         const float captureSample = observeSamples ? static_cast<const float *>(input)[0] : 0.0F;
         const float generatedSample = observeSamples ? static_cast<const float *>(output)[0] : 0.0F;
         if (processExternalInputInterleaved(view)) {
-            const auto postRoute = outputHash(output, frames);
+            const auto postRoute = collectInputEvidence ? outputHash(output, frames) : 0;
             g_runtime.inputAfterOriginalBlocks.fetch_add(1, std::memory_order_release);
             bool expected = false;
-            if (postOriginal != postRoute && g_runtime.inputOrderEvidenceClaimed.compare_exchange_strong(expected, true)) {
-                g_runtime.inputPostOriginalHash.store(postOriginal, std::memory_order_relaxed);
-                g_runtime.inputPostRouteHash.store(postRoute, std::memory_order_relaxed);
+            if (collectInputEvidence && g_runtime.inputOrderEvidenceClaimed.compare_exchange_strong(expected, true)) {
+                if (postOriginal != postRoute) {
+                    g_runtime.inputPostOriginalHash.store(postOriginal, std::memory_order_relaxed);
+                    g_runtime.inputPostRouteHash.store(postRoute, std::memory_order_relaxed);
+                }
             }
             // Copy one non-silent sample from this same callback. Never retain
             // borrowed device pointers; publish the tuple only after all stores.

@@ -227,6 +227,19 @@ Router::Result Router::processInterleaved(const InterleavedView &view) noexcept 
         interleavedMissingBlocks_.fetch_add(1, std::memory_order_relaxed);
         return result;
     }
+    // Fast path: a disabled/bypassed input chain must not pay the planar
+    // conversion cost. Preserve the host's generated output and return.
+    const bool active = enabled_.load(std::memory_order_acquire) &&
+        !bypassed_.load(std::memory_order_acquire) &&
+        streamRunning_.load(std::memory_order_acquire) &&
+        route_.load(std::memory_order_acquire) != Route::Disabled;
+    if (!active) {
+        captureBlocks_.fetch_add(1, std::memory_order_relaxed);
+        bypassBlocks_.fetch_add(1, std::memory_order_relaxed);
+        interleavedInputObserved_.store(true, std::memory_order_release);
+        observeLevel(CaptureView{});
+        return {true, true, false, false};
+    }
     if (!deinterleave(view.input, view.frameCount, view.inputChannelCount,
                       interleavedCaptureScratch_)) {
         interleavedMissingBlocks_.fetch_add(1, std::memory_order_relaxed);
@@ -236,14 +249,6 @@ Router::Result Router::processInterleaved(const InterleavedView &view) noexcept 
     interleavedInputObserved_.store(true, std::memory_order_release);
     const CaptureView originalCapture{interleavedCaptureScratch_.inputChannels(),
         view.inputChannelCount, view.frameCount, view.sampleRate, view.blockSize};
-    if (!enabled_.load(std::memory_order_acquire) || bypassed_.load(std::memory_order_acquire) ||
-        !streamRunning_.load(std::memory_order_acquire) ||
-        route_.load(std::memory_order_acquire) == Route::Disabled) {
-        observeLevel(originalCapture);
-        captureBlocks_.fetch_add(1, std::memory_order_relaxed);
-        bypassBlocks_.fetch_add(1, std::memory_order_relaxed);
-        return {true, true, false, false};
-    }
     const auto processingChannels = channelCapacity_;
     for (std::size_t channel = 0; channel < processingChannels; ++channel) {
         auto *destination = mixScratch_.inputChannels()[channel];

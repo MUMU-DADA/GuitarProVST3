@@ -70,6 +70,15 @@ int main(int argc, char **argv) {
         require(inputState.interleavedOutputWritten && inputState.interleavedCopyOperations == 2,
                 "input route copy evidence");
 
+        gpvst3::input::Router bypassRouter;
+        require(bypassRouter.prepare(2, 64), "prepare bypass router");
+        bypassRouter.setRoute(gpvst3::input::Route::InputInsert);
+        bypassRouter.setEnabled(false);
+        const auto bypassed = bypassRouter.processInterleaved(interleaved);
+        require(bypassed.completed && bypassed.bypassed &&
+                    bypassRouter.snapshot().interleavedCopyOperations == 0,
+                "bypass input fast path");
+
         std::ofstream out(artifact, std::ios::binary);
         require(out.good(), "open diagnostics artifact");
         out << "{\"startup_timeline\":{\"source\":\"fixture\",\"initialize_ms\":0,\"hook_ready_ms\":0,\"scan_scheduled_ms\":0,\"ui_ready_ms\":0},"

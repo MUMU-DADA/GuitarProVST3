@@ -384,7 +384,6 @@ QJsonObject initialize() {
         gpvst3::gp_audio::initialize();
         hook::prepare(host);
         g_hookReadyMs = startupElapsedMs();
-        hook::refreshTrackContext();
         ui::setRealtimeBypassControl(&hook::setTotalBypass);
         ui::setVst3SelectionControl(&hook::setGlobalVst3Selection);
         ui::setVst3SelectionRequestControl(&hook::requestGlobalVst3Selection);
@@ -409,18 +408,17 @@ QJsonObject initialize() {
     if (enabled) {
         vst3::setRecognitionControl(&vst3::identifyBundle);
         ui::setVst3DiscoveryControl([] { refreshCatalog(true); }, &identifyBundle);
-        auto *refreshTimer = new QTimer(QCoreApplication::instance());
-        refreshTimer->setInterval(60000);
-        QObject::connect(refreshTimer, &QTimer::timeout, refreshTimer, [] { refreshCatalog(); });
-        refreshTimer->start();
         auto *trackTimer = new QTimer(QCoreApplication::instance());
-        trackTimer->setInterval(250);
+        // Do not walk the host object tree during score opening. The first
+        // discovery starts after the UI has had time to present its frame;
+        // subsequent refreshes are only maintenance for host-side changes.
+        trackTimer->setInterval(1000);
         QObject::connect(trackTimer, &QTimer::timeout, trackTimer, [] {
             hook::refreshTrackContext();
             if (hook::consumeSelectionStateChanges()) ui::reloadVst3Selections();
             ui::refreshVst3TrackContext();
         });
-        trackTimer->start();
+        QTimer::singleShot(1500, trackTimer, [trackTimer] { trackTimer->start(); });
         vst3 = qEnvironmentVariable("GPVST3_RUN_LIFECYCLE_PROBE") == "1"
             ? vst3::prepare(host.supported) : vst3::beginAsync(host.supported);
         g_scanScheduledMs = startupElapsedMs();

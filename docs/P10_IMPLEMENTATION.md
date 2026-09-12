@@ -1,10 +1,12 @@
 # P10 实现记录
 
-状态：已完成代码与可重复验证（2026-09-12）
+状态：已完成代码与可重复验证；实机反馈表明仍需继续收敛（2026-09-12）
 关联计划：[P10：ASIO 实时链路、加载性能与音轨身份计划](P10_ASIO_LATENCY_INPUT_PLAN.md)
 基线：Guitar Pro 8.1.1.17 / Windows x64。
 
 ## 交付内容
+
+本轮修正：ASIO stream callback 在输入链关闭/旁路时提前返回，跳过原先每块必做的 interleaved→planar 转换；音轨上下文全量发现不再参与启动关键路径，首帧展示后延迟 1.5 秒才开始维护刷新。输入链现在默认启用并使用 `input_insert`；设置 `GPVST3_ENABLE_P4_INPUT=0` 或 `GPVST3_P4_ROUTE=disabled` 可显式关闭。
 
 | 范围 | 状态 | 实现与证据 |
 | --- | --- | --- |
