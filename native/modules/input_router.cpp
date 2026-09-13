@@ -277,7 +277,8 @@ Router::Result Router::processInterleaved(const InterleavedView &view) noexcept 
                   interleavedOutputScratch_.outputChannels()[channel] + view.frameCount,
                   0.0F);
     result = process(capture, generated, output);
-    observeLevel(originalCapture);
+    // process() already observes the same captured samples. Avoid a second
+    // full-block RMS/peak pass on the realtime callback.
     interleavedBlocks_.fetch_add(1, std::memory_order_relaxed);
     if (result.completed && interleave(interleavedOutputScratch_, view.output,
                                        view.frameCount, view.outputChannelCount))

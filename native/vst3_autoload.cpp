@@ -27,7 +27,17 @@ QString pluginPath() {
 
 void writeObservation() {
     const auto hook = gpvst3::bootstrap::hookSnapshot();
-    gpvst3::state::writeRealtimeObservation(hook);
+    // The hook snapshot is polled for diagnostics, but an unchanged snapshot
+    // does not need another QSaveFile replacement. This removes idle disk I/O
+    // while retaining an immediate write whenever counters or state change.
+    static QJsonObject lastHook;
+    static bool haveLastHook = false;
+    if (!haveLastHook || hook != lastHook) {
+        if (gpvst3::state::writeRealtimeObservation(hook)) {
+            lastHook = hook;
+            haveLastHook = true;
+        }
+    }
     if (auto *application = QCoreApplication::instance())
         QTimer::singleShot(250, application, &writeObservation);
 }

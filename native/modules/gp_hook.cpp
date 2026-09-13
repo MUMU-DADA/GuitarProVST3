@@ -2089,7 +2089,12 @@ void masterProcessHook(void *self, void *buffer, void *ticks, void *musicians,
                                                              std::memory_order_relaxed);
     g_runtime.masterLastSequence.store(sequence, std::memory_order_relaxed);
     g_runtime.masterLastBuffer.store(bufferAddress, std::memory_order_relaxed);
-    const auto before = bufferHash(buffer);
+    // Hashing a complete audio block is diagnostic only. Once the host write
+    // evidence has been captured, avoid paying for another full block scan on
+    // every realtime callback.
+    const bool needBufferHash = !g_runtime.bufferWriteObserved.load(std::memory_order_relaxed);
+    const bool needEffectHash = !g_runtime.effectWriteObserved.load(std::memory_order_relaxed);
+    const auto before = needBufferHash ? bufferHash(buffer) : 0;
     if (g_runtime.masterCalls.fetch_add(1, std::memory_order_relaxed) == 0) {
         g_runtime.masterThread.store(GetCurrentThreadId(), std::memory_order_relaxed);
     }
@@ -2108,7 +2113,7 @@ void masterProcessHook(void *self, void *buffer, void *ticks, void *musicians,
         float *outputs[2]{raw.channels[0], raw.channels[1]};
         const audio::BlockView block{inputs, nullptr, outputs, nullptr, channels, frames,
                                      rate > 0 ? rate : 44100.0, frames, buffer, sequence, true};
-        const auto effectBefore = bufferHash(buffer);
+        const auto effectBefore = needEffectHash ? bufferHash(buffer) : 0;
         const auto active = g_runtime.chain.snapshot().activeSlot;
         const bool selected = g_runtime.selectionPublished.load(std::memory_order_acquire);
         const auto configuredRate = active < 0 || selected ? 0 :
@@ -2132,10 +2137,11 @@ void masterProcessHook(void *self, void *buffer, void *ticks, void *musicians,
             g_runtime.globalChainProcessBlocks.fetch_add(1, std::memory_order_relaxed);
             g_runtime.effectProcessed.store(true, std::memory_order_relaxed);
         }
-        if (effectBefore != bufferHash(buffer) && !chainResult.bypassed)
+        if (needEffectHash && effectBefore != bufferHash(buffer) && !chainResult.bypassed)
             g_runtime.effectWriteObserved.store(true, std::memory_order_relaxed);
     }
-    if (before != bufferHash(buffer)) g_runtime.bufferWriteObserved.store(true, std::memory_order_relaxed);
+    if (needBufferHash && before != bufferHash(buffer))
+        g_runtime.bufferWriteObserved.store(true, std::memory_order_relaxed);
     g_inMasterHook = false;
 }
 
@@ -2410,17 +2416,19 @@ void dspProcessHook(void *self, void *buffer, void *scratch, void *ticks) {
     const audio::BlockView block{inputs, nullptr, outputs, nullptr,
                                  channels, frames, rate, frames, buffer,
                                  sequence, true};
-    const auto before = bufferHash(buffer);
+    const bool needTrackHash = trackRuntime->count.load(std::memory_order_acquire) != 0 &&
+        !trackRuntime->writeObserved.load(std::memory_order_relaxed);
+    const auto before = needTrackHash ? bufferHash(buffer) : 0;
     bool actuallyProcessed = false;
     const bool completed = trackRuntime->processBlock(block, &actuallyProcessed);
-    const auto after = bufferHash(buffer);
+    const auto after = needTrackHash ? bufferHash(buffer) : 0;
     if (completed && trackRuntime->count.load(std::memory_order_acquire) != 0) {
         g_runtime.trackChainProcessBlocks.fetch_add(1, std::memory_order_relaxed);
         if (actuallyProcessed) {
             g_runtime.trackChainProcessedBlocks.fetch_add(1, std::memory_order_relaxed);
             g_runtime.trackRuntimeProcessed.store(true, std::memory_order_release);
         }
-        if (before != after) {
+        if (needTrackHash && before != after) {
             trackRuntime->writeObserved.store(true, std::memory_order_release);
             g_runtime.trackRuntimeWriteObserved.store(true, std::memory_order_release);
         }
@@ -3108,7 +3116,11 @@ int streamCallbackHook(const void *input, void *output, unsigned long frames,
                                                               std::memory_order_relaxed);
     g_runtime.outputLastBuffer.store(outputAddress, std::memory_order_relaxed);
     g_runtime.outputCalls.fetch_add(1, std::memory_order_relaxed);
-    const auto before = outputHash(output, frames);
+    // Output hashes prove the callback writeback once. They are not part of
+    // audio processing, so stop scanning the realtime buffer after that
+    // evidence has been claimed.
+    const bool needOutputHashes = !g_runtime.outputEvidenceClaimed.load(std::memory_order_relaxed);
+    const auto before = needOutputHashes ? outputHash(output, frames) : 0;
     const auto result = original(input, output, frames, timeInfo, status, userData);
     const auto inputState = g_runtime.inputRouter.snapshot();
     portaudio::Configuration configuration;
@@ -3142,7 +3154,9 @@ int streamCallbackHook(const void *input, void *output, unsigned long frames,
             static_cast<std::size_t>(frames),
             userData, static_cast<std::uint64_t>(g_runtime.outputCalls.load(std::memory_order_relaxed)),
             input::InterleavedSampleFormat::Float32};
-        const auto postOriginal = outputHash(output, frames);
+        const bool needInputOrderHash =
+            !g_runtime.inputOrderEvidenceClaimed.load(std::memory_order_relaxed);
+        const auto postOriginal = needInputOrderHash ? outputHash(output, frames) : 0;
         const bool observeSamples = input && output &&
             !g_runtime.inputOrderSamplesObserved.load(std::memory_order_acquire) &&
             g_runtime.trackChainProcessedBlocks.load(std::memory_order_relaxed) > 0 &&
@@ -3150,10 +3164,11 @@ int streamCallbackHook(const void *input, void *output, unsigned long frames,
         const float captureSample = observeSamples ? static_cast<const float *>(input)[0] : 0.0F;
         const float generatedSample = observeSamples ? static_cast<const float *>(output)[0] : 0.0F;
         if (processExternalInputInterleaved(view)) {
-            const auto postRoute = outputHash(output, frames);
+            const auto postRoute = needInputOrderHash ? outputHash(output, frames) : 0;
             g_runtime.inputAfterOriginalBlocks.fetch_add(1, std::memory_order_release);
             bool expected = false;
-            if (postOriginal != postRoute && g_runtime.inputOrderEvidenceClaimed.compare_exchange_strong(expected, true)) {
+            if (needInputOrderHash && postOriginal != postRoute &&
+                g_runtime.inputOrderEvidenceClaimed.compare_exchange_strong(expected, true)) {
                 g_runtime.inputPostOriginalHash.store(postOriginal, std::memory_order_relaxed);
                 g_runtime.inputPostRouteHash.store(postRoute, std::memory_order_relaxed);
             }
@@ -3169,9 +3184,9 @@ int streamCallbackHook(const void *input, void *output, unsigned long frames,
             }
         }
     }
-    const auto after = outputHash(output, frames);
+    const auto after = needOutputHashes ? outputHash(output, frames) : 0;
     g_runtime.outputObserved.store(output != nullptr && frames != 0, std::memory_order_release);
-    if (before != after) {
+    if (needOutputHashes && before != after) {
         bool expected = false;
         if (g_runtime.outputEvidenceClaimed.compare_exchange_strong(
                 expected, true, std::memory_order_acq_rel)) {

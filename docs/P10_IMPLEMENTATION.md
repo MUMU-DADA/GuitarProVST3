@@ -17,6 +17,12 @@
 - 保留 P10 已有的 selection generation、准备/提交时间戳、首个处理 callback 和 bypass 观测字段。
 - `editor_stage` 和 `editor_result_code` 覆盖 `create_view`、`platform_check`、`set_frame`、`get_size`、`attached`、`visible`、`removed`、`failed` 等阶段；失败仍保持中性 UI 文案。
 
+### 性能维护
+
+- Master、track 和 PortAudio 回调中的整块 hash 只在对应写回证据尚未取得时执行；证据确认后不再重复扫描实时缓冲区。
+- live-input 路径移除重复的整块 RMS/peak 扫描；`process()` 保留唯一一次电平观测。
+- `p2-observation.json` 在 hook 快照未变化时不再重复替换写盘；退出时仍执行一次最终写入。
+
 ### 异步审计修复
 
 - `RuntimePlugFrame::resizeView` 的重入标志改为原子状态，避免多个 editor 回调同时调整窗口时发生数据竞争。

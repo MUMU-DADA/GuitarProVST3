@@ -90,6 +90,7 @@ git diff --check
 
 - [安装与使用](docs/INSTALL.md)
 - [实时实现总览](docs/REALTIME_IMPLEMENTATION_PLAN.md)
+- [运行逻辑与介入逻辑总图](docs/PLUGIN_RUNTIME_AND_INTERVENTION.md)
 - [P8 范围与验收](docs/P8_TRACK_GLOBAL_VST3_PLAN.md)
 - [P8 实现记录](docs/P8_IMPLEMENTATION.md)
 - [P9 体验与稳定性计划](docs/P9_AUDIO_SWITCH_UI_PLAN.md)
