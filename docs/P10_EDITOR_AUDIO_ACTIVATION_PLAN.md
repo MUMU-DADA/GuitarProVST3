@@ -1,8 +1,8 @@
 # P10：VST3 原生 UI 与首次启停音频生效优化计划
 
-状态：已实施并完成夹具、Qt/HWND 与 MCP 宿主回归（2026-09-13）
+状态：已实施并完成夹具、Qt/HWND 与真实 Mateus MCP 宿主回归（目标版本 `v0.9.8`，2026-09-13）
 关联记录：[P9 实现记录](P9_IMPLEMENTATION.md)、[实时实现总览](REALTIME_IMPLEMENTATION_PLAN.md)
-基线：Guitar Pro 8.1.1.17 / Windows x64 / 当前 `v0.9.6` 工作树。
+基线：Guitar Pro 8.1.1.17 / Windows x64 / `v0.9.7` 验收修正后的 `v0.9.8` 工作树。
 
 本计划根据真实使用反馈重新制定，处理两个相互关联但验收标准不同的问题：
 

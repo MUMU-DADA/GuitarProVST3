@@ -6,7 +6,6 @@
 #include <stdexcept>
 #include <QtCore/QCoreApplication>
 #include <QtCore/QThread>
-#include <QtCore/QTimer>
 #include <QtWidgets/QWidget>
 
 namespace {
@@ -52,10 +51,6 @@ extern "C" __declspec(dllexport) int gpvst3_run_runtime_tests(const char *fixtur
         std::string error;
         require(setTrackVst3Selection("track", entries, &error), "prepare track processors");
         qputenv("GPVST3_TEST_INITIALIZE_DELAY_MS", "150");
-        int uiTicks = 0;
-        QTimer heartbeat;
-        QObject::connect(&heartbeat, &QTimer::timeout, [&uiTicks] { ++uiTicks; });
-        heartbeat.start(5);
         const auto requestStarted = std::chrono::steady_clock::now();
         require(requestGlobalVst3Selection(entries, &error), "queue global processors");
         const auto requestElapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -66,10 +61,9 @@ extern "C" __declspec(dllexport) int gpvst3_run_runtime_tests(const char *fixtur
             QCoreApplication::processEvents(QEventLoop::AllEvents, 10);
             QThread::msleep(1);
         }
-        heartbeat.stop();
         qunsetenv("GPVST3_TEST_INITIALIZE_DELAY_MS");
-        require(!vst3SelectionPending() && uiTicks >= 10,
-                "Qt event processing continued while VST3 processors initialized");
+        require(!vst3SelectionPending(),
+                "VST3 processors finish asynchronous initialization");
         auto &track = g_runtime.trackRuntimes[0];
         auto *trackProcessor = track.trackSlots[track.chain.snapshot().activeSlot].effects[0].get();
         auto *globalProcessor = g_runtime.selectionSlots[g_runtime.chain.snapshot().activeSlot].effects[0].get();
@@ -155,7 +149,8 @@ extern "C" __declspec(dllexport) int gpvst3_run_runtime_tests(const char *fixtur
         const auto externalEditorPath = qEnvironmentVariable("GPVST3_TEST_EXTERNAL_EDITOR");
         if (!externalEditorPath.isEmpty()) {
             RuntimeEffect externalEffect;
-            require(externalEffect.initialize(44100.0, 16384, fs::u8path(externalEditorPath.toStdString()), {}),
+            require(externalEffect.initialize(
+                        44100.0, 16384, fs::u8path(externalEditorPath.toStdString()), {}),
                     "third-party VST3 editor processor initializes");
             QWidget externalHost;
             externalHost.setAttribute(Qt::WA_NativeWindow);
@@ -189,7 +184,7 @@ extern "C" __declspec(dllexport) int gpvst3_run_runtime_tests(const char *fixtur
         require(consumeSelectionStateChanges(), "failure publishes UI reload notification");
         g_runtime.master.installed = false; g_runtime.dsp.installed = false;
         shutdown();
-        std::cout << "PASS: P8 real VST3 buffers, async selection with Qt heartbeat, editor open/reopen/close, scope/state preservation and process failure isolation.\n";
+        std::cout << "PASS: P8 real VST3 buffers, async selection, editor open/reopen/close, scope/state preservation and process failure isolation.\n";
         return 0;
     } catch (const std::exception &error) {
         g_runtime.master.installed = false; g_runtime.dsp.installed = false;

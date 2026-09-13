@@ -2,6 +2,7 @@
 
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+#include <objbase.h>
 #undef max
 #undef min
 
@@ -13,6 +14,8 @@
 #include <cstdint>
 #include <cstring>
 #include <filesystem>
+#include <functional>
+#include <cstdio>
 #include <mutex>
 #include <condition_variable>
 #include <string>
@@ -32,6 +35,7 @@
 #include <QtCore/QCoreApplication>
 #include <QtCore/QMetaObject>
 #include <QtCore/QThread>
+#include <QtCore/QEventLoop>
 #include "portaudio_capture_abi.h"
 #include "pluginterfaces/base/funknownimpl.h"
 #include "pluginterfaces/base/ipluginbase.h"
@@ -66,6 +70,23 @@ using SteadyClock = std::chrono::steady_clock;
 std::uint64_t steadyNanoseconds() noexcept {
     return static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
         SteadyClock::now().time_since_epoch()).count());
+}
+
+// Optional trace for diagnosing a third-party editor that blocks the host
+// thread. It is enabled only when GPVST3_EDITOR_TRACE is set and writes a
+// flushed line before/after each VST3 editor contract call.
+void editorTrace(const char *event) noexcept {
+    const char *enabled = std::getenv("GPVST3_EDITOR_TRACE");
+    const char *directory = std::getenv("GPVST3_DATA_DIR");
+    if (!enabled || std::strcmp(enabled, "1") != 0 || !directory || !*directory || !event) return;
+    const auto path = std::string(directory) + "\\editor-trace.log";
+    FILE *file = nullptr;
+    if (fopen_s(&file, path.c_str(), "ab") != 0 || !file) return;
+    std::fprintf(file, "%llu tid=%lu %s\n",
+                 static_cast<unsigned long long>(steadyNanoseconds()),
+                 static_cast<unsigned long>(GetCurrentThreadId()), event);
+    std::fflush(file);
+    fclose(file);
 }
 
 constexpr char kMasterProcess[] =
@@ -184,6 +205,7 @@ private:
 
 bool succeeded(tresult result) noexcept;
 bool onQtThread() noexcept;
+bool invokeOnQtThreadBlocking(const std::function<void()> &callback) noexcept;
 
 class RuntimePlugFrame final
     : public Steinberg::U::Implements<Steinberg::U::Directly<Steinberg::IPlugFrame>> {
@@ -191,14 +213,18 @@ public:
     explicit RuntimePlugFrame(HWND hostWindow) : hostWindow_(hostWindow) {}
     Steinberg::tresult PLUGIN_API resizeView(Steinberg::IPlugView *view,
                                              ViewRect *newSize) override {
-        if (!onQtThread()) return Steinberg::kResultFalse;
         if (!newSize || !hostWindow_ || !IsWindow(hostWindow_)) return Steinberg::kInvalidArgument;
         if (resizing_) return Steinberg::kResultTrue;
         resizing_ = true;
         const int width = (std::max)(1, newSize->getWidth());
         const int height = (std::max)(1, newSize->getHeight());
         try {
-            gpvst3::ui::resizeNativeEditor(reinterpret_cast<void *>(hostWindow_), width, height);
+            if (!invokeOnQtThreadBlocking([&] {
+                    gpvst3::ui::resizeNativeEditor(reinterpret_cast<void *>(hostWindow_), width, height);
+                })) {
+                resizing_ = false;
+                return Steinberg::kResultFalse;
+            }
         } catch (...) {
             resizing_ = false;
             return Steinberg::kResultFalse;
@@ -221,6 +247,29 @@ bool succeeded(tresult result) noexcept {
 bool onQtThread() noexcept {
     const auto *application = QCoreApplication::instance();
     return application && QThread::currentThread() == application->thread();
+}
+
+// VST3 processors may be prepared by the selection worker, but a number of
+// controllers (including Neural DSP products) require their initialize and
+// editor contracts to stay on the host Qt thread. Keep the blocking hop on the
+// control path; never use it from an audio callback.
+bool invokeOnQtThreadBlocking(const std::function<void()> &callback) noexcept {
+    if (!callback) return false;
+    if (onQtThread()) {
+        try { callback(); } catch (...) { return false; }
+        return true;
+    }
+    auto *application = QCoreApplication::instance();
+    if (!application) return false;
+    bool callbackFailed = false;
+    try {
+        return QMetaObject::invokeMethod(
+            application, [&callback, &callbackFailed] {
+                try { callback(); } catch (...) { callbackFailed = true; }
+            }, Qt::BlockingQueuedConnection) && !callbackFailed;
+    } catch (...) {
+        return false;
+    }
 }
 
 class RuntimeHostApplication final
@@ -298,6 +347,13 @@ struct RuntimeEffect {
     IPtr<Steinberg::IPlugView> editor;
     IPtr<IComponentHandler> componentHandler;
     IPtr<Steinberg::IPlugFrame> plugFrame;
+    std::thread editorThread;
+    std::mutex editorThreadMutex;
+    std::condition_variable editorThreadCv;
+    bool editorThreadStop = false;
+    bool editorThreadReady = false;
+    bool editorThreadSucceeded = false;
+    QEventLoop *editorCloseLoop = nullptr;
     vst3::ParameterChanges parameterChanges;
     Vst3SelectionEntry identity;
     FUnknownPtr<Steinberg::Vst::IConnectionPoint> componentConnection;
@@ -333,12 +389,18 @@ struct RuntimeEffect {
 
     void shutdown() noexcept {
         ready.store(false, std::memory_order_release);
-        if (editor && !onQtThread()) {
+        bool hasEditor = false;
+        {
+            std::lock_guard<std::mutex> lock(editorThreadMutex);
+            hasEditor = static_cast<bool>(editor) || editorAttached.load(std::memory_order_acquire) ||
+                editorThread.joinable();
+        }
+        if (hasEditor && !onQtThread()) {
             auto *application = QCoreApplication::instance();
             if (application) {
                 const bool invoked = QMetaObject::invokeMethod(
                     application, [this] { closeEditor(); }, Qt::BlockingQueuedConnection);
-                if (!invoked && editor) closeEditor();
+                if (!invoked) closeEditor();
             } else {
                 closeEditor();
             }
@@ -444,87 +506,120 @@ struct RuntimeEffect {
         }
         name = selected.name;
         identity = saved ? *saved : Vst3SelectionEntry{path.u8string(), uidString(selected.cid)};
-        IComponent *rawComponent = nullptr;
-        if (!succeeded(factory->createInstance(selected.cid, IComponent::iid,
-                                               reinterpret_cast<void **>(&rawComponent))) || !rawComponent) {
-            error = "runtime_vst3_component_failed";
-            return false;
-        }
-        component = Steinberg::owned(rawComponent);
         auto *hostUnknown = static_cast<Steinberg::FUnknown *>(
             static_cast<Steinberg::Vst::IHostApplication *>(&host));
-        if (auto factory3 = FUnknownPtr<Steinberg::IPluginFactory3>(factory.get()))
-            factory3->setHostContext(hostUnknown);
-        if (!succeeded(component->initialize(hostUnknown))) {
-            error = "runtime_vst3_component_initialize_failed";
-            return false;
-        }
-        for (int direction = Steinberg::Vst::kInput; direction <= Steinberg::Vst::kOutput; ++direction) {
-            const auto count = component->getBusCount(Steinberg::Vst::kAudio, direction);
-            for (Steinberg::int32 index = 0; index < count; ++index) {
-                Steinberg::Vst::BusInfo bus{};
-                if (succeeded(component->getBusInfo(Steinberg::Vst::kAudio, direction, index, bus)) &&
-                    ((bus.flags & Steinberg::Vst::BusInfo::kDefaultActive) || index == 0))
-                    component->activateBus(Steinberg::Vst::kAudio, direction, index, true);
-            }
-        }
         Steinberg::MemoryStream componentState;
-        const bool componentStateReady = succeeded(component->getState(&componentState));
-        if (componentStateReady) {
-            componentState.seek(0, Steinberg::IBStream::kIBSeekSet, nullptr);
-            component->setState(&componentState);
+        bool componentStateReady = false;
+        bool componentSetupCompleted = false;
+        // Neural DSP's component creates Qt objects during initialize.  A
+        // selection worker is deliberately used for the expensive request,
+        // but the plug-in object must be created and initialized on the real
+        // Qt thread; otherwise its later HWND editor is permanently stuck in
+        // attached().  The blocking hop keeps Guitar Pro's event loop alive
+        // while the worker waits for preparation.
+        const bool componentSetupInvoked = invokeOnQtThreadBlocking([&] {
+            IComponent *rawComponent = nullptr;
+            if (!succeeded(factory->createInstance(selected.cid, IComponent::iid,
+                                                   reinterpret_cast<void **>(&rawComponent))) || !rawComponent) {
+                error = "runtime_vst3_component_failed";
+                componentSetupCompleted = true;
+                return;
+            }
+            component = Steinberg::owned(rawComponent);
+            if (auto factory3 = FUnknownPtr<Steinberg::IPluginFactory3>(factory.get()))
+                factory3->setHostContext(hostUnknown);
+            if (!succeeded(component->initialize(hostUnknown))) {
+                error = "runtime_vst3_component_initialize_failed";
+                componentSetupCompleted = true;
+                return;
+            }
+            for (int direction = Steinberg::Vst::kInput; direction <= Steinberg::Vst::kOutput; ++direction) {
+                const auto count = component->getBusCount(Steinberg::Vst::kAudio, direction);
+                for (Steinberg::int32 index = 0; index < count; ++index) {
+                    Steinberg::Vst::BusInfo bus{};
+                    if (succeeded(component->getBusInfo(Steinberg::Vst::kAudio, direction, index, bus)) &&
+                        ((bus.flags & Steinberg::Vst::BusInfo::kDefaultActive) || index == 0))
+                        component->activateBus(Steinberg::Vst::kAudio, direction, index, true);
+                }
+            }
+            componentStateReady = succeeded(component->getState(&componentState));
+            if (componentStateReady) {
+                componentState.seek(0, Steinberg::IBStream::kIBSeekSet, nullptr);
+                component->setState(&componentState);
+            }
+            componentSetupCompleted = true;
+        });
+        if (!componentSetupInvoked || !componentSetupCompleted) {
+            if (error.empty()) error = "runtime_vst3_component_ui_thread_unavailable";
+            return false;
         }
         processor = FUnknownPtr<IAudioProcessor>(component.get());
         if (!processor) {
             error = "runtime_vst3_processor_missing";
             return false;
         }
-        // Initialize the optional controller before activating the component.
-        // This is the same lifecycle order used by the metadata probe and by
-        // controllers that reject initialization after processing starts.
-        TUID controllerClassId{};
-        if (succeeded(component->getControllerClassId(controllerClassId))) {
-            IEditController *rawController = nullptr;
-            if (succeeded(factory->createInstance(controllerClassId, IEditController::iid,
-                                                  reinterpret_cast<void **>(&rawController))) &&
-                rawController)
-                controller = Steinberg::owned(rawController);
-        }
-        const bool separateController = static_cast<bool>(controller);
-        if (!controller) controller = FUnknownPtr<IEditController>(component.get());
-        if (!controller) {
-            editorError = "runtime_vst3_controller_create_failed";
-        } else {
+        // The processor may be prepared on the selection worker, while the
+        // controller is a UI object for many commercial plug-ins. Create and
+        // initialize it on the Qt thread so createView/attached later sees the
+        // same thread affinity that the plug-in established during startup.
+        bool controllerSetupCompleted = false;
+        bool controllerSetupInvoked = invokeOnQtThreadBlocking([&] {
+            TUID controllerClassId{};
+            if (succeeded(component->getControllerClassId(controllerClassId))) {
+                IEditController *rawController = nullptr;
+                if (succeeded(factory->createInstance(controllerClassId, IEditController::iid,
+                                                      reinterpret_cast<void **>(&rawController))) &&
+                    rawController)
+                    controller = Steinberg::owned(rawController);
+            }
+            const bool separateController = static_cast<bool>(controller);
+            if (!controller) controller = FUnknownPtr<IEditController>(component.get());
+            if (!controller) {
+                editorError = "runtime_vst3_controller_create_failed";
+                controllerSetupCompleted = true;
+                return;
+            }
             auto handler = Steinberg::owned(new RuntimeComponentHandler(this));
             // Single-component plug-ins already initialized their controller
             // through IComponent. Reinitializing returns kResultFalse.
             const auto controllerInit = separateController ? controller->initialize(hostUnknown)
                                                            : Steinberg::kResultOk;
             separateControllerInitialized = separateController && succeeded(controllerInit);
-            if (succeeded(controllerInit)) {
-                if (handler && succeeded(controller->setComponentHandler(handler.get()))) {
-                    componentHandler = std::move(handler);
-                    if (separateController) {
-                        componentConnection = FUnknownPtr<Steinberg::Vst::IConnectionPoint>(component.get());
-                        controllerConnection = FUnknownPtr<Steinberg::Vst::IConnectionPoint>(controller.get());
-                        if (componentConnection && controllerConnection) {
-                            componentConnection->connect(controllerConnection);
-                            controllerConnection->connect(componentConnection);
-                        }
-                    }
-                    if (componentStateReady) {
-                        componentState.seek(0, Steinberg::IBStream::kIBSeekSet, nullptr);
-                        controller->setComponentState(&componentState);
-                    }
-                } else {
-                    editorError = "runtime_vst3_component_handler_failed";
-                }
-            } else {
+            if (!succeeded(controllerInit)) {
                 controller = nullptr;
                 editorError = "runtime_vst3_controller_initialize_failed_" +
                     std::to_string(static_cast<long>(controllerInit));
+                controllerSetupCompleted = true;
+                return;
             }
+            if (handler && succeeded(controller->setComponentHandler(handler.get()))) {
+                componentHandler = std::move(handler);
+                if (separateController) {
+                    componentConnection = FUnknownPtr<Steinberg::Vst::IConnectionPoint>(component.get());
+                    controllerConnection = FUnknownPtr<Steinberg::Vst::IConnectionPoint>(controller.get());
+                    if (componentConnection && controllerConnection) {
+                        componentConnection->connect(controllerConnection);
+                        controllerConnection->connect(componentConnection);
+                    }
+                }
+                if (componentStateReady) {
+                    componentState.seek(0, Steinberg::IBStream::kIBSeekSet, nullptr);
+                    controller->setComponentState(&componentState);
+                }
+            } else {
+                editorError = "runtime_vst3_component_handler_failed";
+            }
+            controllerSetupCompleted = true;
+        });
+        if (!controllerSetupInvoked) {
+            error = "runtime_vst3_controller_ui_thread_unavailable";
+            return false;
         }
+        if (!controllerSetupCompleted) {
+            error = "runtime_vst3_controller_initialize_failed";
+            return false;
+        }
+        if (!controller && !editorError.empty()) error = editorError;
         if (!parameterChanges.prepare(controller.get())) {
             error = "runtime_vst3_parameter_setup_failed";
             return false;
@@ -566,14 +661,29 @@ struct RuntimeEffect {
         if (!saved.componentState.empty()) {
             Steinberg::MemoryStream stream(const_cast<unsigned char *>(saved.componentState.data()),
                                            saved.componentState.size());
-            if (!restored(component->setState(&stream), "component")) return false;
+            tresult componentResult = Steinberg::kNoInterface;
+            if (!invokeOnQtThreadBlocking([&] {
+                    stream.seek(0, Steinberg::IBStream::kIBSeekSet, nullptr);
+                    componentResult = component ? component->setState(&stream) : Steinberg::kNoInterface;
+                })) {
+                error = "runtime_vst3_state_restore_failed:component_ui_thread";
+                return false;
+            }
+            if (!restored(componentResult, "component")) return false;
             stream.seek(0, Steinberg::IBStream::kIBSeekSet, nullptr);
             if (controller) {
                 // Some controllers rely on the component's state and do not
                 // implement a separate component-state copy (e.g. Mateus Asato).
                 // Keep genuine restore failures fatal; kNotImplemented alone
                 // does not invalidate the component state restored above.
-                const auto copied = controller->setComponentState(&stream);
+                tresult copied = Steinberg::kNotImplemented;
+                if (!invokeOnQtThreadBlocking([&] {
+                        stream.seek(0, Steinberg::IBStream::kIBSeekSet, nullptr);
+                        copied = controller->setComponentState(&stream);
+                    })) {
+                    error = "runtime_vst3_state_restore_failed:component_controller_ui_thread";
+                    return false;
+                }
                 if (copied != Steinberg::kNotImplemented && !restored(copied, "component_controller"))
                     return false;
             }
@@ -581,8 +691,15 @@ struct RuntimeEffect {
         if (!saved.controllerState.empty()) {
             Steinberg::MemoryStream stream(const_cast<unsigned char *>(saved.controllerState.data()),
                                            saved.controllerState.size());
-            if (!restored(controller ? controller->setState(&stream) : Steinberg::kNoInterface,
-                          "controller")) return false;
+            tresult result = Steinberg::kNoInterface;
+            if (controller && !invokeOnQtThreadBlocking([&] {
+                    stream.seek(0, Steinberg::IBStream::kIBSeekSet, nullptr);
+                    result = controller->setState(&stream);
+                })) {
+                error = "runtime_vst3_state_restore_failed:controller_ui_thread";
+                return false;
+            }
+            if (!restored(result, "controller")) return false;
         }
         return true;
     }
@@ -610,6 +727,7 @@ struct RuntimeEffect {
     }
 
     bool openEditor(HWND parentWindow) noexcept {
+        editorTrace("open.begin");
         setEditorStage(EditorStage::Requested);
         if (!onQtThread()) {
             editorError = "editor_ui_thread_required";
@@ -626,7 +744,13 @@ struct RuntimeEffect {
             setEditorStage(EditorStage::Failed, Steinberg::kInvalidArgument);
             return false;
         }
-        if (editor && editorAttached.load(std::memory_order_acquire) && editorParent == parentWindow) {
+        bool alreadyAttached = false;
+        {
+            std::lock_guard<std::mutex> lock(editorThreadMutex);
+            alreadyAttached = static_cast<bool>(editor) &&
+                editorAttached.load(std::memory_order_acquire) && editorParent == parentWindow;
+        }
+        if (alreadyAttached) {
             try {
                 setEditorStage(EditorStage::Focus);
                 const auto focused = editor->onFocus(true);
@@ -639,57 +763,170 @@ struct RuntimeEffect {
             return true;
         }
         try {
+            editorTrace("open.close.before");
             closeEditor();
+            editorTrace("open.close.after");
+            // Commercial editors can perform a long native/UI bootstrap in
+            // createView or attached. Keep those calls off Guitar Pro's Qt
+            // thread while a nested event loop keeps the host responsive.
             setEditorStage(EditorStage::CreateView);
-            Steinberg::IPlugView *rawView = controller->createView("editor");
-            if (!rawView) {
-                editorError = "editor_view_unavailable";
-                setEditorStage(EditorStage::Failed, Steinberg::kNoInterface);
+            const auto contentScale = gpvst3::ui::nativeEditorScale(
+                reinterpret_cast<void *>(parentWindow));
+            {
+                std::lock_guard<std::mutex> lock(editorThreadMutex);
+                editorThreadStop = false;
+                editorThreadReady = false;
+                editorThreadSucceeded = false;
+            }
+            QEventLoop loop;
+            editorThread = std::thread([this, parentWindow, contentScale, &loop] {
+                struct ComApartment {
+                    HRESULT result = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+                    ~ComApartment() { if (SUCCEEDED(result)) CoUninitialize(); }
+                } comApartment;
+                Steinberg::IPtr<Steinberg::IPlugView> workerEditor;
+                Steinberg::IPtr<Steinberg::IPlugFrame> workerFrame;
+                ViewRect workerRect{};
+                tresult workerResult = Steinberg::kResultFalse;
+                std::string workerError;
+                try {
+                    editorTrace("create_view.before");
+                    auto *rawView = controller->createView("editor");
+                    editorTrace(rawView ? "create_view.after.ok" : "create_view.after.null");
+                    if (!rawView) {
+                        workerError = "editor_view_unavailable";
+                        setEditorStage(EditorStage::Failed, Steinberg::kNoInterface);
+                    } else {
+                        workerEditor = Steinberg::owned(rawView);
+                        setEditorStage(EditorStage::PlatformCheck);
+                        editorTrace("platform.before");
+                        const auto platformResult = workerEditor->isPlatformTypeSupported(
+                            Steinberg::kPlatformTypeHWND);
+                        editorTrace("platform.after");
+                        if (!succeeded(platformResult)) {
+                            workerError = "editor_hwnd_unsupported";
+                            workerResult = platformResult;
+                            setEditorStage(EditorStage::Failed, platformResult);
+                        } else {
+                            workerFrame = Steinberg::owned(new RuntimePlugFrame(parentWindow));
+                            setEditorStage(EditorStage::SetFrame);
+                            editorTrace("set_frame.before");
+                            const auto frameResult = workerFrame
+                                ? workerEditor->setFrame(workerFrame.get()) : Steinberg::kOutOfMemory;
+                            editorTrace("set_frame.after");
+                            if (!workerFrame || !succeeded(frameResult)) {
+                                workerError = "editor_frame_failed";
+                                workerResult = frameResult;
+                                setEditorStage(EditorStage::Failed, frameResult);
+                            } else {
+                                if (auto scale = FUnknownPtr<Steinberg::IPlugViewContentScaleSupport>(
+                                        workerEditor.get())) {
+                                    editorTrace("scale.before");
+                                    scale->setContentScaleFactor(static_cast<float>(contentScale));
+                                    editorTrace("scale.after");
+                                }
+                                setEditorStage(EditorStage::GetSize);
+                                editorTrace("get_size.before");
+                                const auto sizeResult = workerEditor->getSize(&workerRect);
+                                editorTrace("get_size.after");
+                                if (!succeeded(sizeResult)) workerRect = ViewRect(0, 0, 420, 260);
+                                if (!invokeOnQtThreadBlocking([&] {
+                                        gpvst3::ui::resizeNativeEditor(
+                                            reinterpret_cast<void *>(parentWindow),
+                                            workerRect.getWidth(), workerRect.getHeight());
+                                    })) {
+                                    workerError = "editor_host_resize_failed";
+                                    workerResult = Steinberg::kResultFalse;
+                                    setEditorStage(EditorStage::Failed, workerResult);
+                                } else {
+                                    setEditorStage(EditorStage::Attached);
+                                    editorTrace("attached.before");
+                                    workerResult = workerEditor->attached(
+                                        reinterpret_cast<void *>(parentWindow), Steinberg::kPlatformTypeHWND);
+                                    editorTrace("attached.after");
+                                    if (!succeeded(workerResult)) {
+                                        workerError = "editor_attach_failed";
+                                        setEditorStage(EditorStage::Failed, workerResult);
+                                    } else {
+                                        editorTrace("on_size.before");
+                                        workerEditor->onSize(&workerRect);
+                                        editorTrace("on_size.after");
+                                    }
+                                }
+                            }
+                        }
+                    }
+                } catch (...) {
+                    workerError = "editor_exception";
+                    setEditorStage(EditorStage::Failed);
+                    editorTrace("open.exception");
+                }
+                const bool succeededAttach = workerError.empty() && workerEditor && succeeded(workerResult);
+                {
+                    std::lock_guard<std::mutex> lock(editorThreadMutex);
+                    editorThreadReady = true;
+                    editorThreadSucceeded = succeededAttach;
+                    if (succeededAttach) {
+                        editor = workerEditor;
+                        plugFrame = workerFrame;
+                        editorParent = parentWindow;
+                        editorAttached.store(true, std::memory_order_release);
+                    } else {
+                        editorError = workerError.empty() ? "editor_attach_failed" : workerError;
+                        if (workerResult == Steinberg::kResultFalse)
+                            setEditorStage(EditorStage::Failed, workerResult);
+                    }
+                }
+                if (succeededAttach) {
+                    QMetaObject::invokeMethod(&loop, [&loop] { loop.quit(); }, Qt::QueuedConnection);
+                    std::unique_lock<std::mutex> lock(editorThreadMutex);
+                    editorThreadCv.wait(lock, [this] { return editorThreadStop; });
+                    lock.unlock();
+                    if (parentWindow && IsWindow(parentWindow)) {
+                        editorTrace("removed.before");
+                        try { workerEditor->removed(); } catch (...) {}
+                        editorTrace("removed.after");
+                        editorTrace("clear_frame.before");
+                        try { workerEditor->setFrame(nullptr); } catch (...) {}
+                        editorTrace("clear_frame.after");
+                    } else {
+                        editorTrace("removed.skip_host_closed");
+                    }
+                    workerFrame = nullptr;
+                    workerEditor = nullptr;
+                    std::lock_guard<std::mutex> clearLock(editorThreadMutex);
+                    editor = nullptr;
+                    plugFrame = nullptr;
+                    editorAttached.store(false, std::memory_order_release);
+                    if (editorCloseLoop) {
+                        auto *closeLoop = editorCloseLoop;
+                        QMetaObject::invokeMethod(closeLoop, [closeLoop] { closeLoop->quit(); },
+                                                  Qt::QueuedConnection);
+                    }
+                } else {
+                    try { if (workerEditor) workerEditor->setFrame(nullptr); } catch (...) {}
+                    workerEditor = nullptr;
+                    workerFrame = nullptr;
+                    QMetaObject::invokeMethod(&loop, [&loop] { loop.quit(); }, Qt::QueuedConnection);
+                }
+            });
+            loop.exec();
+            bool workerSucceeded = false;
+            {
+                std::lock_guard<std::mutex> lock(editorThreadMutex);
+                workerSucceeded = editorThreadReady && editorThreadSucceeded;
+            }
+            if (!workerSucceeded) {
+                if (editorThread.joinable()) editorThread.join();
+                if (editorError.empty()) editorError = "editor_attach_failed";
                 return false;
             }
-            editor = Steinberg::owned(rawView);
-            setEditorStage(EditorStage::PlatformCheck);
-            const auto platformResult = editor->isPlatformTypeSupported(Steinberg::kPlatformTypeHWND);
-            if (!succeeded(platformResult)) {
-                editor = nullptr;
-                editorError = "editor_hwnd_unsupported";
-                setEditorStage(EditorStage::Failed, platformResult);
-                return false;
-            }
-            auto frame = Steinberg::owned(new RuntimePlugFrame(parentWindow));
-            setEditorStage(EditorStage::SetFrame);
-            const auto frameResult = frame ? editor->setFrame(frame.get()) : Steinberg::kOutOfMemory;
-            if (!frame || !succeeded(frameResult)) {
-                editor = nullptr;
-                editorError = "editor_frame_failed";
-                setEditorStage(EditorStage::Failed, frameResult);
-                return false;
-            }
-            if (auto scale = FUnknownPtr<Steinberg::IPlugViewContentScaleSupport>(editor.get()))
-                scale->setContentScaleFactor(static_cast<float>(gpvst3::ui::nativeEditorScale(reinterpret_cast<void *>(parentWindow))));
-            ViewRect rect{};
-            setEditorStage(EditorStage::GetSize);
-            const auto sizeResult = editor->getSize(&rect);
-            if (!succeeded(sizeResult)) rect = ViewRect(0, 0, 420, 260);
-            gpvst3::ui::resizeNativeEditor(reinterpret_cast<void *>(parentWindow), rect.getWidth(), rect.getHeight());
-            setEditorStage(EditorStage::Attached);
-            const auto attachedResult = editor->attached(reinterpret_cast<void *>(parentWindow),
-                                                         Steinberg::kPlatformTypeHWND);
-            if (!succeeded(attachedResult)) {
-                editor->setFrame(nullptr);
-                editor = nullptr;
-                editorError = "editor_attach_failed";
-                setEditorStage(EditorStage::Failed, attachedResult);
-                return false;
-            }
-            plugFrame = std::move(frame);
-            editorParent = parentWindow;
-            editorAttached.store(true, std::memory_order_release);
-            editor->onSize(&rect);
             setEditorStage(EditorStage::Visible);
+            editorTrace("open.visible");
             editorError.clear();
             return true;
         } catch (...) {
+            editorTrace("open.exception");
             closeEditor();
             editorError = "editor_exception";
             setEditorStage(EditorStage::Failed);
@@ -698,17 +935,38 @@ struct RuntimeEffect {
     }
 
     void closeEditor() noexcept {
-        editorParent = nullptr;
-        if (editor) {
-            const bool attached = editorAttached.exchange(false, std::memory_order_acq_rel);
-            if (attached) {
-                setEditorStage(EditorStage::Removed);
-                try { editor->removed(); } catch (...) {}
-            }
-            try { editor->setFrame(nullptr); } catch (...) {}
-            editor = nullptr;
+        std::thread threadToJoin;
+        bool hadEditor = false;
+        QEventLoop closeLoop;
+        const bool keepQtResponsive = onQtThread();
+        {
+            std::lock_guard<std::mutex> lock(editorThreadMutex);
+            editorParent = nullptr;
+            hadEditor = editorAttached.load(std::memory_order_acquire) ||
+                static_cast<bool>(editor) || editorThread.joinable();
+            editorCloseLoop = keepQtResponsive && editorThread.joinable() && editorThreadSucceeded
+                ? &closeLoop : nullptr;
+            editorThreadStop = true;
+            editorThreadCv.notify_all();
+            if (editorThread.joinable()) threadToJoin = std::move(editorThread);
         }
-        plugFrame = nullptr;
+        if (threadToJoin.joinable()) {
+            // removed() may marshal native/Qt destruction back to the host.
+            // Pump Qt until the editor thread has completed that contract;
+            // joining it while blocking Qt deadlocks Neural DSP editors.
+            if (editorCloseLoop) closeLoop.exec();
+            try { threadToJoin.join(); } catch (...) {}
+        }
+        {
+            std::lock_guard<std::mutex> lock(editorThreadMutex);
+            editor = nullptr;
+            plugFrame = nullptr;
+            editorThreadReady = false;
+            editorThreadSucceeded = false;
+            editorCloseLoop = nullptr;
+            editorAttached.store(false, std::memory_order_release);
+        }
+        if (hadEditor) setEditorStage(EditorStage::Removed);
     }
 
     bool reconfigure(double sampleRate, std::size_t maxSamplesPerBlock) noexcept {
@@ -1254,6 +1512,10 @@ bool trackSelectionQueued(const std::string &trackKey) noexcept {
 }
 
 void selectionWorkerLoop() {
+    struct ComApartment {
+        HRESULT result = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+        ~ComApartment() { if (SUCCEEDED(result)) CoUninitialize(); }
+    } comApartment;
     for (;;) {
         std::vector<Vst3SelectionEntry> selection;
         std::string trackKey;
@@ -1328,9 +1590,11 @@ void selectionWorkerLoop() {
                     g_runtime.selectionAppliedGeneration.store(generation, std::memory_order_release);
                     g_runtime.selectionStatus.store(3, std::memory_order_release);
                 } else {
+                    const auto rejected = error.empty() ?
+                        std::string("runtime_vst3_selection_prepare_failed") : error;
                     for (const auto &entry : selection)
                         if (!containsIdentity(g_runtime.appliedSelection, entry))
-                            rejectSavedEntry(entry, "runtime_vst3_selection_prepare_failed",
+                            rejectSavedEntry(entry, rejected,
                                              state::ScopeKind::Global);
                     g_runtime.requestedSelection = g_runtime.appliedSelection;
                     g_runtime.selectionPreparedNanoseconds.store(steadyNanoseconds(), std::memory_order_release);
@@ -1353,9 +1617,11 @@ void selectionWorkerLoop() {
                         g_runtime.audioGeneration.fetch_add(1, std::memory_order_acq_rel);
                         g_runtime.selectionStatus.store(3, std::memory_order_release);
                     } else {
+                        const auto rejected = error.empty() ?
+                            std::string("runtime_vst3_selection_prepare_failed") : error;
                         for (const auto &entry : selection)
                             if (!containsIdentity(runtime->requested, entry))
-                                rejectSavedEntry(entry, "runtime_vst3_selection_prepare_failed",
+                                rejectSavedEntry(entry, rejected,
                                                  state::ScopeKind::Track, runtime->scoreKey,
                                                  runtime->trackKey, runtime->trackIndex);
                         runtime->error = error.empty() ? prepareError : error;
@@ -3192,14 +3458,21 @@ void scaleVst3Editor(void *host, double factor) noexcept {
     if (!keepAlive || !host || !std::isfinite(factor) || factor <= 0.0) return;
     std::unique_lock<std::recursive_mutex> editorLock(g_runtime.editorMutex, std::try_to_lock);
     if (!editorLock.owns_lock()) return;
-    if (keepAlive->editorParent != static_cast<HWND>(host) || !keepAlive->editor) return;
+    Steinberg::IPtr<Steinberg::IPlugView> editor;
+    Steinberg::IPtr<Steinberg::IPlugFrame> plugFrame;
+    {
+        std::lock_guard<std::mutex> lock(keepAlive->editorThreadMutex);
+        if (keepAlive->editorParent != static_cast<HWND>(host) || !keepAlive->editor) return;
+        editor = keepAlive->editor;
+        plugFrame = keepAlive->plugFrame;
+    }
     EditorCallbackScope callbackScope;
     try {
-        if (auto scale = FUnknownPtr<Steinberg::IPlugViewContentScaleSupport>(keepAlive->editor.get())) {
+        if (auto scale = FUnknownPtr<Steinberg::IPlugViewContentScaleSupport>(editor.get())) {
             if (!succeeded(scale->setContentScaleFactor(static_cast<float>(factor)))) return;
             ViewRect size{};
-            if (succeeded(keepAlive->editor->getSize(&size)) && keepAlive->plugFrame)
-                keepAlive->plugFrame->resizeView(keepAlive->editor.get(), &size);
+            if (succeeded(editor->getSize(&size)) && plugFrame)
+                plugFrame->resizeView(editor.get(), &size);
         }
     } catch (...) {
         keepAlive->editorError = "editor_scale_exception";

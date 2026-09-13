@@ -1,35 +1,54 @@
 # P10 实现记录
 
-状态：已实施并通过夹具、Qt 原生窗口和 MCP 宿主回归（2026-09-13）
+状态：已实施；真实 Guitar Pro UI 回归通过（目标版本 `v0.9.8`，2026-09-13）。
 关联计划：[P10 editor/音频生效优化计划](P10_EDITOR_AUDIO_ACTIVATION_PLAN.md)
-基线：`v0.9.6` / Guitar Pro 8.1.1.17 / Windows x64。
 
-## 交付内容
+## 修复内容
 
-| 范围 | 状态 | 实现与证据 |
-| --- | --- | --- |
-| P10-0 时间线诊断 | 已实现、已验证 | `selection_request_id`、queued/worker/prepared/committed 时间戳、`audio_generation`、首个处理块序列和 callback 证据写入 `gp_hook` 状态。过期 global/track 请求在提交前丢弃。 |
-| P10-1 原生 editor | 已实现、已验证 | `RuntimeEffect::openEditor` 固定 `createView → platform → setFrame → scale/size → attached → onSize` 顺序；记录 `editor_stage`、原始 `editor_result_code`、identity 和失败原因。Qt 侧使用稳定 `WA_NativeWindow` 子 HWND，关闭 editor 只移除 view。 |
-| P10-2 首次启停生效 | 已实现、已验证 | 空选择立即设置 global/input/track bypass；输入和 playback 双槽保留 warm slot，匹配 module/class/state/rate 时复用实例；`Chain` 记录 activation 到首个成功处理块的时间和序列。 |
-| P10-3 UI 状态 | 已实现、已验证 | 复选框立即显示请求中或已旁路；worker 完成后同步“已生效/失败已恢复”。editor 等待期间只保留最后一个请求，完成通知由维护 tick 触发一次重试，不再使用固定 50 ms 轮询。 |
-| P10-4 回归与发布 | 已实现、已验证 | `test-p10-activation.ps1` 验证立即旁路、warm/cold 首块和连续切换；`test-p10-editor.ps1` 串联生产 RuntimeEffect、Qt/HWND 夹具及 MCP 宿主 editor/关闭/重开流程。 |
+### 原生 editor
 
-## 诊断字段
+- `RuntimeEffect` 的 component、factory/controller 创建和初始化通过 `invokeOnQtThreadBlocking` 在 Guitar Pro Qt 主线程完成，保留第三方插件建立 Qt 对象所需的线程归属。
+- editor 使用独立持久线程执行 `createView`、`isPlatformTypeSupported`、`setFrame`、content scale、`getSize` 和 `attached`。Qt 主线程继续处理事件，因此 Mateus 的 `attached()` 不再把宿主卡死。
+- editor host 保持 `WA_NativeWindow`/稳定 HWND；`RuntimePlugFrame::resizeView` 将宿主窗口尺寸更新转发回 Qt 线程，再调用 `IPlugView::onSize`。
+- 关闭时先通知 editor 线程执行 `removed`/`setFrame(nullptr)`，Qt 线程用嵌套事件循环等待线程结束，避免第三方 view 在销毁时回调 Qt 造成死锁。关闭 editor 只移除 view，不停用音频实例。
 
-`gp_hook.selection_*` 描述一次选择请求从排队到提交的阶段；`selection_status` 为 `idle`、`queued`、`preparing`、`applied` 或 `failed`。`audio_generation` 在 global/input 或 track 提交后递增。`chain_*first_processed*` 与 `input_*first_processed*` 只在新 slot 首次成功写回时记录，宿主没有 callback 时保持 0。
+### 音频和诊断
 
-`editor_stage` 取 `requested`、`busy_wait`、`controller_missing`、`create_view`、`platform_check`、`set_frame`、`get_size`、`attached`、`visible`、`focus`、`removed` 或 `failed`；`editor_result_code` 保留 VST3 `tresult`。详细 identity 和错误只进入结构化状态，不进入产品中性文案。
+- 保留 P10 已有的 selection generation、准备/提交时间戳、首个处理 callback 和 bypass 观测字段。
+- `editor_stage` 和 `editor_result_code` 覆盖 `create_view`、`platform_check`、`set_frame`、`get_size`、`attached`、`visible`、`removed`、`failed` 等阶段；失败仍保持中性 UI 文案。
 
-## 验证记录
+## 真实 MCP 验证
 
-已执行并通过：
+验证使用已安装的 MCP bridge 驱动 Guitar Pro 8.1.1.17，未使用 computer use。命令入口为：
 
 ```powershell
-.\native\test\test-p10-activation.ps1 -OutputRoot .tools/native/p10-activation-check2
-.\native\test\test-p8-runtime.ps1 -QtDir C:\Users\mumu\source\GuitarProMCP\.tools\qt\5.15.2\msvc2019_64 -OutputRoot .tools/native/p10-runtime-check -PluginPath .tools/native/p10-build/plugins/imageformats/guitarpro_vst3_autoload.dll
-.\native\test\test-p10-editor.ps1 -QtDir C:\Users\mumu\source\GuitarProMCP\.tools\qt\5.15.2\msvc2019_64 -OutputRoot .tools/native/p10-editor-check -PluginPath .tools/native/p10-build/plugins/imageformats/guitarpro_vst3_autoload.dll -McpRoot C:\Users\mumu\source\GuitarProMCP -Vst3Root 'ParametricOD.vst3;Gateway.vst3'
+.\native\test\test-p7-mcp.ps1 -EditorOnly -HookMode default `
+  -PluginPath .tools/native/p10-hybrid-editor-build/plugins/imageformats/guitarpro_vst3_autoload.dll `
+  -McpRoot C:\Users\mumu\source\GuitarProMCP `
+  -Vst3Root 'Neural DSP/Archetype Mateus Asato.vst3;Gateway.vst3'
 ```
 
-最终 MCP 证据目录为 `artifacts/mcp-p7-9ba57930ba784b16b539ab1a9b92f27a`：原生 editor 窗口可见、非 modal、可关闭和重开；`editor_stage=visible`；停用后 `total_bypass=true`；`chain_sequence_gaps=0`、首个处理块 callback 为 1，选择提交时间线均已写入结构化观测。生产 RuntimeEffect 夹具证据为 `artifacts/p8-runtime-094910ae82aa4143a6e145417f2d228d`，完整套件目录为 `.tools/native/release-p10-suite`。
+通过证据目录：`artifacts/mcp-p7-c759c17ee0b44595a298f47c5314752e`。
 
-未覆盖项仍按宿主边界记录：真实 ASIO/WASAPI 设备矩阵、真实扬声器听感阈值、没有合法 editor 的第三方插件，以及第三方插件进程级崩溃隔离。此类插件现在会返回稳定的 `editor_stage`/`editor_result_code` 并保持旁路，不伪造 GUI 成功。
+- 窗口标题为 `Archetype Mateus Asato · VST3`，尺寸 `1510x1153`，`non_modal=true`，`editor_stage=visible`，`editor_error=""`。
+- 重复触发复用同一 `window_id`，窗口仍可见；关闭后 `editor_stage=removed`，Guitar Pro 保持响应。
+- [editor-native.png](../artifacts/mcp-p7-c759c17ee0b44595a298f47c5314752e/editor-native.png) 是按 Guitar Pro PID 取得的 native `PrintWindow` capture，内容可见，不是白屏。
+- [editor-trace.log](../artifacts/mcp-p7-c759c17ee0b44595a298f47c5314752e/data/editor-trace.log) 记录了 `create_view → set_frame → get_size → attached → visible → removed` 的前后顺序；`attached` 发生在线程 `35996`，Qt 主线程线程号为 `33528`。
+- 关闭后音频观测仍有 `101` 个 global process blocks、`219` 个 input blocks、首个处理 callback 为 `1`、`chain_sequence_gaps=0`。
+
+## 夹具验证
+
+已通过：
+
+```powershell
+.\native\test\test-p10-activation.ps1 -OutputRoot .tools/native/p10-activation-final
+.\native\test\test-p8-runtime.ps1 -QtDir C:\Users\mumu\source\GuitarProMCP\.tools\qt\5.15.2\msvc2019_64 `
+  -OutputRoot .tools/native/p10-runtime-final2 `
+  -PluginPath .tools/native/p10-hybrid-editor-build/plugins/imageformats/guitarpro_vst3_autoload.dll
+```
+
+`test-p10-editor.ps1` 和 `test-p10.ps1` 已改为默认使用 Mateus + Gateway，并在 MCP 流程中明确执行 editor-only 的打开、重开和关闭断言。
+
+## 未覆盖项
+
+真实 ASIO/WASAPI 设备矩阵、不同 Guitar Pro 版本、真实扬声器听感阈值，以及没有合法 HWND editor 的第三方插件仍属于宿主或插件限制。某些插件要求 `createView` 也必须在其 Qt 线程执行；这类插件会保留诊断阶段并失败回退，不能由宿主伪造 GUI 成功。

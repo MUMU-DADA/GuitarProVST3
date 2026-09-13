@@ -1,4 +1,4 @@
-param([string]$QtDir = '', [string]$OutputRoot = '', [switch]$RunHost, [string]$HostDirectory = 'C:\Program Files\Arobas Music\Guitar Pro 8', [string]$PluginPath = '', [string]$ExternalEditorPlugin = '', [string]$McpRoot = 'C:\Users\mumu\source\GuitarProMCP', [string]$Vst3Root = 'ParametricOD.vst3;Gateway.vst3')
+param([string]$QtDir = '', [string]$OutputRoot = '', [switch]$RunHost, [string]$HostDirectory = 'C:\Program Files\Arobas Music\Guitar Pro 8', [string]$PluginPath = '', [string]$ExternalEditorPlugin = '', [string]$McpRoot = 'C:\Users\mumu\source\GuitarProMCP', [string]$Vst3Root = 'Neural DSP/Archetype Mateus Asato.vst3;Gateway.vst3')
 $ErrorActionPreference = 'Stop'
 $root = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
 if (-not $OutputRoot) { $OutputRoot = Join-Path $root '.tools/native/p10-delivery-suite' }

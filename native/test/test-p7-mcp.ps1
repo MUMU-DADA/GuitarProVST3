@@ -8,6 +8,7 @@ param(
     [switch]$StandardScan,
     [switch]$CheckGain,
     [switch]$CheckCatalogRestart,
+    [switch]$EditorOnly,
     [switch]$KeepHost
 )
 
@@ -71,6 +72,7 @@ try {
     # P7 owns its selected processors; leave the legacy single-effect probe
     # disabled so this test exercises the list-driven lifecycle in isolation.
     $environment.GPVST3_ENABLE_P2_EFFECT = '0'
+    if ($env:GPVST3_EDITOR_TRACE -eq '1') { $environment.GPVST3_EDITOR_TRACE = '1' }
     $programFiles = if ($env:ProgramW6432) { $env:ProgramW6432 } else { $env:ProgramFiles }
     $vst3Paths = @($Vst3Root -split ';' | Where-Object { $_ } |
         ForEach-Object { if ([IO.Path]::IsPathRooted($_)) { $_ } else { Join-Path $programFiles ('Common Files/VST3/' + $_) } })
@@ -203,6 +205,7 @@ try {
         if (-not $checkbox -or -not $secondCheckbox) { throw 'Identified checkbox not found.' }
     } else { throw 'P7 regression requires two distinct ready test plugins.' }
     $result.checkbox_before = @($checkbox,$secondCheckbox)
+    $observationPath = Join-Path $dataDirectory 'p2-observation.json'
     $freshFirst = Invoke-McpTool $session gp_objects @{query=$checkbox.object_name;limit=10}
     $setFirst = Invoke-McpTool $session gp_set_property @{
         snapshot=$freshFirst.snapshot
@@ -210,6 +213,14 @@ try {
         property='checked'
         value=$true
     }
+    $selectionReadyDeadline = [DateTime]::UtcNow.AddSeconds(120)
+    do {
+        Start-Sleep -Milliseconds 250
+        $selectionObservation = Get-Content -LiteralPath $observationPath -Raw | ConvertFrom-Json
+        if ($selectionObservation.gp_hook.runtime_processor_ready -or
+            ((-not $EditorOnly -or $HookMode -eq 'disabled') -and
+             $selectionObservation.gp_hook.selection_status -eq 'failed')) { break }
+    } while ([DateTime]::UtcNow -lt $selectionReadyDeadline)
     if ($HookMode -eq 'disabled') {
         $after = Invoke-McpTool $session gp_objects @{query=$checkbox.object_name;limit=10}
         $notice = Invoke-McpTool $session gp_objects @{query='gpvst3GlobalStatus';limit=10}
@@ -225,19 +236,81 @@ try {
         Write-Output "PASS: P7 explicitly disabled hook rejects selection with its actual cause. Evidence: $run"
         return
     }
+    if (-not (Test-Path -LiteralPath $observationPath)) { throw 'P7 realtime observation was not written.' }
     Start-Sleep -Seconds 2
+    if ($EditorOnly) {
+        $readyDeadline = [DateTime]::UtcNow.AddSeconds(120)
+        do {
+            $readyObservation = Get-Content -LiteralPath $observationPath -Raw | ConvertFrom-Json
+            if ($readyObservation.gp_hook.runtime_processor_ready) { break }
+            Start-Sleep -Milliseconds 250
+        } while ([DateTime]::UtcNow -lt $readyDeadline)
+    }
     $initialPlayback = Invoke-McpTool $session gp_playback @{operation='state';document=$operation.operation.document}
     Invoke-McpTool $session gp_playback @{operation='set_loop';document=$operation.operation.document;enabled=$true} | Out-Null
     $play = Invoke-McpTool $session gp_playback @{operation='play';document=$operation.operation.document}
     Start-Sleep -Seconds 2
-    $observationPath = Join-Path $dataDirectory 'p2-observation.json'
-    if (-not (Test-Path -LiteralPath $observationPath)) { throw 'P7 realtime observation was not written.' }
     $observation = Get-Content -LiteralPath $observationPath -Raw | ConvertFrom-Json
     $hook = $observation.gp_hook
     $result.one_enabled_observation = $hook
-    if (-not $hook.runtime_processor_ready -or $hook.runtime_effect_instances -ne 1 -or
-        $hook.chain_active_slot -lt 0 -or $hook.total_bypass -or -not $hook.runtime_process_observed) {
+    if (-not $EditorOnly -and (-not $hook.runtime_processor_ready -or $hook.runtime_effect_instances -ne 1 -or
+        $hook.chain_active_slot -lt 0 -or $hook.total_bypass -or -not $hook.runtime_process_observed)) {
         throw "P7 checked selection did not produce one live processor: $($hook | ConvertTo-Json -Depth 12 -Compress)"
+    }
+    if ($EditorOnly) {
+        if (-not $hook.runtime_processor_ready -or $hook.chain_active_slot -lt 0) {
+            throw "Editor-only selection did not become ready: $($hook | ConvertTo-Json -Depth 12 -Compress)"
+        }
+        $classId = ([string]$checkbox.object_name) -replace '^gpvst3GlobalEnabled_', ''
+        $editorButtons = Invoke-McpTool $session gp_objects @{query=("gpvst3GlobalEditor_$classId");limit=10}
+        if (@($editorButtons.objects).Count -eq 0) { throw 'Editor-only native editor button was not found.' }
+        $editorTrigger = Invoke-McpTool $session gp_trigger @{snapshot=$editorButtons.snapshot;id=@($editorButtons.objects)[0].id}
+        $result.editor_only_trigger = $editorTrigger
+        $result | ConvertTo-Json -Depth 30 | Set-Content -LiteralPath (Join-Path $run 'editor-only-trigger.json') -Encoding UTF8
+        $editorDeadline = [DateTime]::UtcNow.AddSeconds(30)
+        do {
+            Start-Sleep -Milliseconds 250
+            $editorHost = Invoke-McpTool $session gp_objects @{query='gpvst3NativeEditorHost';limit=10}
+            $editorWindows = Invoke-McpTool $session gp_windows @{include_hidden=$true}
+            $editorWindow = @($editorWindows.windows | Where-Object object_name -EQ 'gpvst3NativeEditorWindow')[0]
+            $editorObservation = Get-Content -LiteralPath $observationPath -Raw | ConvertFrom-Json
+            $readyEditor = $editorWindow -and $editorWindow.visible -and
+                @($editorHost.objects | Where-Object object_name -EQ 'gpvst3NativeEditorHost').Count -gt 0 -and
+                $editorObservation.gp_hook.editor_stage -eq 'visible'
+        } while (-not $readyEditor -and [DateTime]::UtcNow -lt $editorDeadline)
+        if (-not $readyEditor -or $editorWindow.geometry.width -lt 100 -or $editorWindow.geometry.height -lt 100) {
+            throw "Editor-only native window did not become visible: $($editorWindows | ConvertTo-Json -Depth 12 -Compress)"
+        }
+        $process.Refresh()
+        if (-not $process.Responding) { throw 'Guitar Pro stopped responding while opening the editor.' }
+        $result.editor_host = $editorHost
+        $result.editor_window = $editorWindow
+        $screenshotBody = @{jsonrpc='2.0';id=3;method='tools/call';params=@{name='gp_screenshot';arguments=@{window_id=$editorWindow.window_id}}} | ConvertTo-Json -Depth 8 -Compress
+        $screenshot = Invoke-RestMethod -Uri $session.Url -Method Post -Headers $session.Headers -ContentType 'application/json' -Body $screenshotBody
+        $result.editor_screenshot = $screenshot.result.structuredContent
+        $png = @($screenshot.result.content | Where-Object type -EQ 'image')[0]
+        if ($png) { [IO.File]::WriteAllBytes((Join-Path $run 'editor.png'), [Convert]::FromBase64String($png.data)) }
+        $result.native_window_capture = Save-P7NativeWindowCapture $process.Id $editorWindow.title (Join-Path $run 'editor-native.png')
+        $result.editor_observation = (Get-Content -LiteralPath $observationPath -Raw | ConvertFrom-Json).gp_hook
+        if ($result.editor_observation.editor_stage -ne 'visible' -or $result.editor_observation.editor_error) {
+            throw "Editor-only hook stage is not visible: $($result.editor_observation | ConvertTo-Json -Depth 12 -Compress)"
+        }
+        $result.editor_status = Invoke-McpTool $session gp_objects @{query='gpvst3GlobalStatus';limit=10}
+        # A repeated request must reuse the visible editor instead of creating
+        # a second view or disturbing the audio instance.
+        $editorAgain = Invoke-McpTool $session gp_objects @{query=("gpvst3GlobalEditor_$classId");limit=10}
+        Invoke-McpTool $session gp_trigger @{snapshot=$editorAgain.snapshot;id=@($editorAgain.objects)[0].id} | Out-Null
+        Start-Sleep -Milliseconds 500
+        $reopened = Invoke-McpTool $session gp_windows @{include_hidden=$true}
+        $result.editor_reopen = @($reopened.windows | Where-Object object_name -EQ 'gpvst3NativeEditorWindow')[0]
+        if (-not $result.editor_reopen.visible) { throw 'Editor-only repeated open did not keep the window visible.' }
+        $closeQuery = Invoke-McpTool $session gp_objects @{query='gpvst3NativeEditorWindow';limit=10}
+        Invoke-McpTool $session gp_close_window @{snapshot=$closeQuery.snapshot;id=@($closeQuery.objects | Where-Object object_name -EQ 'gpvst3NativeEditorWindow')[0].id} | Out-Null
+        Start-Sleep -Milliseconds 500
+        $result.after_editor_close = (Get-Content -LiteralPath $observationPath -Raw | ConvertFrom-Json).gp_hook
+        $result | ConvertTo-Json -Depth 30 | Set-Content -LiteralPath (Join-Path $run 'verification.json') -Encoding UTF8
+        Write-Output "PASS: P10 real Guitar Pro editor open/reopen/close and native capture. Evidence: $run"
+        return
     }
     $checkboxes2 = Invoke-McpTool $session gp_objects @{query='gpvst3GlobalEnabled';limit=30}
     $second2 = @($checkboxes2.objects | Where-Object object_name -EQ $secondCheckbox.object_name)[0]
@@ -247,7 +320,13 @@ try {
         property='checked'
         value=$true
     }
-    Start-Sleep -Seconds 3
+    $selectionReadyDeadline = [DateTime]::UtcNow.AddSeconds(120)
+    do {
+        Start-Sleep -Milliseconds 250
+        $selectionObservation = Get-Content -LiteralPath $observationPath -Raw | ConvertFrom-Json
+        if ($selectionObservation.gp_hook.runtime_effect_instances -ge 2 -or
+            $selectionObservation.gp_hook.selection_status -eq 'failed') { break }
+    } while ([DateTime]::UtcNow -lt $selectionReadyDeadline)
     $twoObservation = Get-Content -LiteralPath $observationPath -Raw | ConvertFrom-Json
     $result.two_enabled_observation = $twoObservation.gp_hook
     if (-not $twoObservation.gp_hook.runtime_processor_ready -or
