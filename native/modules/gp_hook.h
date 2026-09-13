@@ -11,8 +11,12 @@
 
 namespace gpvst3::hook {
 
+using SelectionNotifier = void (*)() noexcept;
+using TrackContextNotifier = void (*)() noexcept;
+
 void setVst3Catalog(const QJsonArray &catalog);
 void saveVst3States();
+void setTrackContextNotifier(TrackContextNotifier notifier) noexcept;
 
 struct Vst3SelectionEntry {
     std::string module;
@@ -215,6 +219,7 @@ void shutdown() noexcept;
 // Refresh the verified GuitarProMCP EffectsChain -> track binding table on
 // the Qt/control thread. The audio callback only consumes its atomics.
 void refreshTrackContext() noexcept;
+void setSelectionNotifier(SelectionNotifier notifier) noexcept;
 // Control-thread notification after a failed restored/running entry was
 // persisted as disabled; the UI reloads the actual accepted selection.
 bool consumeSelectionStateChanges() noexcept;

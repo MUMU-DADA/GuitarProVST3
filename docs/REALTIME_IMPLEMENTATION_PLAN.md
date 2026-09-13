@@ -1,6 +1,6 @@
 # GuitarProVST3 实时实现总览
 
-当前目标是在 Windows x64 的 Guitar Pro 8.1.1.17 中提供由 Guitar Pro 加载的实时 VST3 效果器链。P8/P9 的实现记录和当前待办以根目录 `docs/` 下的正式文档为准；editor 打开和首次启停生效的后续工作见 [P10 优化计划](P10_EDITOR_AUDIO_ACTIVATION_PLAN.md)，阶段原始记录保存在 `docs/archive/phase-records/`。
+当前目标是在 Windows x64 的 Guitar Pro 8.1.1.17 中提供由 Guitar Pro 加载的实时 VST3 效果器链。P8/P9/P10/P11 的实现记录和当前待办以根目录 `docs/` 下的正式文档为准；阶段原始记录保存在 `docs/archive/phase-records/`。
 
 ## 目标与架构
 
@@ -29,13 +29,14 @@ GP 继续负责音频设备、输入输出、采样率和流生命周期；插�
 | P8 | track/global 链、生命周期恢复、UI 分区和交付回归 |
 | P9 | 实时切换稳定性、UI 重构、标题工具栏 About 和扫描反馈收敛（夹具/MCP 完成；真实 editor 与首次启停生效问题转入 P10） |
 | P10 | VST3 原生 editor 打开、首次启停音频提交、首个有效处理块诊断和真实宿主回归（已完成） |
+| P11 | UI 周期维护替换、selection worker 链维护、后台诊断/status writer、扫描 poll 收敛和真实 MCP 双音轨回归（代码与专项已完成；固定设备 CPU A/B 采样待执行） |
 
 ## 核心约束
 
 - 未通过 Guitar Pro 文件哈希和函数 prologue 校验时，私有 ABI hook 保持关闭并旁路。
 - 音频线程不扫描磁盘、不创建 Qt 对象、不动态分配、不等待阻塞锁；实例和 scratch 在控制线程准备。
 - VST3 链独立于 GP 私有 `core::Effect` / `am::overloud::Effect` 容器；global、track 和 P4 input 使用各自明确的处理边界。
-- UI 和 sidecar 写入在 Qt/控制线程执行，实时回调只读取已发布的运行时对象。
+- UI 和用户 sidecar 操作在 Qt/控制线程执行；周期诊断和 scanner status 使用有界后台 writer，实时回调只读取已发布的运行时对象。
 
 ## 当前宿主边界
 

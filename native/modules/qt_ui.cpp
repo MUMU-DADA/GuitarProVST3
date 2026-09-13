@@ -73,10 +73,11 @@ QString g_vst3ScanState = QStringLiteral("pending");
 class P7Panel;
 P7Panel *g_p7Panel = nullptr;
 P7Panel *g_globalPanel = nullptr;
-QPointer<QTimer> g_panelAttachTimer;
 QPointer<QDialog> g_aboutDialog;
 QPointer<QObject> g_aboutObserver;
 QPointer<QMainWindow> g_aboutObservedWindow;
+std::function<void()> g_panelAttachRequest;
+bool g_panelAttachPending = false;
 bool g_panelUsesP7 = true;
 bool g_trackExpanded = true, g_globalExpanded = true;
 
@@ -489,6 +490,16 @@ void showAboutDialog() {
 
 void ensureAboutEntry();
 
+void schedulePanelAttach() {
+    if (!qApp || g_panelAttachPending) return;
+    g_panelAttachPending = true;
+    QTimer::singleShot(0, qApp, [] {
+        g_panelAttachPending = false;
+        ensureAboutEntry();
+        if (g_panelAttachRequest) g_panelAttachRequest();
+    });
+}
+
 class AboutEntryObserver final : public QObject {
 public:
     explicit AboutEntryObserver(QObject *parent = nullptr) : QObject(parent) {}
@@ -502,7 +513,7 @@ protected:
             // Guitar Pro rebuilds the title/sidebar hierarchy while changing
             // score pages. Reattach after the host finishes that mutation so
             // the About entry survives toolbar replacement immediately.
-            QTimer::singleShot(0, qApp, [] { ensureAboutEntry(); });
+            schedulePanelAttach();
         }
         return QObject::eventFilter(object, event);
     }
@@ -1449,6 +1460,10 @@ void setVst3Catalog(const QJsonArray &catalog) {
         g_p7Panel->refreshCatalog();
     }
     if (g_globalPanel) g_globalPanel->refreshCatalog();
+    // The initial bootstrap can run before the host exposes its catalog. Once
+    // static discovery completes, switch the legacy dock to the native
+    // sidebar sections immediately; no maintenance timer is needed.
+    showEffectChainPanel(false);
 }
 
 void setVst3DiscoveryControl(Vst3RefreshControl refresh, Vst3IdentifyControl identify) noexcept {
@@ -1538,17 +1553,11 @@ void showEffectChainPanel(bool show) {
     legacy = legacy && g_vst3Catalog.isEmpty();
     const bool useP7Panel = !legacy;
 
-    // Keep the maintenance timer owned by qApp rather than by the selector.
-    // GP destroys and rebuilds the sidebar widgets during score/track changes;
-    // the next tick must recreate a hidden selector and reattach its entry.
+    // Attach once now; subsequent host lifecycle/layout events are coalesced
+    // through AboutEntryObserver and schedulePanelAttach(). Stable windows
+    // have no periodic maintenance work.
     g_panelUsesP7 = useP7Panel;
-    auto *timer = g_panelAttachTimer.data();
-    if (!timer) {
-        timer = new QTimer(qApp);
-        timer->setInterval(500);
-        g_panelAttachTimer = timer;
-    }
-    const auto attachPanel = [timer] {
+    const auto attachPanel = [] {
         ensureAboutEntry();
         QWidget *panel = qApp->property("gpvst3P5Panel").value<QWidget *>();
         if (!panel) {
@@ -1618,7 +1627,7 @@ void showEffectChainPanel(bool show) {
             mount(panel, trackSection, g_trackExpanded);
             mount(g_globalPanel, globalSection, g_globalExpanded);
         }
-        bool dockReady = timer->property("dockReady").toBool();
+        bool dockReady = qApp->property("gpvst3DockReady").toBool();
         if (!useP7Panel) {
             for (QWidget *widget : QApplication::topLevelWidgets()) {
                 if (QByteArray(widget->metaObject()->className()) != "gp::gui::MainWindow") continue;
@@ -1658,16 +1667,22 @@ void showEffectChainPanel(bool show) {
         if (!useP7Panel && !panel->parentWidget()) {
             panel->show(); panel->raise(); panel->activateWindow();
         }
-        timer->setProperty("dockReady", dockReady);
+        qApp->setProperty("gpvst3DockReady", dockReady);
+        if (useP7Panel && !soundEntryReady) {
+            const int retry = qApp->property("gpvst3PanelRetryCount").toInt();
+            if (retry < 5) {
+                qApp->setProperty("gpvst3PanelRetryCount", retry + 1);
+                static const int delays[] = {50, 100, 250, 500, 1000};
+                QTimer::singleShot(delays[retry], qApp, [] { schedulePanelAttach(); });
+            }
+        } else {
+            qApp->setProperty("gpvst3PanelRetryCount", 0);
+        }
     };
-    if (!timer->property("gpvst3Connected").toBool()) {
-        QObject::connect(timer, &QTimer::timeout, timer, attachPanel);
-        timer->setProperty("gpvst3Connected", true);
-    }
+    g_panelAttachRequest = attachPanel;
     // A user click must display a newly recreated selector in this event,
-    // without waiting for another click or the sidebar maintenance timer.
+    // without waiting for another click or a periodic maintenance pass.
     attachPanel();
-    timer->start();
 }
 
 }

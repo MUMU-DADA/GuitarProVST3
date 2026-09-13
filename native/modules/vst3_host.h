@@ -111,6 +111,7 @@ State identifyBundle(const std::string &module, bool hostSupported) noexcept;
 // delivers changed progress/catalog snapshots without waiting for the worker.
 State beginAsync(bool hostSupported = true, bool retryTimedOut = false) noexcept;
 bool poll(State &completed) noexcept;
+bool pollNeeded() noexcept;
 void shutdownScan() noexcept;
 void setRecognitionControl(RecognitionControl control) noexcept;
 

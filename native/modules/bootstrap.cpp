@@ -12,8 +12,73 @@
 #include <QtCore/QString>
 #include <QtCore/QTimer>
 #include <QtCore/QCoreApplication>
+#include <QtCore/QMetaObject>
+#include <QtCore/QPointer>
+#include <atomic>
 
 namespace {
+
+QPointer<QTimer> g_scanTimer;
+QPointer<QTimer> g_trackFallbackTimer;
+QJsonObject g_scanStatus;
+std::atomic<bool> g_trackRefreshQueued{false};
+int g_trackRefreshRetries = 0;
+void scheduleTrackRefresh() noexcept;
+
+void notifyTrackContextComplete() noexcept {
+    auto *application = QCoreApplication::instance();
+    if (!application) return;
+    QMetaObject::invokeMethod(application, [] {
+        gpvst3::ui::syncVst3Selection();
+        gpvst3::ui::refreshVst3TrackContext();
+    }, Qt::QueuedConnection);
+}
+
+void dispatchTrackRefresh() {
+    g_trackRefreshQueued.store(false, std::memory_order_release);
+    // A cursor move is available from the MCP bridge without rebuilding the
+    // native object graph. Apply that small context snapshot first; the hook
+    // performs a full collection only when the structure dirty bit remains.
+    gpvst3::gp_audio::refreshSelectionContext();
+    gpvst3::hook::refreshTrackContext();
+    if (gpvst3::hook::consumeSelectionStateChanges()) gpvst3::ui::reloadVst3Selections();
+    gpvst3::ui::syncVst3Selection();
+    gpvst3::ui::refreshVst3TrackContext();
+    if (gpvst3::gp_audio::refreshIncomplete() && g_trackRefreshRetries < 5) {
+        ++g_trackRefreshRetries;
+        QTimer::singleShot(500, QCoreApplication::instance(), [] { gpvst3::gp_audio::markDirty(); });
+    } else {
+        g_trackRefreshRetries = 0;
+    }
+}
+
+void scheduleTrackRefresh() noexcept {
+    auto *application = QCoreApplication::instance();
+    if (!application) return;
+    bool expected = false;
+    if (!g_trackRefreshQueued.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) return;
+    // Completion can arrive from std::thread. Create the settling timer on
+    // Qt's event thread; a timer created on the selection worker has no event
+    // dispatcher and would leave the coalescing flag set forever.
+    if (!QMetaObject::invokeMethod(application, [application] {
+            QTimer::singleShot(50, application, [] { dispatchTrackRefresh(); });
+        }, Qt::QueuedConnection))
+        g_trackRefreshQueued.store(false, std::memory_order_release);
+}
+
+void ensureScanTimer() {
+    auto *application = QCoreApplication::instance();
+    if (!application) return;
+    if (!g_scanTimer) {
+        g_scanTimer = new QTimer(application);
+        g_scanTimer->setInterval(100);
+        QObject::connect(g_scanTimer, &QTimer::timeout, g_scanTimer, [] {
+            gpvst3::bootstrap::pollVst3(g_scanStatus);
+            if (!gpvst3::vst3::pollNeeded()) g_scanTimer->stop();
+        });
+    }
+    if (gpvst3::vst3::pollNeeded()) g_scanTimer->start();
+}
 
 QJsonObject classStatus(const gpvst3::vst3::ClassState &value) {
     return QJsonObject{
@@ -125,7 +190,11 @@ void scanFeedback(const gpvst3::vst3::State &scan) {
 
 void refreshCatalog(bool retryTimedOut = false) {
     const auto pending = gpvst3::vst3::beginAsync(gpvst3::hook::snapshot().hostSupported, retryTimedOut);
+    g_scanStatus = QJsonObject{};
+    g_scanStatus.insert("vst3_host", vst3Status(pending));
+    g_scanStatus.insert("vst3_catalog", vst3Catalog(pending));
     scanFeedback(pending);
+    ensureScanTimer();
 }
 
 QJsonArray identifyBundle(const QString &module, QString *error) {
@@ -338,7 +407,10 @@ QJsonObject initialize() {
     if (enabled) state::disableAllEffectsAtStartup();
     if (enabled) {
         gpvst3::gp_audio::initialize();
+        gpvst3::gp_audio::setRefreshNotifier(&scheduleTrackRefresh);
         hook::prepare(host);
+        hook::setSelectionNotifier(&scheduleTrackRefresh);
+        hook::setTrackContextNotifier(&notifyTrackContextComplete);
         hook::refreshTrackContext();
         ui::setRealtimeBypassControl(&hook::setTotalBypass);
         ui::setVst3SelectionControl(&hook::setGlobalVst3Selection);
@@ -364,21 +436,52 @@ QJsonObject initialize() {
     if (enabled) {
         vst3::setRecognitionControl(&vst3::identifyBundle);
         ui::setVst3DiscoveryControl([] { refreshCatalog(true); }, &identifyBundle);
-        auto *refreshTimer = new QTimer(QCoreApplication::instance());
-        refreshTimer->setInterval(60000);
-        QObject::connect(refreshTimer, &QTimer::timeout, refreshTimer, [] { refreshCatalog(); });
-        refreshTimer->start();
-        auto *trackTimer = new QTimer(QCoreApplication::instance());
-        trackTimer->setInterval(250);
-        QObject::connect(trackTimer, &QTimer::timeout, trackTimer, [] {
-            hook::refreshTrackContext();
-            if (hook::consumeSelectionStateChanges()) ui::reloadVst3Selections();
-            ui::syncVst3Selection();
-            ui::refreshVst3TrackContext();
-        });
-        trackTimer->start();
         vst3 = qEnvironmentVariable("GPVST3_RUN_LIFECYCLE_PROBE") == "1"
             ? vst3::prepare(host.supported) : vst3::beginAsync(host.supported);
+        g_scanStatus = QJsonObject{};
+        g_scanStatus.insert("vst3_host", vst3Status(vst3));
+        g_scanStatus.insert("vst3_catalog", vst3Catalog(vst3));
+        ensureScanTimer();
+        g_trackFallbackTimer = new QTimer(QCoreApplication::instance());
+        g_trackFallbackTimer->setInterval(2000);
+        QObject::connect(g_trackFallbackTimer, &QTimer::timeout, g_trackFallbackTimer, [] {
+            static bool unresolvedRecoveryRequested = false;
+            static int unresolvedAttempts = 0;
+            static int settlingAttempts = 0;
+            // The fallback is recovery-only. Stable sessions stop the timer,
+            // so no periodic bridge enumeration or object-tree walk remains.
+            const bool unresolved = gpvst3::hook::snapshot().trackScopeUnresolved ||
+                                    gpvst3::gp_audio::refreshIncomplete();
+            if (!unresolved) {
+                unresolvedRecoveryRequested = false;
+                unresolvedAttempts = 0;
+                // A host may finish constructing a newly inserted sound
+                // after the first complete snapshot. Keep a short bounded
+                // settling window for that lifecycle gap, then stop.
+                if (settlingAttempts++ >= 5) {
+                    g_trackFallbackTimer->stop();
+                    return;
+                }
+                gpvst3::gp_audio::checkStructureChanged();
+                scheduleTrackRefresh();
+                return;
+            }
+            settlingAttempts = 0;
+            if (unresolvedAttempts++ >= 5) {
+                g_trackFallbackTimer->stop();
+                return;
+            }
+            if (!unresolvedRecoveryRequested) {
+                unresolvedRecoveryRequested = true;
+                // Only an unresolved/incomplete session pays for the bridge
+                // signature check. Once all bindings are stable this timer
+                // is stopped and the bridge is never enumerated in idle.
+                gpvst3::gp_audio::checkStructureChanged();
+                gpvst3::gp_audio::markDirty();
+            }
+            scheduleTrackRefresh();
+        });
+        g_trackFallbackTimer->start();
     } else {
         vst3.status = "disabled_by_user";
         ui::setVst3DiscoveryControl(nullptr, nullptr);
@@ -438,9 +541,11 @@ bool pollVst3(QJsonObject &status) {
     scanFeedback(completed);
     status.insert("vst3_host", vst3Status(completed));
     status.insert("vst3_catalog", catalog);
-    state::writeStatus(status);
+    state::submitStatus(status);
     return true;
 }
+
+bool scanPending() noexcept { return vst3::pollNeeded(); }
 
 QJsonObject hookSnapshot() {
     return hookStatus(hook::snapshot());

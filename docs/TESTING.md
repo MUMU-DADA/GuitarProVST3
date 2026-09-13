@@ -63,3 +63,18 @@ P10 激活夹具验证下一 callback 旁路、warm/cold slot 首个处理块和
 ```
 
 状态文件中的 `selection_*`、`audio_generation`、`chain_*first_processed*` 和 `editor_stage/editor_result_code` 是 P10 的结构化证据入口。
+
+## P11 验证
+
+P11 套件使用本机 Visual Studio/Qt 夹具和已安装的 MCP 服务，不使用 computer use。maintenance fixture 验证有界 latest-slot observation writer；P11 UI fixture 编译并运行 About/侧栏/DPI 回归；真实宿主选项验证 scanner、selection worker、track/global 绑定和两轨 writeback。
+
+```powershell
+./native/build.ps1 -OutputRoot .tools/native/p11-build
+./native/test/test-p11.ps1 -QtDir C:/path/to/Qt/5.15.x/msvc2019_64
+./native/test/test-p11.ps1 -RunHost -QtDir C:/path/to/Qt/5.15.x/msvc2019_64 `
+  -PluginPath .tools/native/p11-build/plugins/imageformats/guitarpro_vst3_autoload.dll `
+  -McpRoot C:/Users/mumu/source/GuitarProMCP -Vst3Root 'ParametricOD.vst3;Gateway.vst3'
+./native/test/test-p6-package.ps1 -PluginPath .tools/native/p11-build/plugins/imageformats/guitarpro_vst3_autoload.dll
+```
+
+稳定期不再运行固定 track/observation timer；`status.json` 与 `p2-observation.json` 的 generation、sample mode、计数和时间字段用于后续固定设备 A/B 采样。真实宿主性能门槛需要单独保存 CPU/P95 原始数值，不能由 fixture PASS 代替。

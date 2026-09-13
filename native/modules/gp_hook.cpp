@@ -62,6 +62,7 @@ int streamCallbackHook(const void *input, void *output, unsigned long frames,
 void reconfigureInputRouterIfNeeded() noexcept;
 bool configureSelectedChain(const std::vector<Vst3SelectionEntry> &selection, std::string *error) noexcept;
 State prepare(const host::Verification &verification, bool enableForSelection) noexcept;
+bool consumeSelectionStateChanges() noexcept;
 
 namespace {
 
@@ -1476,6 +1477,12 @@ struct Runtime {
     std::vector<Vst3SelectionEntry> appliedSelection;
     std::unordered_map<std::string, std::vector<Vst3SelectionEntry>> pendingTrackSelections;
     std::unordered_map<std::string, std::uint64_t> pendingTrackGenerations;
+    // Binding collection stays on the host/Qt thread. The immutable value
+    // snapshot is handed to this worker for chain maintenance, retirement,
+    // persistence and rate reconfiguration.
+    std::vector<gp_audio::Binding> pendingBindings;
+    std::size_t pendingDiscovered = 0;
+    bool trackContextRequestPending = false;
     int retainedInputSelectionSlot = -1;
 };
 
@@ -1484,6 +1491,8 @@ State g_initial;
 host::Verification g_verification;
 std::shared_ptr<RuntimeEffect> g_openEditorEffect; // Owned and accessed on Qt.
 std::atomic<bool> g_selectionStateChanged{false};
+std::atomic<SelectionNotifier> g_selectionNotifier{nullptr};
+std::atomic<TrackContextNotifier> g_trackContextNotifier{nullptr};
 thread_local bool g_inMasterHook = false;
 thread_local bool g_inEditorCallback = false;
 
@@ -1552,6 +1561,7 @@ struct EditorCallbackScope {
 };
 
 double callbackSampleRate() noexcept;
+void updateAudioLayerState() noexcept;
 bool configureInputSelection(const std::vector<Vst3SelectionEntry> &selection,
                              std::string *error = nullptr) noexcept;
 void refreshInputParameterMirrors() noexcept;
@@ -1576,6 +1586,9 @@ bool trackSelectionQueued(const std::string &trackKey) noexcept {
         g_runtime.pendingTrackSelections.end();
 }
 
+void refreshTrackContextWorkerImpl(std::vector<gp_audio::Binding> bindings,
+                                   std::size_t discovered) noexcept;
+
 void selectionWorkerLoop() {
     struct ComApartment {
         HRESULT result = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
@@ -1585,11 +1598,14 @@ void selectionWorkerLoop() {
         std::vector<Vst3SelectionEntry> selection;
         std::string trackKey;
         std::uint64_t generation = 0;
+        std::vector<gp_audio::Binding> contextBindings;
+        std::size_t contextDiscovered = 0;
+        bool contextRefresh = false;
         {
             std::unique_lock<std::mutex> lock(g_runtime.selectionRequestMutex);
             g_runtime.selectionCondition.wait(lock, [] {
                 return g_runtime.selectionWorkerStop || g_runtime.selectionRequestPending ||
-                       !g_runtime.pendingTrackSelections.empty();
+                       !g_runtime.pendingTrackSelections.empty() || g_runtime.trackContextRequestPending;
             });
             if (g_runtime.selectionWorkerStop && !g_runtime.selectionRequestPending &&
                 g_runtime.pendingTrackSelections.empty()) {
@@ -1599,16 +1615,40 @@ void selectionWorkerLoop() {
                 selection = std::move(g_runtime.pendingSelection);
                 generation = g_runtime.selectionRequestGeneration;
                 g_runtime.selectionRequestPending = false;
-            } else {
+            } else if (!g_runtime.pendingTrackSelections.empty()) {
                 auto it = g_runtime.pendingTrackSelections.begin();
                 trackKey = it->first;
                 selection = std::move(it->second);
                 generation = g_runtime.pendingTrackGenerations[trackKey];
                 g_runtime.pendingTrackSelections.erase(it);
+            } else {
+                contextRefresh = g_runtime.trackContextRequestPending;
+                if (contextRefresh) {
+                    contextBindings = std::move(g_runtime.pendingBindings);
+                    contextDiscovered = g_runtime.pendingDiscovered;
+                    g_runtime.pendingBindings.clear();
+                    g_runtime.pendingDiscovered = 0;
+                    g_runtime.trackContextRequestPending = false;
+                }
             }
             g_runtime.selectionWorkerBusy.store(true, std::memory_order_release);
             g_runtime.selectionWorkerStartedNanoseconds.store(steadyNanoseconds(), std::memory_order_release);
             g_runtime.selectionStatus.store(2, std::memory_order_release);
+        }
+        if (contextRefresh) {
+            refreshTrackContextWorkerImpl(std::move(contextBindings), contextDiscovered);
+            // Do not call the selection notifier here: bootstrap maps that
+            // notifier to scheduleTrackRefresh(), which would enqueue the
+            // same context request again and starve real selection work.
+            if (const auto notifier = g_trackContextNotifier.load(std::memory_order_acquire)) notifier();
+            g_runtime.selectionWorkerBusy.store(false, std::memory_order_release);
+            {
+                std::lock_guard<std::mutex> requestLock(g_runtime.selectionRequestMutex);
+                if (g_runtime.selectionRequestPending || !g_runtime.pendingTrackSelections.empty() ||
+                    g_runtime.trackContextRequestPending)
+                    g_runtime.selectionStatus.store(1, std::memory_order_release);
+            }
+            continue;
         }
         {
             // Only the worker waits for runtime ownership. Qt's observation,
@@ -1697,6 +1737,7 @@ void selectionWorkerLoop() {
                 }
             }
             g_selectionStateChanged.store(true, std::memory_order_release);
+            if (const auto notifier = g_selectionNotifier.load(std::memory_order_acquire)) notifier();
         }
         g_runtime.selectionWorkerBusy.store(false, std::memory_order_release);
         {
@@ -1723,6 +1764,9 @@ void stopSelectionWorker() noexcept {
         g_runtime.pendingSelection.clear();
         g_runtime.pendingTrackSelections.clear();
         g_runtime.pendingTrackGenerations.clear();
+        g_runtime.pendingBindings.clear();
+        g_runtime.pendingDiscovered = 0;
+        g_runtime.trackContextRequestPending = false;
     }
     g_runtime.selectionCondition.notify_all();
     g_runtime.selectionWorker.join();
@@ -1857,27 +1901,17 @@ bool reconfigureSlot(SelectionSlot &slot, effects::Chain &chain, int rate) {
     return valid;
 }
 
-void refreshTrackContextImpl() noexcept {
+void refreshTrackContextWorkerImpl(std::vector<gp_audio::Binding> bindings,
+                                   std::size_t discovered) noexcept {
     if (g_inEditorCallback) return;
     if (!g_initial.hostSupported) return;
-    const auto discovered = gpvst3::gp_audio::refresh();
-    const auto bindings = gpvst3::gp_audio::snapshot();
-    gpvst3::gp_audio::Binding selectedBinding;
-    const bool haveSelectedBinding = gpvst3::gp_audio::currentTrack(selectedBinding);
-    if (haveSelectedBinding) {
-        gpvst3::state::setRuntimeTrackContext(
-            QString::fromStdString(selectedBinding.scoreKey),
-            QString::fromStdString(selectedBinding.trackKey),
-            selectedBinding.trackIndex,
-            QString::fromStdString(selectedBinding.trackId));
-    } else {
-        gpvst3::state::clearRuntimeTrackContext();
-    }
-    std::unique_lock<std::recursive_mutex> editorLock(g_runtime.editorMutex, std::try_to_lock);
-    if (!editorLock.owns_lock()) return;
-    std::unique_lock<std::mutex> lock(g_runtime.selectionMutex, std::try_to_lock);
-    if (!lock.owns_lock()) return;
-    g_runtime.currentTrackKey = haveSelectedBinding ? selectedBinding.trackKey : "";
+    updateAudioLayerState();
+    const auto selected = std::find_if(bindings.begin(), bindings.end(),
+        [](const gp_audio::Binding &binding) { return binding.activeDocument && binding.selectedTrack; });
+    const bool haveSelectedBinding = selected != bindings.end();
+    std::lock_guard<std::recursive_mutex> editorLock(g_runtime.editorMutex);
+    std::lock_guard<std::mutex> lock(g_runtime.selectionMutex);
+    g_runtime.currentTrackKey = haveSelectedBinding ? selected->trackKey : "";
     const int rate = static_cast<int>(callbackSampleRate());
     const auto sameBindings = bindings.size() == g_runtime.publishedBindings.size() &&
         std::equal(bindings.begin(), bindings.end(), g_runtime.publishedBindings.begin(),
@@ -1896,6 +1930,9 @@ void refreshTrackContextImpl() noexcept {
             runtime.configuredRate.load() != rate;
         pending |= runtime.chain.faulted();
     }
+    // Input rate/channel changes are control work too. They must not depend
+    // on a diagnostic snapshot read to become effective.
+    reconfigureInputRouterIfNeeded();
     if (!pending) return;
     const TrackDispatchUpdate update;
     clearTrackDispatch();
@@ -2396,7 +2433,12 @@ void dspProcessHook(void *self, void *buffer, void *scratch, void *ticks) {
     auto *trackRuntime = dispatch ? dispatch->runtime.load(std::memory_order_acquire) : nullptr;
     if (!trackRuntime || !g_runtime.rawData || !g_runtime.frameCount ||
         !g_runtime.channelCount || !buffer) {
-        g_runtime.trackScopeUnresolved.store(true, std::memory_order_release);
+        // Guitar Pro also invokes processDSP for auxiliary chains that are
+        // outside the published track table. Once a real track has processed
+        // successfully, those unrelated calls must not turn a healthy scope
+        // back into an unresolved diagnostic.
+        if (!g_runtime.trackRuntimeProcessed.load(std::memory_order_acquire))
+            g_runtime.trackScopeUnresolved.store(true, std::memory_order_release);
         return;
     }
     const auto frames = g_runtime.frameCount(buffer);
@@ -2505,7 +2547,38 @@ EntryPointObservation observe(HMODULE module, const char *symbol) noexcept {
 } // namespace
 
 void refreshTrackContext() noexcept {
-    refreshTrackContextImpl();
+    if (g_inEditorCallback || !g_initial.hostSupported) return;
+    // QObject/GP model reads remain on the host thread. Only the copied
+    // binding values cross into the worker, which owns all chain maintenance.
+    const auto discovered = gpvst3::gp_audio::refreshIfNeeded();
+    const auto bindings = gpvst3::gp_audio::snapshot();
+    gpvst3::gp_audio::Binding selectedBinding;
+    const bool haveSelectedBinding = gpvst3::gp_audio::currentTrack(selectedBinding);
+    if (haveSelectedBinding) {
+        gpvst3::state::setRuntimeTrackContext(
+            QString::fromStdString(selectedBinding.scoreKey),
+            QString::fromStdString(selectedBinding.trackKey),
+            selectedBinding.trackIndex,
+            QString::fromStdString(selectedBinding.trackId));
+    } else {
+        gpvst3::state::clearRuntimeTrackContext();
+    }
+    startSelectionWorker();
+    {
+        std::lock_guard<std::mutex> lock(g_runtime.selectionRequestMutex);
+        g_runtime.pendingBindings = bindings;
+        g_runtime.pendingDiscovered = discovered;
+        g_runtime.trackContextRequestPending = true;
+    }
+    g_runtime.selectionCondition.notify_one();
+}
+
+void setSelectionNotifier(SelectionNotifier notifier) noexcept {
+    g_selectionNotifier.store(notifier, std::memory_order_release);
+}
+
+void setTrackContextNotifier(TrackContextNotifier notifier) noexcept {
+    g_trackContextNotifier.store(notifier, std::memory_order_release);
 }
 
 bool configureSelectedChain(const std::vector<Vst3SelectionEntry> &selection,
@@ -2635,8 +2708,6 @@ State snapshot() noexcept {
     if (!runtimeLock.owns_lock()) return *std::atomic_load(&previous);
     State result = g_initial;
     result.trackBindingSource = gp_audio::bindingSource();
-    updateAudioLayerState();
-    reconfigureInputRouterIfNeeded();
     const auto chain = g_runtime.chain.snapshot();
     const auto input = g_runtime.inputRouter.snapshot();
     result.selectionRequestId = g_runtime.selectionRequestId.load(std::memory_order_relaxed);
@@ -3002,6 +3073,8 @@ void reconfigureInputRouterIfNeeded() noexcept {
 }
 
 void shutdown() noexcept {
+    g_selectionNotifier.store(nullptr, std::memory_order_release);
+    g_trackContextNotifier.store(nullptr, std::memory_order_release);
     g_qtDispatchStopping.store(true, std::memory_order_release);
     stopSelectionWorker();
     std::lock_guard<std::recursive_mutex> editorLock(g_runtime.editorMutex);
@@ -3314,7 +3387,8 @@ void setVst3Catalog(const QJsonArray &catalog) {
     // Catalog delivery is metadata-only. Persisted selections are deliberately
     // not restored here: loading a factory/processor belongs exclusively to an
     // explicit user request handled by the selection worker.
-    refreshTrackContextImpl();
+    gpvst3::gp_audio::markDirty();
+    refreshTrackContext();
 }
 
 bool consumeSelectionStateChanges() noexcept {
@@ -3325,13 +3399,13 @@ bool consumeSelectionStateChanges() noexcept {
 bool vst3SelectionPending() noexcept {
     std::lock_guard<std::mutex> lock(g_runtime.selectionRequestMutex);
     return g_runtime.selectionWorkerBusy.load(std::memory_order_acquire) ||
-        g_runtime.selectionRequestPending || !g_runtime.pendingTrackSelections.empty();
+        g_runtime.selectionRequestPending || !g_runtime.pendingTrackSelections.empty() ||
+        g_runtime.trackContextRequestPending;
 }
 
 bool setTrackVst3Selection(const std::string &trackKey,
                            const std::vector<Vst3SelectionEntry> &selection,
                            std::string *error) noexcept {
-    std::lock_guard<std::recursive_mutex> editorLock(g_runtime.editorMutex);
     if (error) error->clear();
     if (trackKey.empty()) {
         if (error) *error = "track_scope_unresolved";
@@ -3348,7 +3422,15 @@ bool setTrackVst3Selection(const std::string &trackKey,
             return false;
         }
     }
-    refreshTrackContextImpl();
+    const auto waitMaintenance = [] {
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+        while (vst3SelectionPending() && std::chrono::steady_clock::now() < deadline) {
+            if (qApp) QCoreApplication::processEvents(QEventLoop::AllEvents, 2);
+            std::this_thread::yield();
+        }
+    };
+    refreshTrackContext();
+    waitMaintenance();
     const auto bindings = gp_audio::snapshot();
     if (std::none_of(bindings.begin(), bindings.end(), [&](const gp_audio::Binding &binding) {
             return binding.chain && binding.activeDocument && binding.trackKey == trackKey;
@@ -3365,8 +3447,9 @@ bool setTrackVst3Selection(const std::string &trackKey,
             if (runtime.trackKey == trackKey) runtime.error.clear();
     }
     // Reconcile immediately when the MCP binding is already available. The
-    // periodic control timer repeats this after score/Conductor rebuilds.
-    refreshTrackContextImpl();
+    // worker owns the potentially expensive chain operation.
+    refreshTrackContext();
+    waitMaintenance();
     std::string targetError;
     for (const auto &runtime : g_runtime.trackRuntimes)
         if (runtime.trackKey == trackKey) targetError = runtime.error;
@@ -3376,7 +3459,8 @@ bool setTrackVst3Selection(const std::string &trackKey,
             std::lock_guard<std::mutex> lock(g_runtime.selectionMutex);
             g_runtime.requestedTrackSelections[trackKey] = previous;
         }
-        refreshTrackContextImpl();
+        refreshTrackContext();
+        waitMaintenance();
         return false;
     }
     return true;

@@ -50,6 +50,14 @@ struct HostTrackIdentity {
 bool reconcileTrackIdentities(std::vector<HostTrackIdentity> &tracks);
 void resetTrackIdentities();
 bool writeStatus(const QJsonObject &status);
+// Scan/status updates are coalesced and committed away from the Qt event
+// thread. The synchronous writeStatus() remains for bootstrap initialization
+// and explicit shutdown compatibility.
+void startStatusWriter();
+bool submitStatus(const QJsonObject &status);
+void stopStatusWriter();
+void startRealtimeObservationWriter();
 bool writeRealtimeObservation(const QJsonObject &hookStatus);
+void stopRealtimeObservationWriter();
 
 }

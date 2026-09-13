@@ -101,13 +101,13 @@ sequenceDiagram
         Boot->>Hook: refreshTrackContext()
         Boot->>UI: 注入 selection、editor、旁路、扫描回调
         Boot->>Catalog: beginAsync(hostSupported)
-        Boot->>Qt: 启动 scan poll(100ms)、track tick(250ms)、catalog refresh(60s)
+        Boot->>Qt: 启动任务期 scan poll(100ms) 与有限 track settling
         Qt->>UI: showEffectChainPanel(false)
     end
     loop 运行期间
-        Qt->>Catalog: pollVst3()
-        Qt->>Hook: refreshTrackContext()
-        Qt->>State: writeObservation()（状态变化时替换文件）
+        Qt->>Catalog: 有任务时 pollVst3()
+        Qt->>Hook: 变化事件合并后 refreshTrackContext()
+        Hook->>State: 后台 monitor/writer 合并诊断快照
         Audio->>Hook: Master / DSP / stream callback
     end
     GP-->>Qt: aboutToQuit / post routine
@@ -220,7 +220,7 @@ sequenceDiagram
     participant Worker as selectionWorkerLoop
     participant Chain as 双槽 Chain
     participant Input as live-input copy
-    participant Tick as 250ms control tick
+    participant Tick as worker 完成通知
 
     User->>Panel: 勾选/取消勾选、排序、参数编辑
     Panel->>Panel: 更新 enabled/bypass/order/configured
@@ -372,7 +372,7 @@ flowchart LR
 ```mermaid
 flowchart TD
     T0["gp_audio::refresh()\n发现 document / track / EffectsChain"] --> T1["reconcileTrackIdentities()\ndocumentId + trackId -> persistent trackKey"]
-    T1 --> T2["refreshTrackContextImpl()\n构建最多 64 个 self -> TrackRuntime dispatch"]
+    T1 --> T2["Qt 收集值快照 -> selection worker\n维护最多 64 个 self -> TrackRuntime dispatch"]
     T2 --> T3["TrackDispatchUpdate\ngeneration 置奇数，清空表，等待 readers"]
     T3 --> T4["每个 active document binding\n分配/复用最多 32 个 TrackRuntime"]
     T4 --> T5["runtime.prepare(selection, rate, 16384)\n独立双槽 SelectionSlot"]
@@ -392,7 +392,7 @@ flowchart TD
     D9 --> D10["记录 processed/writeObserved/error/bypass"]
 ```
 
-track runtime 只在 `self` 与已发布 binding 匹配时处理。切换音轨、增删音轨、保存/另存、重开或 host 对象重建都会进入 control tick，先保存旧 runtime，再以新的 `trackKey` 重建 dispatch；未解析的上下文安全旁路。
+track runtime 只在 `self` 与已发布 binding 匹配时处理。切换音轨、增删音轨、保存/另存、重开或 host 对象重建会提交一次合并请求；Qt 只发布值快照，selection worker 先保存旧 runtime，再以新的 `trackKey` 重建 dispatch；未解析的上下文安全旁路。
 
 ## 9. live-input / PortAudio 介入路径
 
@@ -501,7 +501,7 @@ sequenceDiagram
     Note over Hook,VST: 关闭 editor 只移除 view，不停用音频实例
 ```
 
-失败阶段写入 `editor_stage`、`editor_result_code`、`editor_error`，包括 `controller_missing`、`create_view`、`platform_check`、`set_frame`、`get_size`、`attached` 和 `removed`。UI 只显示中性文案；识别中的插件会等 control tick 发现 worker 空闲后重试一次 pending key。
+失败阶段写入 `editor_stage`、`editor_result_code`、`editor_error`，包括 `controller_missing`、`create_view`、`platform_check`、`set_frame`、`get_size`、`attached` 和 `removed`。UI 只显示中性文案；识别中的插件在 worker 完成通知到达后重试一次 pending key。
 
 ## 12. 音轨上下文、文档身份与持久化
 
@@ -534,8 +534,8 @@ flowchart LR
 | `settings.json` | About 开关 | `enabled`，决定下次启动是否扫描和接入 |
 | `effect-chain.json` | 勾选、排序、参数、关闭、退出、runtime retire | schema 2 的 global/track 链、顺序、enabled/bypass、component/controller state、错误 |
 | `vst3-catalog-cache.json` | static scan、factory recognition、timeout | 路径指纹、metadata entries、recognition 状态和重试时间 |
-| `status.json` | bootstrap 初始化和 scan poll | host、VST3 catalog、hook、UI、adapter 摘要 |
-| `p2-observation.json` | 250ms 诊断 tick（快照变化时写）和退出 | Master/DSP/stream、chain、track、input、selection、editor 时间线和证据 |
+| `status.json` | bootstrap 初始化；scanner 活动期间由后台 writer 合并提交 | host、VST3 catalog、hook、UI、adapter 摘要、generation |
+| `p2-observation.json` | normal/detailed 诊断 monitor 提交；后台 writer 和退出 final flush | Master/DSP/stream、chain、track、input、selection、editor 时间线和证据、sample mode/generation |
 
 ## 13. 控制线程、实时线程和 editor 线程关系
 

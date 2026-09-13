@@ -76,6 +76,14 @@ public:
             return false;
         }
         const auto name = QByteArray(object->metaObject()->className());
+        const bool relevant = name == "gp::rse::ConductorController" ||
+            name == "gp::gui::IDocumentsManager" || name == "gp::gui::IDocument" ||
+            name == "gp::gui::IDocumentView";
+        if (event && relevant && !object->property("gpvst3Owned").toBool() &&
+            (event->type() == QEvent::ChildAdded || event->type() == QEvent::ChildRemoved ||
+             event->type() == QEvent::LayoutRequest || event->type() == QEvent::Show ||
+             event->type() == QEvent::Hide || event->type() == QEvent::DynamicPropertyChange))
+            markDirty();
         if (name != "gp::rse::ConductorController" && name != "gp::gui::IDocumentsManager") return false;
         std::lock_guard<std::mutex> lock(mutex_);
         for (const auto &known : controllers_)
@@ -110,7 +118,20 @@ Binding g_bindingBuffers[2][kMaxBindings];
 std::atomic<int> g_activeBuffer{0};
 std::atomic<std::size_t> g_bindingCount{0};
 std::atomic<std::uint64_t> g_generation{0};
-const char *g_bindingSource = "unresolved";
+std::atomic<bool> g_dirty{true};
+std::atomic<RefreshNotifier> g_refreshNotifier{nullptr};
+std::atomic<std::uint64_t> g_structureSignature{0};
+std::atomic<std::size_t> g_expectedBridgeBindings{0};
+std::atomic<std::size_t> g_expectedNativeTracks{0};
+std::atomic<bool> g_refreshIncomplete{false};
+std::atomic<const char *> g_bindingSource{"unresolved"};
+
+bool sameBinding(const Binding &a, const Binding &b) noexcept {
+    return a.chain == b.chain && a.trackIndex == b.trackIndex && a.soundIndex == b.soundIndex &&
+        a.trackKey == b.trackKey && a.trackId == b.trackId && a.documentId == b.documentId &&
+        a.scoreKey == b.scoreKey && a.activeDocument == b.activeDocument &&
+        a.selectedTrack == b.selectedTrack;
+}
 
 QString scoreKey() {
     const auto configured = qEnvironmentVariable("GPVST3_SCORE_PATH");
@@ -175,6 +196,26 @@ std::vector<BridgeContext> collectFromMcpBridge(bool *available) {
 
 bool sameScoreKey(const std::string &nativeScore, const QString &bridgeScore) {
     return QString::fromStdString(nativeScore).compare(bridgeScore, Qt::CaseInsensitive) == 0;
+}
+
+const BridgeContext *contextForBinding(const Binding &value,
+                                       const std::vector<BridgeContext> &contexts) {
+    const auto byIdentity = std::find_if(contexts.cbegin(), contexts.cend(), [&](const BridgeContext &candidate) {
+        if (candidate.trackIndex != value.trackIndex) return false;
+        if (!candidate.documentId.isEmpty() && candidate.documentId.toStdString() == value.documentId) return true;
+        return sameScoreKey(value.scoreKey, candidate.scoreKey);
+    });
+    if (byIdentity != contexts.cend()) return &*byIdentity;
+    // A single-document bridge can omit one of the identity fields while the
+    // host is rebuilding. Index-only matching is safe only when it is
+    // unambiguous; never let one document overwrite another document's state.
+    const auto sameIndex = std::count_if(contexts.cbegin(), contexts.cend(), [&](const BridgeContext &candidate) {
+        return candidate.trackIndex == value.trackIndex;
+    });
+    if (sameIndex != 1) return nullptr;
+    return &*std::find_if(contexts.cbegin(), contexts.cend(), [&](const BridgeContext &candidate) {
+        return candidate.trackIndex == value.trackIndex;
+    });
 }
 
 void mergeBridgeContexts(std::vector<Binding> &bindings,
@@ -282,10 +323,15 @@ std::vector<Binding> collect() {
     if (!verified) return {};
     bool bridgeAvailable = false;
     const auto bridgeContexts = collectFromMcpBridge(&bridgeAvailable);
+    g_expectedBridgeBindings.store(bridgeAvailable ? bridgeContexts.size() : 0,
+                                   std::memory_order_release);
     std::vector<Binding> result;
+    std::size_t expectedNativeTracks = 0;
     const auto finish = [&] {
         mergeBridgeContexts(result, bridgeContexts);
-        g_bindingSource = bridgeAvailable ? "mcp_context_native_registry" : "native_document_registry";
+        g_expectedNativeTracks.store(expectedNativeTracks, std::memory_order_release);
+        g_bindingSource.store(bridgeAvailable ? "mcp_context_native_registry" : "native_document_registry",
+                              std::memory_order_release);
         return result;
     };
     if (!g_observer || !qApp) return finish();
@@ -314,6 +360,7 @@ std::vector<Binding> collect() {
         if (document == documents.end()) continue;
         const auto &tracks = conductor->score()->tracks();
         if (tracks.size() > 32) continue;
+        expectedNativeTracks += tracks.size();
         for (std::size_t trackIndex = 0; trackIndex < tracks.size(); ++trackIndex) {
             const auto &coreTrack = tracks[trackIndex];
             auto *musician = conductor->musician(static_cast<unsigned>(trackIndex));
@@ -333,10 +380,10 @@ std::vector<Binding> collect() {
             for (std::size_t soundIndex = 0; soundIndex < count; ++soundIndex) {
                 auto sound = conductor->sound(static_cast<unsigned>(trackIndex), static_cast<unsigned>(soundIndex));
                 if (!sound) sound = musician->soundAtIndex(static_cast<unsigned>(soundIndex));
-                if (!sound) {
-                    musician->updateAll();
-                    sound = musician->soundAtIndex(static_cast<unsigned>(soundIndex));
-                }
+                // A missing sound means the host is still rebuilding its
+                // conductor. Calling updateAll() here re-enters a potentially
+                // expensive host rebuild on the GUI thread; the lifecycle
+                // observer will schedule a bounded retry instead.
                 if (!sound || !sound->effectChain()) continue;
                 Binding binding;
                 binding.chain = sound->effectChain().get();
@@ -369,11 +416,25 @@ std::vector<Binding> collect() {
 
 } // namespace
 
-const char *bindingSource() noexcept { return g_bindingSource; }
+const char *bindingSource() noexcept { return g_bindingSource.load(std::memory_order_acquire); }
+
+void setRefreshNotifier(RefreshNotifier notifier) noexcept {
+    g_refreshNotifier.store(notifier, std::memory_order_release);
+}
+
+void markDirty() noexcept {
+    const bool wasDirty = g_dirty.exchange(true, std::memory_order_acq_rel);
+    if (!wasDirty) {
+        if (const auto notifier = g_refreshNotifier.load(std::memory_order_acquire)) notifier();
+    }
+}
+
+bool refreshNeeded() noexcept { return g_dirty.load(std::memory_order_acquire); }
 
 void initialize() noexcept {
     if (g_observer || !qApp) return;
     try {
+        g_dirty.store(true, std::memory_order_release);
         g_observer = new ControllerObserver;
         g_observer->setParent(qApp);
         qApp->installEventFilter(g_observer);
@@ -386,6 +447,9 @@ void initialize() noexcept {
 }
 
 void shutdown() noexcept {
+    g_refreshNotifier.store(nullptr, std::memory_order_release);
+    g_bindingSource.store("unresolved", std::memory_order_release);
+    g_dirty.store(false, std::memory_order_release);
     g_objects.uninstall();
     if (qApp && g_observer) qApp->removeEventFilter(g_observer);
     if (g_observer) g_observer->deleteLater();
@@ -410,6 +474,27 @@ std::size_t refresh() noexcept {
         std::lock_guard<std::mutex> lock(g_snapshotMutex);
         const auto count = (std::min)(discovered.size(), kMaxBindings);
         const int active = g_activeBuffer.load(std::memory_order_relaxed);
+        const auto previousCount = g_bindingCount.load(std::memory_order_acquire);
+        const bool incompleteBindings = std::any_of(discovered.begin(), discovered.end(),
+            [](const Binding &binding) { return binding.chain == nullptr; });
+        bool changed = previousCount != count;
+        if (!changed) {
+            for (std::size_t index = 0; index < count; ++index) {
+                if (!sameBinding(g_bindingBuffers[active][index], discovered[index])) {
+                    changed = true;
+                    break;
+                }
+            }
+        }
+        if (!changed) {
+            g_refreshIncomplete.store(
+                incompleteBindings ||
+                g_expectedBridgeBindings.load(std::memory_order_acquire) > count ||
+                g_expectedNativeTracks.load(std::memory_order_acquire) > count,
+                                      std::memory_order_release);
+            g_dirty.store(false, std::memory_order_release);
+            return count;
+        }
         const int target = active == 0 ? 1 : 0;
         for (std::size_t index = 0; index < count; ++index)
             g_bindingBuffers[target][index] = discovered[index];
@@ -418,9 +503,97 @@ std::size_t refresh() noexcept {
         g_generation.fetch_add(1, std::memory_order_relaxed);
         g_activeBuffer.store(target, std::memory_order_release);
         g_bindingCount.store(count, std::memory_order_release);
+        g_refreshIncomplete.store(
+            incompleteBindings ||
+            g_expectedBridgeBindings.load(std::memory_order_acquire) > count ||
+            g_expectedNativeTracks.load(std::memory_order_acquire) > count,
+                                  std::memory_order_release);
+        g_dirty.store(false, std::memory_order_release);
         return count;
     } catch (...) {
         return 0;
+    }
+}
+
+std::size_t refreshIfNeeded() noexcept {
+    if (!g_dirty.exchange(false, std::memory_order_acq_rel))
+        return g_bindingCount.load(std::memory_order_acquire);
+    return refresh();
+}
+
+bool refreshIncomplete() noexcept { return g_refreshIncomplete.load(std::memory_order_acquire); }
+
+bool checkStructureChanged() noexcept {
+    try {
+        std::uint64_t signature = 1469598103934665603ULL;
+        bool available = false;
+        const auto contexts = collectFromMcpBridge(&available);
+        if (!available) return false;
+        std::vector<std::string> keys;
+        keys.reserve(contexts.size());
+        for (const auto &context : contexts)
+            keys.push_back(context.documentId.toStdString() + "\n" + context.scoreKey.toStdString() +
+                           "\n" + std::to_string(context.trackIndex) + "\n" + context.trackId.toStdString());
+        std::sort(keys.begin(), keys.end());
+        for (const auto &key : keys) {
+            for (const auto byte : key) {
+                signature ^= static_cast<std::uint8_t>(byte);
+                signature *= 1099511628211ULL;
+            }
+            signature ^= 0xff;
+            signature *= 1099511628211ULL;
+        }
+        const auto previous = g_structureSignature.exchange(signature, std::memory_order_acq_rel);
+        if (previous == signature) return false;
+        markDirty();
+        return true;
+    } catch (...) {
+        return false;
+    }
+}
+
+bool refreshSelectionContext() noexcept {
+    try {
+        bool available = false;
+        const auto contexts = collectFromMcpBridge(&available);
+        if (!available || contexts.empty()) return false;
+        std::lock_guard<std::mutex> lock(g_snapshotMutex);
+        const int active = g_activeBuffer.load(std::memory_order_acquire);
+        const auto count = g_bindingCount.load(std::memory_order_acquire);
+        const int target = active == 0 ? 1 : 0;
+        bool changed = false;
+        bool complete = contexts.size() == count;
+        for (std::size_t index = 0; index < count; ++index) {
+            auto value = g_bindingBuffers[active][index];
+            const auto *context = contextForBinding(value, contexts);
+            if (!context) complete = false;
+            else {
+                if (context->activeDocument <= 1) {
+                    const bool isActive = context->activeDocument == 1;
+                    changed |= value.activeDocument != isActive;
+                    value.activeDocument = isActive;
+                }
+                if (context->selectedTrack <= 1) {
+                    const bool selected = context->selectedTrack == 1;
+                    changed |= value.selectedTrack != selected;
+                    value.selectedTrack = selected;
+                }
+            }
+            g_bindingBuffers[target][index] = std::move(value);
+        }
+        if (!changed && complete) return false;
+        for (std::size_t index = count; index < kMaxBindings; ++index) g_bindingBuffers[target][index] = {};
+        if (changed) {
+            g_activeBuffer.store(target, std::memory_order_release);
+            g_generation.fetch_add(1, std::memory_order_relaxed);
+        }
+        // A complete, same-sized bridge snapshot is a selection-only update.
+        // Clear the generic dirty bit so the next hook pass does not repeat a
+        // full object-tree/native-chain collection for a cursor move.
+        if (complete) g_dirty.store(false, std::memory_order_release);
+        return changed;
+    } catch (...) {
+        return false;
     }
 }
 
@@ -438,6 +611,26 @@ bool currentTrack(Binding &binding) noexcept {
             if (!candidate.activeDocument || !candidate.selectedTrack) continue;
             binding = candidate;
             return true;
+        }
+        bool available = false;
+        const auto contexts = collectFromMcpBridge(&available);
+        if (available) {
+            const auto selected = std::find_if(contexts.cbegin(), contexts.cend(), [](const BridgeContext &context) {
+                return context.activeDocument == 1 && context.selectedTrack == 1;
+            });
+            if (selected != contexts.cend()) {
+                for (std::size_t index = 0; index < count; ++index) {
+                    const auto &candidate = g_bindingBuffers[active][index];
+                    if (candidate.trackIndex != selected->trackIndex) continue;
+                    if (!selected->documentId.isEmpty() && candidate.documentId != selected->documentId.toStdString() &&
+                        !sameScoreKey(candidate.scoreKey, selected->scoreKey)) continue;
+                    binding = candidate;
+                    binding.activeDocument = true;
+                    binding.selectedTrack = true;
+                    return true;
+                }
+                markDirty();
+            }
         }
     } catch (...) {
     }

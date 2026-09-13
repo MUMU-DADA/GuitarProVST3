@@ -16,6 +16,9 @@ void require(bool value, const char *message) { if (!value) throw std::runtime_e
 }
 namespace gpvst3::gp_audio {
 std::size_t refresh() noexcept { return testBindings.size(); }
+bool refreshNeeded() noexcept { return false; }
+std::size_t refreshIfNeeded() noexcept { return testBindings.size(); }
+void markDirty() noexcept {}
 std::vector<Binding> snapshot() { return testBindings; }
 bool currentTrack(Binding &binding) noexcept { if (testBindings.empty()) return false; binding = testBindings[0]; return true; }
 const char *bindingSource() noexcept { return "fixture"; }
@@ -47,7 +50,16 @@ extern "C" __declspec(dllexport) int gpvst3_run_runtime_tests(const char *fixtur
         // control API after substituting discovery and the rate accessor.
         g_runtime.master.installed = true; g_runtime.dsp.installed = true;
         g_runtime.sampleRate = &readRate; g_runtime.audioCore = reinterpret_cast<void *>(1);
+        auto waitMaintenance = [&] {
+            const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+            while (vst3SelectionPending() && std::chrono::steady_clock::now() < deadline) {
+                QCoreApplication::processEvents(QEventLoop::AllEvents, 10);
+                QThread::msleep(1);
+            }
+            require(!vst3SelectionPending(), "track context maintenance did not finish asynchronously");
+        };
         refreshTrackContext();
+        waitMaintenance();
         std::string error;
         require(setTrackVst3Selection("track", entries, &error), "prepare track processors");
         qputenv("GPVST3_TEST_INITIALIZE_DELAY_MS", "150");
@@ -118,6 +130,7 @@ extern "C" __declspec(dllexport) int gpvst3_run_runtime_tests(const char *fixtur
                 require(!track.chain.faulted(), "rate transition must not latch an audio fault");
             }
             refreshTrackContext();
+            waitMaintenance();
             require(track.configuredRate.load() == rate && globalProcessor->configuredRate.load() == rate,
                 "both scopes adopt the new callback sample rate");
             require(track.trackSlots[track.chain.snapshot().activeSlot].effects[0].get() == trackProcessor &&
@@ -177,6 +190,7 @@ extern "C" __declspec(dllexport) int gpvst3_run_runtime_tests(const char *fixtur
         slot.effects[1]->forceError = true;
         reset(); require(!track.processBlock(block(testRate)), "failed process is detected");
         refreshTrackContext();
+        waitMaintenance();
         reset(); require(track.processBlock(block(testRate)) && std::abs(left[0] - 0.775F) < 0.000001F,
             "remaining track processors continue after failure isolation");
         reset(); require(g_runtime.chain.process(block(testRate)).completed && std::abs(left[0] - 0.5125F) < 0.000001F,
