@@ -747,14 +747,21 @@ public:
         // UI polling loop while still retrying exactly once after the worker
         // has published the prepared slot.
         if (!g_pendingEditorKey.isEmpty() && (!g_vst3BusyControl || !g_vst3BusyControl())) {
+            bool matched = false;
             for (int index = 0; index < effects_.size(); ++index) {
                 const auto effect = effects_.at(index).toObject();
                 const auto keyValue = (scope_ == state::ScopeKind::Global ? QStringLiteral("global") : trackKey_)
                     + '\n' + key(effect);
                 if (keyValue == g_pendingEditorKey) {
+                    matched = true;
                     openEditor(index);
                     break;
                 }
+            }
+            if (!matched) {
+                const auto scopePrefix = scope_ == state::ScopeKind::Global
+                    ? QStringLiteral("global\n") : trackKey_ + '\n';
+                if (g_pendingEditorKey.startsWith(scopePrefix)) g_pendingEditorKey.clear();
             }
         }
     }
@@ -1201,10 +1208,14 @@ private:
     bool contextReady_ = false;
 
     void bindTrackContext() {
+        const auto previousTrackKey = trackKey_;
         scoreKey_ = state::currentScoreKey();
         trackKey_ = state::currentTrackKey();
         trackIndex_ = configuredTrackIndex();
         contextReady_ = trackContextAvailable();
+        if (scope_ == state::ScopeKind::Track && previousTrackKey != trackKey_ &&
+            !previousTrackKey.isEmpty() && g_pendingEditorKey.startsWith(previousTrackKey + '\n'))
+            g_pendingEditorKey.clear();
     }
 };
 

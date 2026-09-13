@@ -206,6 +206,7 @@ private:
 bool succeeded(tresult result) noexcept;
 bool onQtThread() noexcept;
 bool invokeOnQtThreadBlocking(const std::function<void()> &callback) noexcept;
+std::atomic<bool> g_qtDispatchStopping{false};
 
 class RuntimePlugFrame final
     : public Steinberg::U::Implements<Steinberg::U::Directly<Steinberg::IPlugFrame>> {
@@ -214,30 +215,30 @@ public:
     Steinberg::tresult PLUGIN_API resizeView(Steinberg::IPlugView *view,
                                              ViewRect *newSize) override {
         if (!newSize || !hostWindow_ || !IsWindow(hostWindow_)) return Steinberg::kInvalidArgument;
-        if (resizing_) return Steinberg::kResultTrue;
-        resizing_ = true;
+        if (resizing_.test_and_set(std::memory_order_acquire)) return Steinberg::kResultTrue;
+        struct ResizeGuard {
+            std::atomic_flag &flag;
+            ~ResizeGuard() { flag.clear(std::memory_order_release); }
+        } resizeGuard{resizing_};
         const int width = (std::max)(1, newSize->getWidth());
         const int height = (std::max)(1, newSize->getHeight());
         try {
             if (!invokeOnQtThreadBlocking([&] {
                     gpvst3::ui::resizeNativeEditor(reinterpret_cast<void *>(hostWindow_), width, height);
                 })) {
-                resizing_ = false;
                 return Steinberg::kResultFalse;
             }
         } catch (...) {
-            resizing_ = false;
             return Steinberg::kResultFalse;
         }
         bool resized = false;
         try { resized = view && succeeded(view->onSize(newSize)); } catch (...) { resized = false; }
-        resizing_ = false;
         return resized ? Steinberg::kResultTrue : Steinberg::kResultFalse;
     }
 
 private:
     HWND hostWindow_ = nullptr;
-    bool resizing_ = false;
+    std::atomic_flag resizing_ = ATOMIC_FLAG_INIT;
 };
 
 bool succeeded(tresult result) noexcept {
@@ -260,13 +261,50 @@ bool invokeOnQtThreadBlocking(const std::function<void()> &callback) noexcept {
         return true;
     }
     auto *application = QCoreApplication::instance();
-    if (!application) return false;
-    bool callbackFailed = false;
+    if (!application || QCoreApplication::closingDown() ||
+        g_qtDispatchStopping.load(std::memory_order_acquire)) return false;
+    struct InvocationState {
+        std::mutex mutex;
+        std::condition_variable condition;
+        std::function<void()> callback;
+        bool started = false;
+        bool done = false;
+        bool cancelled = false;
+        bool failed = false;
+    };
+    auto state = std::make_shared<InvocationState>();
+    state->callback = callback;
     try {
-        return QMetaObject::invokeMethod(
-            application, [&callback, &callbackFailed] {
-                try { callback(); } catch (...) { callbackFailed = true; }
-            }, Qt::BlockingQueuedConnection) && !callbackFailed;
+        if (!QMetaObject::invokeMethod(application, [state] {
+                std::function<void()> callbackToRun;
+                {
+                    std::lock_guard<std::mutex> lock(state->mutex);
+                    if (state->cancelled) {
+                        state->done = true;
+                        state->condition.notify_all();
+                        return;
+                    }
+                    state->started = true;
+                    callbackToRun = state->callback;
+                }
+                bool failed = false;
+                try { callbackToRun(); } catch (...) { failed = true; }
+                {
+                    std::lock_guard<std::mutex> lock(state->mutex);
+                    state->failed = failed;
+                    state->done = true;
+                }
+                state->condition.notify_all();
+            }, Qt::QueuedConnection)) return false;
+        std::unique_lock<std::mutex> lock(state->mutex);
+        while (!state->done) {
+            if (g_qtDispatchStopping.load(std::memory_order_acquire) && !state->started) {
+                state->cancelled = true;
+                return false;
+            }
+            state->condition.wait_for(lock, std::chrono::milliseconds(20));
+        }
+        return !state->failed && !state->cancelled;
     } catch (...) {
         return false;
     }
@@ -365,6 +403,7 @@ struct RuntimeEffect {
     // instance. Track effects must remain playback-only even when they use
     // the same VST3 class as the global chain.
     std::weak_ptr<RuntimeEffect> inputParameterMirror;
+    mutable std::mutex editorErrorMutex;
     std::string editorError;
     std::atomic<int> editorStage{static_cast<int>(EditorStage::None)};
     std::atomic<long> editorResultCode{0};
@@ -385,6 +424,29 @@ struct RuntimeEffect {
         editorResultCode.store(static_cast<long>(result), std::memory_order_release);
     }
 
+    void setEditorError(std::string value) noexcept {
+        try {
+            std::lock_guard<std::mutex> lock(editorErrorMutex);
+            editorError = std::move(value);
+        } catch (...) {}
+    }
+
+    void clearEditorError() noexcept {
+        try {
+            std::lock_guard<std::mutex> lock(editorErrorMutex);
+            editorError.clear();
+        } catch (...) {}
+    }
+
+    std::string getEditorError() const noexcept {
+        try {
+            std::lock_guard<std::mutex> lock(editorErrorMutex);
+            return editorError;
+        } catch (...) {
+            return {};
+        }
+    }
+
     ~RuntimeEffect() { shutdown(); }
 
     void shutdown() noexcept {
@@ -396,48 +458,45 @@ struct RuntimeEffect {
                 editorThread.joinable();
         }
         if (hasEditor && !onQtThread()) {
-            auto *application = QCoreApplication::instance();
-            if (application) {
-                const bool invoked = QMetaObject::invokeMethod(
-                    application, [this] { closeEditor(); }, Qt::BlockingQueuedConnection);
-                if (!invoked) closeEditor();
-            } else {
-                closeEditor();
-            }
+            if (!invokeOnQtThreadBlocking([this] { closeEditor(); })) closeEditor();
         } else {
             closeEditor();
         }
-        try {
-            if (componentConnection && controllerConnection) {
-                componentConnection->disconnect(controllerConnection);
-                controllerConnection->disconnect(componentConnection);
-            }
-        } catch (...) {}
-        componentConnection = nullptr;
-        controllerConnection = nullptr;
-        try { if (controller) controller->setComponentHandler(nullptr); } catch (...) {}
-        try { if (controller && separateControllerInitialized) controller->terminate(); } catch (...) {}
-        separateControllerInitialized = false;
-        componentHandler = nullptr;
-        controller = nullptr;
+        const auto teardownPlugin = [this] {
+            try {
+                if (componentConnection && controllerConnection) {
+                    componentConnection->disconnect(controllerConnection);
+                    controllerConnection->disconnect(componentConnection);
+                }
+            } catch (...) {}
+            componentConnection = nullptr;
+            controllerConnection = nullptr;
+            try { if (controller) controller->setComponentHandler(nullptr); } catch (...) {}
+            try { if (controller && separateControllerInitialized) controller->terminate(); } catch (...) {}
+            separateControllerInitialized = false;
+            componentHandler = nullptr;
+            try { if (processor) processor->setProcessing(false); } catch (...) {}
+            try {
+                if (component) {
+                    component->setActive(false);
+                    component->terminate();
+                }
+            } catch (...) {}
+            processor = nullptr;
+            controller = nullptr;
+            component = nullptr;
+            factory = nullptr;
+        };
+        if (onQtThread() || !QCoreApplication::instance() ||
+            !invokeOnQtThreadBlocking(teardownPlugin)) teardownPlugin();
         plugFrame = nullptr;
         parameterChanges.clear();
-        editorError.clear();
+        clearEditorError();
         setEditorStage(EditorStage::None);
         outputWritten.store(false, std::memory_order_release);
         ownerObserved.store(false, std::memory_order_release);
         configuredRate.store(0, std::memory_order_release);
         configuredBlock.store(0, std::memory_order_release);
-        try { if (processor) processor->setProcessing(false); } catch (...) {}
-        try {
-            if (component) {
-                component->setActive(false);
-                component->terminate();
-            }
-        } catch (...) {}
-        processor = nullptr;
-        component = nullptr;
-        factory = nullptr;
         if (exit) {
             exit();
             exit = nullptr;
@@ -575,7 +634,7 @@ struct RuntimeEffect {
             const bool separateController = static_cast<bool>(controller);
             if (!controller) controller = FUnknownPtr<IEditController>(component.get());
             if (!controller) {
-                editorError = "runtime_vst3_controller_create_failed";
+                setEditorError("runtime_vst3_controller_create_failed");
                 controllerSetupCompleted = true;
                 return;
             }
@@ -587,8 +646,8 @@ struct RuntimeEffect {
             separateControllerInitialized = separateController && succeeded(controllerInit);
             if (!succeeded(controllerInit)) {
                 controller = nullptr;
-                editorError = "runtime_vst3_controller_initialize_failed_" +
-                    std::to_string(static_cast<long>(controllerInit));
+                setEditorError("runtime_vst3_controller_initialize_failed_" +
+                    std::to_string(static_cast<long>(controllerInit)));
                 controllerSetupCompleted = true;
                 return;
             }
@@ -607,7 +666,7 @@ struct RuntimeEffect {
                     controller->setComponentState(&componentState);
                 }
             } else {
-                editorError = "runtime_vst3_component_handler_failed";
+                setEditorError("runtime_vst3_component_handler_failed");
             }
             controllerSetupCompleted = true;
         });
@@ -619,7 +678,10 @@ struct RuntimeEffect {
             error = "runtime_vst3_controller_initialize_failed";
             return false;
         }
-        if (!controller && !editorError.empty()) error = editorError;
+        if (!controller) {
+            const auto controllerError = getEditorError();
+            if (!controllerError.empty()) error = controllerError;
+        }
         if (!parameterChanges.prepare(controller.get())) {
             error = "runtime_vst3_parameter_setup_failed";
             return false;
@@ -730,17 +792,17 @@ struct RuntimeEffect {
         editorTrace("open.begin");
         setEditorStage(EditorStage::Requested);
         if (!onQtThread()) {
-            editorError = "editor_ui_thread_required";
+            setEditorError("editor_ui_thread_required");
             setEditorStage(EditorStage::Failed, Steinberg::kNotImplemented);
             return false;
         }
         if (!ready.load(std::memory_order_acquire) || !controller || !parentWindow) {
             if (!controller) setEditorStage(EditorStage::ControllerMissing, Steinberg::kNoInterface);
-            editorError = editorError.empty() ? "editor_host_unavailable" : editorError;
+            if (getEditorError().empty()) setEditorError("editor_host_unavailable");
             return false;
         }
         if (!IsWindow(parentWindow)) {
-            editorError = "editor_host_invalid";
+            setEditorError("editor_host_invalid");
             setEditorStage(EditorStage::Failed, Steinberg::kInvalidArgument);
             return false;
         }
@@ -755,11 +817,11 @@ struct RuntimeEffect {
                 setEditorStage(EditorStage::Focus);
                 const auto focused = editor->onFocus(true);
                 if (!succeeded(focused)) {
-                    editorError = "editor_focus_failed";
+                    setEditorError("editor_focus_failed");
                     setEditorStage(EditorStage::Failed, focused);
                     return false;
                 }
-            } catch (...) { editorError = "editor_focus_failed"; setEditorStage(EditorStage::Failed); return false; }
+            } catch (...) { setEditorError("editor_focus_failed"); setEditorStage(EditorStage::Failed); return false; }
             return true;
         }
         try {
@@ -872,7 +934,7 @@ struct RuntimeEffect {
                         editorParent = parentWindow;
                         editorAttached.store(true, std::memory_order_release);
                     } else {
-                        editorError = workerError.empty() ? "editor_attach_failed" : workerError;
+                        setEditorError(workerError.empty() ? "editor_attach_failed" : workerError);
                         if (workerResult == Steinberg::kResultFalse)
                             setEditorStage(EditorStage::Failed, workerResult);
                     }
@@ -918,17 +980,17 @@ struct RuntimeEffect {
             }
             if (!workerSucceeded) {
                 if (editorThread.joinable()) editorThread.join();
-                if (editorError.empty()) editorError = "editor_attach_failed";
+                if (getEditorError().empty()) setEditorError("editor_attach_failed");
                 return false;
             }
             setEditorStage(EditorStage::Visible);
             editorTrace("open.visible");
-            editorError.clear();
+            clearEditorError();
             return true;
         } catch (...) {
             editorTrace("open.exception");
             closeEditor();
-            editorError = "editor_exception";
+            setEditorError("editor_exception");
             setEditorStage(EditorStage::Failed);
             return false;
         }
@@ -1150,7 +1212,7 @@ struct SelectionSlot {
 struct TrackRuntime {
     SelectionSlot trackSlots[2];
     effects::Chain chain;
-    std::size_t count = 0;
+    std::atomic<std::size_t> count{0};
     std::string trackKey;
     std::string trackId;
     std::string scoreKey;
@@ -1173,7 +1235,7 @@ struct TrackRuntime {
         chain.deactivate();
         trackSlots[0].shutdown();
         trackSlots[1].shutdown();
-        count = 0;
+        count.store(0, std::memory_order_release);
         configuredRate.store(0, std::memory_order_release);
         processBlocks.store(0, std::memory_order_relaxed);
         processedBlocks.store(0, std::memory_order_relaxed);
@@ -1202,7 +1264,7 @@ struct TrackRuntime {
             return false;
         }
         if (!trackSlots[target].prepare(entries, rate, maxBlock, previous, error)) return false;
-        count = entries.size();
+        count.store(entries.size(), std::memory_order_release);
         if (entries.empty()) {
             chain.clearFault();
             chain.setBypassed(true);
@@ -1225,7 +1287,7 @@ struct TrackRuntime {
     bool processBlock(const audio::BlockView &block, bool *actuallyProcessed = nullptr) noexcept {
         if (actuallyProcessed) *actuallyProcessed = false;
         processBlocks.fetch_add(1, std::memory_order_relaxed);
-        if (!configured.load(std::memory_order_acquire) || count == 0 ||
+        if (!configured.load(std::memory_order_acquire) || count.load(std::memory_order_acquire) == 0 ||
             configuredRate.load(std::memory_order_acquire) != static_cast<int>(block.sampleRate)) {
             bypassBlocks.fetch_add(1, std::memory_order_relaxed);
             return true;
@@ -1497,6 +1559,9 @@ bool processInputChain(void *context, const audio::BlockView &block) noexcept;
 void rejectSavedEntry(const Vst3SelectionEntry &entry, const std::string &error,
                       state::ScopeKind scope, const std::string &score = {},
                       const std::string &track = {}, int trackIndex = -1);
+void rejectSavedEntryOnQtThread(const Vst3SelectionEntry &entry, const std::string &error,
+                                state::ScopeKind scope, const std::string &score = {},
+                                const std::string &track = {}, int trackIndex = -1) noexcept;
 
 bool containsIdentity(const std::vector<Vst3SelectionEntry> &entries,
                       const Vst3SelectionEntry &value) noexcept {
@@ -1594,8 +1659,8 @@ void selectionWorkerLoop() {
                         std::string("runtime_vst3_selection_prepare_failed") : error;
                     for (const auto &entry : selection)
                         if (!containsIdentity(g_runtime.appliedSelection, entry))
-                            rejectSavedEntry(entry, rejected,
-                                             state::ScopeKind::Global);
+                            rejectSavedEntryOnQtThread(entry, rejected,
+                                                       state::ScopeKind::Global);
                     g_runtime.requestedSelection = g_runtime.appliedSelection;
                     g_runtime.selectionPreparedNanoseconds.store(steadyNanoseconds(), std::memory_order_release);
                     g_runtime.selectionStatus.store(4, std::memory_order_release);
@@ -1621,9 +1686,9 @@ void selectionWorkerLoop() {
                             std::string("runtime_vst3_selection_prepare_failed") : error;
                         for (const auto &entry : selection)
                             if (!containsIdentity(runtime->requested, entry))
-                                rejectSavedEntry(entry, rejected,
-                                                 state::ScopeKind::Track, runtime->scoreKey,
-                                                 runtime->trackKey, runtime->trackIndex);
+                                rejectSavedEntryOnQtThread(entry, rejected,
+                                                           state::ScopeKind::Track, runtime->scoreKey,
+                                                           runtime->trackKey, runtime->trackIndex);
                         runtime->error = error.empty() ? prepareError : error;
                         runtime->failedSelection = selection;
                         g_runtime.selectionPreparedNanoseconds.store(steadyNanoseconds(), std::memory_order_release);
@@ -1756,6 +1821,15 @@ void rejectSavedEntry(const Vst3SelectionEntry &entry, const std::string &error,
     if (state::writeChain(chain)) g_selectionStateChanged = true;
 }
 
+void rejectSavedEntryOnQtThread(const Vst3SelectionEntry &entry, const std::string &error,
+                                state::ScopeKind scope, const std::string &score,
+                                const std::string &track, int trackIndex) noexcept {
+    if (onQtThread() || !invokeOnQtThreadBlocking([&] {
+            rejectSavedEntry(entry, error, scope, score, track, trackIndex);
+        }))
+        rejectSavedEntry(entry, error, scope, score, track, trackIndex);
+}
+
 void saveTrackRuntime(TrackRuntime &runtime) {
     const auto active = runtime.chain.snapshot().activeSlot;
     if (active < 0) return;
@@ -1818,7 +1892,8 @@ void refreshTrackContextImpl() noexcept {
         const auto requested = g_runtime.requestedTrackSelections.find(runtime.trackKey);
         pending |= requested != g_runtime.requestedTrackSelections.end() && !sameSelection(runtime.requested, requested->second) &&
             (runtime.error.empty() || !sameSelection(runtime.failedSelection, requested->second));
-        pending |= runtime.count > 0 && runtime.configuredRate.load() != rate;
+        pending |= runtime.count.load(std::memory_order_acquire) > 0 &&
+            runtime.configuredRate.load() != rate;
         pending |= runtime.chain.faulted();
     }
     if (!pending) return;
@@ -2339,7 +2414,7 @@ void dspProcessHook(void *self, void *buffer, void *scratch, void *ticks) {
     bool actuallyProcessed = false;
     const bool completed = trackRuntime->processBlock(block, &actuallyProcessed);
     const auto after = bufferHash(buffer);
-    if (completed && trackRuntime->count != 0) {
+    if (completed && trackRuntime->count.load(std::memory_order_acquire) != 0) {
         g_runtime.trackChainProcessBlocks.fetch_add(1, std::memory_order_relaxed);
         if (actuallyProcessed) {
             g_runtime.trackChainProcessedBlocks.fetch_add(1, std::memory_order_relaxed);
@@ -2430,6 +2505,7 @@ bool configureSelectedChain(const std::vector<Vst3SelectionEntry> &selection,
 
 State prepare(const host::Verification &verification, bool enableForSelection) noexcept {
     std::lock_guard<std::recursive_mutex> editorLock(g_runtime.editorMutex);
+    g_qtDispatchStopping.store(false, std::memory_order_release);
     g_verification = verification;
     State result;
     g_runtime.effectsChainIndex = nullptr;
@@ -2676,7 +2752,7 @@ State snapshot() noexcept {
             evidence.processedBlocks = runtime.processedBlocks.load(std::memory_order_relaxed);
             evidence.bypassBlocks = runtime.bypassBlocks.load(std::memory_order_relaxed);
             evidence.errorBlocks = runtime.errorBlocks.load(std::memory_order_relaxed);
-            evidence.configuredEffects = runtime.count;
+            evidence.configuredEffects = runtime.count.load(std::memory_order_acquire);
             evidence.configured = runtime.configured.load(std::memory_order_acquire);
             evidence.processed = runtime.processed.load(std::memory_order_acquire);
             evidence.writeObserved = runtime.writeObserved.load(std::memory_order_acquire);
@@ -2713,8 +2789,9 @@ State snapshot() noexcept {
     const auto active = chain.activeSlot >= 0 && chain.activeSlot < 2 ? chain.activeSlot : 0;
     if (g_runtime.selectionMode.load(std::memory_order_acquire)) {
         result.runtimeEffectName = g_runtime.selectionSlots[active].effects[0]->name;
-        result.runtimeEffectError = !g_runtime.selectionSlots[active].effects[0]->editorError.empty()
-            ? g_runtime.selectionSlots[active].effects[0]->editorError
+        const auto runtimeEditorError = g_runtime.selectionSlots[active].effects[0]->getEditorError();
+        result.runtimeEffectError = !runtimeEditorError.empty()
+            ? runtimeEditorError
             : g_runtime.selectionSlots[active].effects[0]->error;
     } else if (!selectionPublished) {
         result.runtimeEffectName = g_runtime.effects[active].name;
@@ -2917,6 +2994,7 @@ void reconfigureInputRouterIfNeeded() noexcept {
 }
 
 void shutdown() noexcept {
+    g_qtDispatchStopping.store(true, std::memory_order_release);
     stopSelectionWorker();
     std::lock_guard<std::recursive_mutex> editorLock(g_runtime.editorMutex);
     const auto openEditor = std::atomic_exchange(&g_openEditorEffect, std::shared_ptr<RuntimeEffect>{});
@@ -3399,7 +3477,7 @@ bool openVst3Editor(const Vst3SelectionEntry &entry, void *parentWindow) noexcep
             const bool opened = effect->openEditor(static_cast<HWND>(parentWindow));
             g_runtime.editorStage.store(effect->editorStage.load(std::memory_order_acquire), std::memory_order_release);
             g_runtime.editorResultCode.store(effect->editorResultCode.load(std::memory_order_acquire), std::memory_order_release);
-            g_runtime.editorError = effect->editorError;
+            g_runtime.editorError = effect->getEditorError();
             if (!opened) return false;
             std::atomic_store(&g_openEditorEffect, effect);
             return true;
@@ -3438,7 +3516,7 @@ bool openTrackVst3Editor(const std::string &trackKey, const Vst3SelectionEntry &
                 const bool opened = effect->openEditor(static_cast<HWND>(parentWindow));
                 g_runtime.editorStage.store(effect->editorStage.load(std::memory_order_acquire), std::memory_order_release);
                 g_runtime.editorResultCode.store(effect->editorResultCode.load(std::memory_order_acquire), std::memory_order_release);
-                g_runtime.editorError = effect->editorError;
+                g_runtime.editorError = effect->getEditorError();
                 if (!opened) return false;
                 std::atomic_store(&g_openEditorEffect, effect);
                 return true;
@@ -3475,7 +3553,7 @@ void scaleVst3Editor(void *host, double factor) noexcept {
                 plugFrame->resizeView(editor.get(), &size);
         }
     } catch (...) {
-        keepAlive->editorError = "editor_scale_exception";
+        keepAlive->setEditorError("editor_scale_exception");
     }
 }
 

@@ -1,6 +1,6 @@
 # P10 实现记录
 
-状态：已实施；真实 Guitar Pro UI 回归通过（目标版本 `v0.9.8`，2026-09-13）。
+状态：已实施；真实 Guitar Pro UI 回归通过（目标版本 `v0.9.9`，2026-09-13）。
 关联计划：[P10 editor/音频生效优化计划](P10_EDITOR_AUDIO_ACTIVATION_PLAN.md)
 
 ## 修复内容
@@ -17,6 +17,13 @@
 - 保留 P10 已有的 selection generation、准备/提交时间戳、首个处理 callback 和 bypass 观测字段。
 - `editor_stage` 和 `editor_result_code` 覆盖 `create_view`、`platform_check`、`set_frame`、`get_size`、`attached`、`visible`、`removed`、`failed` 等阶段；失败仍保持中性 UI 文案。
 
+### 异步审计修复
+
+- `RuntimePlugFrame::resizeView` 的重入标志改为原子状态，避免多个 editor 回调同时调整窗口时发生数据竞争。
+- 音轨 runtime 的效果数量和 editor 错误状态分别使用原子/互斥保护，避免音频线程、准备线程和诊断快照交叉读写未定义状态。
+- Qt 阻塞调用改为可取消的排队调用；退出阶段不再永久等待已经停止的 Qt 事件循环。插件 component/controller 的释放也回到 Qt 线程执行，后台失败状态写入通过 Qt 控制线程串行化。
+- 侧栏等待准备期间如果音轨上下文或 catalog 已变化，会清理过期的 editor 请求，避免稍后误打开旧实例。
+
 ## 真实 MCP 验证
 
 验证使用已安装的 MCP bridge 驱动 Guitar Pro 8.1.1.17，未使用 computer use。命令入口为：
@@ -29,6 +36,8 @@
 ```
 
 通过证据目录：`artifacts/mcp-p7-c759c17ee0b44595a298f47c5314752e`。
+
+异步审计后的复验目录：`artifacts/mcp-p7-e6a08efe7c7f49d2a161c647efb926f7`；P10 套件目录：`.tools/native/async-audit-final-suite2`。
 
 - 窗口标题为 `Archetype Mateus Asato · VST3`，尺寸 `1510x1153`，`non_modal=true`，`editor_stage=visible`，`editor_error=""`。
 - 重复触发复用同一 `window_id`，窗口仍可见；关闭后 `editor_stage=removed`，Guitar Pro 保持响应。
