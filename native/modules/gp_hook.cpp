@@ -1633,14 +1633,17 @@ void selectionWorkerLoop() {
             }
             g_runtime.selectionWorkerBusy.store(true, std::memory_order_release);
             g_runtime.selectionWorkerStartedNanoseconds.store(steadyNanoseconds(), std::memory_order_release);
-            g_runtime.selectionStatus.store(2, std::memory_order_release);
+            // A context-only maintenance pass must not masquerade as a VST3
+            // selection preparation. Keeping the last terminal status is
+            // essential for diagnostics and for the UI's pending-editor gate.
+            if (!contextRefresh)
+                g_runtime.selectionStatus.store(2, std::memory_order_release);
         }
         if (contextRefresh) {
             refreshTrackContextWorkerImpl(std::move(contextBindings), contextDiscovered);
             // Do not call the selection notifier here: bootstrap maps that
             // notifier to scheduleTrackRefresh(), which would enqueue the
             // same context request again and starve real selection work.
-            if (const auto notifier = g_trackContextNotifier.load(std::memory_order_acquire)) notifier();
             g_runtime.selectionWorkerBusy.store(false, std::memory_order_release);
             {
                 std::lock_guard<std::mutex> requestLock(g_runtime.selectionRequestMutex);
@@ -1648,20 +1651,24 @@ void selectionWorkerLoop() {
                     g_runtime.trackContextRequestPending)
                     g_runtime.selectionStatus.store(1, std::memory_order_release);
             }
+            // Publish completion only after busy/pending state is visible. A
+            // Qt notifier can run immediately and must be able to refresh the
+            // selector/editor in the same turn.
+            if (const auto notifier = g_trackContextNotifier.load(std::memory_order_acquire)) notifier();
             continue;
         }
         {
             // Only the worker waits for runtime ownership. Qt's observation,
             // capture and editor paths try this lock and defer while busy.
             std::lock_guard<std::recursive_mutex> editorLock(g_runtime.editorMutex);
+            // Hook installation and all host object reads are performed by the
+            // Qt/control thread before a request is queued. The worker must
+            // never call prepare(), which reads Guitar Pro state and can block
+            // the host UI while the selection is being constructed.
             std::string prepareError;
-            bool prepared = true;
-            if (!selection.empty() && ((trackKey.empty() && !g_runtime.master.installed) ||
-                                       (!trackKey.empty() && !g_runtime.dsp.installed))) {
-                const auto preparedState = prepare(g_verification, true);
-                prepared = preparedState.installed;
-                if (!prepared) prepareError = preparedState.reason;
-            }
+            const bool prepared = selection.empty() ||
+                (trackKey.empty() ? g_runtime.master.installed : g_runtime.dsp.installed);
+            if (!prepared) prepareError = "hook_install_failed";
             std::lock_guard<std::mutex> lock(g_runtime.selectionMutex);
             bool stale = false;
             {
@@ -1737,7 +1744,6 @@ void selectionWorkerLoop() {
                 }
             }
             g_selectionStateChanged.store(true, std::memory_order_release);
-            if (const auto notifier = g_selectionNotifier.load(std::memory_order_acquire)) notifier();
         }
         g_runtime.selectionWorkerBusy.store(false, std::memory_order_release);
         {
@@ -1745,6 +1751,10 @@ void selectionWorkerLoop() {
             if (g_runtime.selectionRequestPending || !g_runtime.pendingTrackSelections.empty())
                 g_runtime.selectionStatus.store(1, std::memory_order_release);
         }
+        // Notify after releasing both runtime locks and clearing the busy bit;
+        // otherwise the queued UI refresh can observe a permanently pending
+        // selection and leave a failed/pending editor stale.
+        if (const auto notifier = g_selectionNotifier.load(std::memory_order_acquire)) notifier();
     }
 }
 
@@ -1775,7 +1785,7 @@ void stopSelectionWorker() noexcept {
 }
 
 bool sameSelection(const std::vector<Vst3SelectionEntry> &left,
-                  const std::vector<Vst3SelectionEntry> &right) noexcept {
+                   const std::vector<Vst3SelectionEntry> &right) noexcept {
     if (left.size() != right.size()) return false;
     for (std::size_t index = 0; index < left.size(); ++index)
         if (left[index].module != right[index].module || left[index].classId != right[index].classId ||
@@ -1905,7 +1915,11 @@ void refreshTrackContextWorkerImpl(std::vector<gp_audio::Binding> bindings,
                                    std::size_t discovered) noexcept {
     if (g_inEditorCallback) return;
     if (!g_initial.hostSupported) return;
-    updateAudioLayerState();
+    // This function runs on the selection worker. Do not read AudioLayer or
+    // AudioCore here: those Guitar Pro private objects are thread-affine and
+    // the old P11 move could leave the host UI/MCP request blocked forever.
+    // The control thread publishes the current sample rate/state before it
+    // queues this immutable binding snapshot.
     const auto selected = std::find_if(bindings.begin(), bindings.end(),
         [](const gp_audio::Binding &binding) { return binding.activeDocument && binding.selectedTrack; });
     const bool haveSelectedBinding = selected != bindings.end();
@@ -2052,10 +2066,9 @@ const Runtime::TrackDispatch *findTrackDispatch(void *self) noexcept {
 
 void updateAudioLayerState() noexcept;
 double callbackSampleRate() noexcept {
-    if (g_runtime.sampleRate && g_runtime.audioCore) {
-        const auto rate = g_runtime.sampleRate(g_runtime.audioCore);
-        if (rate > 0) return static_cast<double>(rate);
-    }
+    // The worker and real-time paths only consume the atomically published
+    // value. The private AudioCore getter is sampled by updateAudioLayerState
+    // on the control thread (and by the host's audio callback).
     const auto observedRate = g_runtime.rate.load(std::memory_order_relaxed);
     if (observedRate > 0) return static_cast<double>(observedRate);
     return 44100.0;
@@ -2223,6 +2236,13 @@ input::Route configuredInputRoute() noexcept {
 }
 
 void updateAudioLayerState() noexcept {
+    // Sample rate is a control value shared with the selection worker. Keep
+    // this host getter out of worker code and publish only the value needed by
+    // processors; the audio callback may refresh the same atomic as well.
+    if (g_runtime.sampleRate && g_runtime.audioCore) {
+        const auto rate = g_runtime.sampleRate(g_runtime.audioCore);
+        if (rate > 0) g_runtime.rate.store(rate, std::memory_order_relaxed);
+    }
     if (!g_runtime.audioLayer) return;
     if (g_runtime.audioLayerInputLevel) {
         const auto level = g_runtime.audioLayerInputLevel(g_runtime.audioLayer);
@@ -2307,8 +2327,11 @@ bool configureInputSelection(const std::vector<Vst3SelectionEntry> &selection,
         refreshInputParameterMirrors();
         return true;
     }
-    if (g_runtime.inputRouter.channelCapacity() == 0 && !configureInputRouter()) {
-        if (error) *error = "input_router_prepare_failed";
+    if (g_runtime.inputRouter.channelCapacity() == 0) {
+        // Router preparation reads AudioLayer state and therefore belongs to
+        // the control thread. Explicit selection requests prepare it before
+        // waking this worker; never recreate it from here as a fallback.
+        if (error) *error = "input_router_not_prepared";
         return false;
     }
 
@@ -2548,6 +2571,9 @@ EntryPointObservation observe(HMODULE module, const char *symbol) noexcept {
 
 void refreshTrackContext() noexcept {
     if (g_inEditorCallback || !g_initial.hostSupported) return;
+    // Host/Qt thread owns all Guitar Pro private object access. Publish the
+    // rate before handing the immutable binding values to the worker.
+    updateAudioLayerState();
     // QObject/GP model reads remain on the host thread. Only the copied
     // binding values cross into the worker, which owns all chain maintenance.
     const auto discovered = gpvst3::gp_audio::refreshIfNeeded();
@@ -2571,6 +2597,11 @@ void refreshTrackContext() noexcept {
         g_runtime.trackContextRequestPending = true;
     }
     g_runtime.selectionCondition.notify_one();
+}
+
+bool editorCallbackActive() noexcept {
+    return g_inEditorCallback ||
+        static_cast<bool>(std::atomic_load(&g_openEditorEffect));
 }
 
 void setSelectionNotifier(SelectionNotifier notifier) noexcept {
@@ -2641,6 +2672,7 @@ State prepare(const host::Verification &verification, bool enableForSelection) n
         g_runtime.sampleRate = reinterpret_cast<SampleRateFn>(GetProcAddress(amaudio, kSampleRate));
         const auto coreInstance = reinterpret_cast<AudioCoreInstanceFn>(GetProcAddress(amaudio, kAudioCoreInstance));
         if (coreInstance) g_runtime.audioCore = coreInstance();
+        updateAudioLayerState();
         const bool master = install(g_runtime.master, GetProcAddress(gprse, kMasterProcess),
                                     reinterpret_cast<void *>(&masterProcessHook), kMasterPrologue,
                                     kMasterPatchBytes);
@@ -3298,6 +3330,7 @@ bool setVst3Selection(const std::vector<Vst3SelectionEntry> &selection, std::str
     std::lock_guard<std::mutex> lock(g_runtime.selectionMutex);
     if (!g_runtime.master.installed && selection.empty()) {
         g_runtime.requestedSelection.clear();
+        g_runtime.appliedSelection.clear();
         return true;
     }
     if (!configureSelectedChain(selection, error)) {
@@ -3305,6 +3338,7 @@ bool setVst3Selection(const std::vector<Vst3SelectionEntry> &selection, std::str
         return false;
     }
     g_runtime.requestedSelection = selection;
+    g_runtime.appliedSelection = selection;
     g_runtime.selectionPreparedNanoseconds.store(steadyNanoseconds(), std::memory_order_release);
     g_runtime.selectionCommittedNanoseconds.store(steadyNanoseconds(), std::memory_order_release);
     g_runtime.audioGeneration.fetch_add(1, std::memory_order_acq_rel);
@@ -3323,6 +3357,22 @@ bool requestGlobalVst3Selection(const std::vector<Vst3SelectionEntry> &selection
     if (error) error->clear();
     if (selection.size() > SelectionSlot::kMaxEffects) {
         if (error) *error = "runtime_vst3_chain_full";
+        return false;
+    }
+    // A first explicit selection enables the hooks. Keep this host-facing
+    // operation on the Qt/control thread; only VST3 processor construction is
+    // deferred to the worker below.
+    if (!selection.empty() && !g_runtime.master.installed) {
+        updateAudioLayerState();
+        const auto prepared = prepare(g_verification, true);
+        if (!prepared.installed) {
+            if (error) *error = prepared.reason;
+            return false;
+        }
+    }
+    if (!selection.empty() && g_runtime.stream.installed && inputFeatureEnabled() &&
+        g_runtime.inputRouter.channelCapacity() == 0 && !configureInputRouter()) {
+        if (error) *error = "input_router_prepare_failed";
         return false;
     }
     startSelectionWorker();
@@ -3478,6 +3528,19 @@ bool requestTrackVst3Selection(const std::string &trackKey,
         if (error) *error = "runtime_vst3_chain_full";
         return false;
     }
+    if (!selection.empty() && !g_runtime.dsp.installed) {
+        updateAudioLayerState();
+        const auto prepared = prepare(g_verification, true);
+        if (!prepared.installed) {
+            if (error) *error = prepared.reason;
+            return false;
+        }
+    }
+    if (!selection.empty() && g_runtime.stream.installed && inputFeatureEnabled() &&
+        g_runtime.inputRouter.channelCapacity() == 0 && !configureInputRouter()) {
+        if (error) *error = "input_router_prepare_failed";
+        return false;
+    }
     // Track runtimes already have an independent fixed table. Queueing the
     // request through the same worker keeps processor construction off Qt;
     // the current binding is validated before accepting it.
@@ -3506,6 +3569,27 @@ bool requestTrackVst3Selection(const std::string &trackKey,
     }
     g_runtime.selectionCondition.notify_one();
     return true;
+}
+
+bool sameSelectionIdentity(const std::vector<Vst3SelectionEntry> &left,
+                           const std::vector<Vst3SelectionEntry> &right) noexcept {
+    if (left.size() != right.size()) return false;
+    for (std::size_t index = 0; index < left.size(); ++index)
+        if (left[index].module != right[index].module || left[index].classId != right[index].classId)
+            return false;
+    return true;
+}
+
+bool vst3SelectionMatches(const std::string &trackKey,
+                          const std::vector<Vst3SelectionEntry> &selection) noexcept {
+    std::lock_guard<std::mutex> lock(g_runtime.selectionMutex);
+    if (trackKey.empty()) return sameSelectionIdentity(g_runtime.appliedSelection, selection);
+    const auto requested = g_runtime.requestedTrackSelections.find(trackKey);
+    if (requested != g_runtime.requestedTrackSelections.end())
+        return sameSelectionIdentity(requested->second, selection);
+    for (const auto &runtime : g_runtime.trackRuntimes)
+        if (runtime.trackKey == trackKey) return sameSelectionIdentity(runtime.requested, selection);
+    return selection.empty();
 }
 
 std::vector<Vst3SelectionEntry> captureGlobalVst3States() {

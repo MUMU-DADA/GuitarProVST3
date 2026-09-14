@@ -45,8 +45,9 @@ struct HostTrackIdentity {
     int index = -1;
     TrackKey runtimeKey;
 };
-// Resolve session identities to sidecar records. Index is used only when a
-// document is first opened; subsequent inserts, moves and undo follow trackId.
+// Resolve session identities to sidecar records. Track ids normally follow
+// the native Track lifetime; when Guitar Pro rebuilds that object, the id can
+// change even though the document and track position are unchanged.
 bool reconcileTrackIdentities(std::vector<HostTrackIdentity> &tracks);
 void resetTrackIdentities();
 bool writeStatus(const QJsonObject &status);

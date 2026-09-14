@@ -28,6 +28,10 @@ void initialize() noexcept;
 void shutdown() noexcept;
 void setRefreshNotifier(RefreshNotifier notifier) noexcept;
 void markDirty() noexcept;
+// Marks only the active-document/selected-track context dirty. This schedules
+// the same coalesced control pass without forcing a native track/effects-chain
+// collection for every document-view show/hide event.
+void markSelectionDirty() noexcept;
 bool refreshNeeded() noexcept;
 
 // Refreshes the immutable chain binding snapshot. Must run on the Qt/control

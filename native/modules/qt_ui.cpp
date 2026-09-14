@@ -56,6 +56,7 @@ bool (*g_vst3BusyControl)() noexcept = nullptr;
 QString g_pendingEditorKey;
 Vst3TrackSelectionControl g_vst3TrackSelectionControl = nullptr;
 Vst3TrackSelectionRequestControl g_vst3TrackSelectionRequestControl = nullptr;
+Vst3SelectionMatchControl g_vst3SelectionMatchControl = nullptr;
 Vst3StateControl g_vst3StateControl = nullptr;
 Vst3TrackStateControl g_vst3TrackStateControl = nullptr;
 Vst3TrackEditorControl g_vst3TrackEditorControl = nullptr;
@@ -437,7 +438,7 @@ QDialog *aboutDialog() {
     title->setFont(titleFont);
     layout->addWidget(title);
     auto *details = new QLabel(
-        QStringLiteral("版本：0.9.7\n"
+        QStringLiteral("版本：0.9.11\n"
                        "已验证宿主：Guitar Pro 8.1.1.17（Windows x64）\n"
                        "许可证：MIT License\n"
                        "第三方声明：VST3 SDK 及插件各自遵循其许可证。\n"
@@ -508,8 +509,7 @@ protected:
     bool eventFilter(QObject *object, QEvent *event) override {
         if (object && event &&
             (event->type() == QEvent::ChildAdded || event->type() == QEvent::ChildRemoved ||
-             event->type() == QEvent::LayoutRequest || event->type() == QEvent::Show ||
-             event->type() == QEvent::WindowActivate)) {
+             event->type() == QEvent::Show || event->type() == QEvent::WindowActivate)) {
             // Guitar Pro rebuilds the title/sidebar hierarchy while changing
             // score pages. Reattach after the host finishes that mutation so
             // the About entry survives toolbar replacement immediately.
@@ -712,6 +712,19 @@ public:
     }
 
     void reloadSavedSelection() {
+        // A successful asynchronous request already has the same identities
+        // in the live chain as the checked rows. Rebuilding the QListWidget in
+        // that case only destroys the QObject handles that MCP just observed,
+        // and was the source of both visible flicker and "object no longer
+        // exists" races during a score/track edit. Rebuild only when the
+        // worker rejected or otherwise changed the actual selection.
+        if (selectionRowsMatchLive()) {
+            bool anyEnabled = false;
+            for (const auto &value : effects_) anyEnabled |= value.toObject().value("enabled").toBool();
+            setProperty("gpvst3SelectionState", "applied");
+            if (status_ && anyEnabled) status_->setText(QStringLiteral("已生效。"));
+            return;
+        }
         loadChain();
         bool failed = false, anyEnabled = false;
         for (const auto &value : effects_) {
@@ -753,10 +766,10 @@ public:
     }
 
     void syncSelection() {
-        // Selection completion is delivered by the control maintenance tick
-        // (the same tick that reloads failed entries). This avoids a 50 ms
-        // UI polling loop while still retrying exactly once after the worker
-        // has published the prepared slot.
+        // Selection completion is delivered by the coalesced control
+        // notification (the same path that reloads failed entries). This
+        // avoids a 50 ms UI polling loop while still retrying exactly once
+        // after the worker has published the prepared slot.
         if (!g_pendingEditorKey.isEmpty() && (!g_vst3BusyControl || !g_vst3BusyControl())) {
             bool matched = false;
             for (int index = 0; index < effects_.size(); ++index) {
@@ -1171,6 +1184,19 @@ private:
         return availableList_;
     }
 
+    bool selectionRowsMatchLive() const {
+        if (!g_vst3SelectionMatchControl) return false;
+        std::vector<Vst3SelectionEntry> desired;
+        for (const auto &value : effects_) {
+            const auto effect = value.toObject();
+            if (!effect.value("enabled").toBool() || !effect.value("identified").toBool()) continue;
+            desired.push_back({effect.value("module").toString().toStdString(),
+                               effect.value("class_id").toString().toStdString()});
+        }
+        return g_vst3SelectionMatchControl(
+            scope_ == state::ScopeKind::Track ? trackKey_.toStdString() : std::string{}, desired);
+    }
+
     int indexFor(const QString &identity) const {
         for (int i = 0; i < effects_.size(); ++i) if (key(effects_.at(i).toObject()) == identity) return i;
         return -1;
@@ -1436,6 +1462,10 @@ void setVst3TrackSelectionControl(Vst3TrackSelectionControl control) noexcept {
 
 void setVst3TrackSelectionRequestControl(Vst3TrackSelectionRequestControl control) noexcept {
     g_vst3TrackSelectionRequestControl = control;
+}
+
+void setVst3SelectionMatchControl(Vst3SelectionMatchControl control) noexcept {
+    g_vst3SelectionMatchControl = control;
 }
 
 void setVst3StateControl(Vst3StateControl control) noexcept {

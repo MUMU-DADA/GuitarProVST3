@@ -1,6 +1,6 @@
 param(
     [ValidatePattern('^\d+\.\d+\.\d+([-.][A-Za-z0-9.]+)?$')]
-    [string]$Version = '0.9.7',
+    [string]$Version = '0.9.11',
     [string]$PluginPath = '',
     [string]$OutputDirectory = ''
 )

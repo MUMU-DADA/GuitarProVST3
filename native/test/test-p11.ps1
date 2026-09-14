@@ -36,6 +36,16 @@ $snapshotBody = if ($snapshotStart -ge 0) {
 if ($snapshotBody -match 'updateAudioLayerState\(\)|reconfigureInputRouterIfNeeded\(\)') {
     throw 'P11 static gate found a snapshot side effect.'
 }
+$audioRuntime = Get-Content -LiteralPath (Join-Path $root 'native/modules/gp_audio_runtime.cpp') -Raw
+$selectionStart = $audioRuntime.IndexOf('bool refreshSelectionContext() noexcept')
+$selectionBody = if ($selectionStart -ge 0) {
+    $tail = $audioRuntime.Substring($selectionStart)
+    $end = [regex]::Match($tail, '(?m)^}').Index
+    $tail.Substring(0, $end + 1)
+} else { '' }
+if ($selectionBody -match 'g_dirty\.store\(false') {
+    throw 'P11 static gate found selection-only refresh clearing structure dirtiness.'
+}
 
 $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio/Installer/vswhere.exe'
 $vsInstall = & $vswhere -latest -products '*' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath

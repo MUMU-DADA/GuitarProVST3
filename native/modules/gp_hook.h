@@ -219,6 +219,9 @@ void shutdown() noexcept;
 // Refresh the verified GuitarProMCP EffectsChain -> track binding table on
 // the Qt/control thread. The audio callback only consumes its atomics.
 void refreshTrackContext() noexcept;
+// True while a native VST3 editor is opening or visible. Maintenance dispatch
+// must avoid starting host/MCP collection during that editor lifetime.
+bool editorCallbackActive() noexcept;
 void setSelectionNotifier(SelectionNotifier notifier) noexcept;
 // Control-thread notification after a failed restored/running entry was
 // persisted as disabled; the UI reloads the actual accepted selection.
@@ -250,6 +253,11 @@ bool setTrackVst3Selection(const std::string &trackKey,
 bool requestTrackVst3Selection(const std::string &trackKey,
                                const std::vector<Vst3SelectionEntry> &selection,
                                std::string *error = nullptr) noexcept;
+// Lightweight control-thread identity check used by the selector after an
+// asynchronous request. It reads published selections only and never calls a
+// VST3 component's getState, so a successful request does not rebuild Qt rows.
+bool vst3SelectionMatches(const std::string &trackKey,
+                          const std::vector<Vst3SelectionEntry> &selection) noexcept;
 std::vector<Vst3SelectionEntry> captureGlobalVst3States();
 std::vector<Vst3SelectionEntry> captureTrackVst3States(const std::string &trackKey);
 // Open the editor owned by the currently active processing instance. The

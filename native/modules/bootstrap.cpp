@@ -29,6 +29,8 @@ void notifyTrackContextComplete() noexcept {
     auto *application = QCoreApplication::instance();
     if (!application) return;
     QMetaObject::invokeMethod(application, [] {
+        if (gpvst3::hook::consumeSelectionStateChanges())
+            gpvst3::ui::reloadVst3Selections();
         gpvst3::ui::syncVst3Selection();
         gpvst3::ui::refreshVst3TrackContext();
     }, Qt::QueuedConnection);
@@ -36,6 +38,16 @@ void notifyTrackContextComplete() noexcept {
 
 void dispatchTrackRefresh() {
     g_trackRefreshQueued.store(false, std::memory_order_release);
+    // openVst3Editor intentionally runs a nested Qt loop while a third-party
+    // view is attached. Do the cheap guard before touching the MCP bridge or
+    // Guitar Pro's object graph; either can wait on the host's RSE update and
+    // make the editor (and every MCP request) appear hung.
+    if (gpvst3::hook::editorCallbackActive()) {
+        // Retain the deferred refresh: markDirty() coalesces an already-dirty
+        // graph and cannot emit another notification by itself.
+        QTimer::singleShot(100, QCoreApplication::instance(), [] { scheduleTrackRefresh(); });
+        return;
+    }
     // A cursor move is available from the MCP bridge without rebuilding the
     // native object graph. Apply that small context snapshot first; the hook
     // performs a full collection only when the structure dirty bit remains.
@@ -418,6 +430,7 @@ QJsonObject initialize() {
         ui::setVst3BusyControl(&hook::vst3SelectionPending);
         ui::setVst3TrackSelectionControl(&hook::setTrackVst3Selection);
         ui::setVst3TrackSelectionRequestControl(&hook::requestTrackVst3Selection);
+        ui::setVst3SelectionMatchControl(&hook::vst3SelectionMatches);
         ui::setVst3StateControl(&hook::captureGlobalVst3States);
         ui::setVst3TrackControls(&hook::captureTrackVst3States, &hook::openTrackVst3Editor);
         ui::setVst3EditorControl(&hook::openVst3Editor, &hook::closeVst3Editors, &hook::scaleVst3Editor);
@@ -427,6 +440,7 @@ QJsonObject initialize() {
         ui::setVst3SelectionRequestControl(nullptr);
         ui::setVst3TrackSelectionControl(nullptr);
         ui::setVst3TrackSelectionRequestControl(nullptr);
+        ui::setVst3SelectionMatchControl(nullptr);
         ui::setVst3StateControl(nullptr);
         ui::setVst3TrackControls(nullptr, nullptr);
         ui::setVst3EditorControl(nullptr, nullptr, nullptr);
@@ -455,10 +469,14 @@ QJsonObject initialize() {
             if (!unresolved) {
                 unresolvedRecoveryRequested = false;
                 unresolvedAttempts = 0;
-                // A host may finish constructing a newly inserted sound
-                // after the first complete snapshot. Keep a short bounded
-                // settling window for that lifecycle gap, then stop.
+                // Keep only a short settling window for a host that publishes
+                // the document/track selection a little after its first
+                // binding snapshot. It is bounded and skips all collection
+                // while a native editor is pumping Qt; stable sessions then
+                // stop the timer permanently.
+                if (gpvst3::hook::editorCallbackActive()) return;
                 if (settlingAttempts++ >= 5) {
+                    settlingAttempts = 0;
                     g_trackFallbackTimer->stop();
                     return;
                 }

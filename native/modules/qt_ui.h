@@ -15,6 +15,7 @@ using Vst3SelectionControl = bool (*)(const std::vector<Vst3SelectionEntry> &, s
 using Vst3SelectionRequestControl = bool (*)(const std::vector<Vst3SelectionEntry> &, std::string *) noexcept;
 using Vst3TrackSelectionControl = bool (*)(const std::string &, const std::vector<Vst3SelectionEntry> &, std::string *) noexcept;
 using Vst3TrackSelectionRequestControl = bool (*)(const std::string &, const std::vector<Vst3SelectionEntry> &, std::string *) noexcept;
+using Vst3SelectionMatchControl = bool (*)(const std::string &, const std::vector<Vst3SelectionEntry> &) noexcept;
 using Vst3StateControl = std::vector<Vst3SelectionEntry> (*)();
 using Vst3TrackStateControl = std::vector<Vst3SelectionEntry> (*)(const std::string &);
 using Vst3TrackEditorControl = bool (*)(const std::string &, const Vst3SelectionEntry &, void *) noexcept;
@@ -33,6 +34,7 @@ void setVst3SelectionRequestControl(Vst3SelectionRequestControl control) noexcep
 void setVst3BusyControl(bool (*control)() noexcept) noexcept;
 void setVst3TrackSelectionControl(Vst3TrackSelectionControl control) noexcept;
 void setVst3TrackSelectionRequestControl(Vst3TrackSelectionRequestControl control) noexcept;
+void setVst3SelectionMatchControl(Vst3SelectionMatchControl control) noexcept;
 void setVst3StateControl(Vst3StateControl control) noexcept;
 void setVst3TrackControls(Vst3TrackStateControl state, Vst3TrackEditorControl editor) noexcept;
 void setVst3EditorControl(Vst3EditorControl open, Vst3EditorCloseControl close,

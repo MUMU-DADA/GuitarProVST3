@@ -2,17 +2,76 @@
 // buffers. Only host discovery and editor window placement are substituted.
 #include "../modules/gp_hook.cpp"
 #include <chrono>
+#include <atomic>
 #include <iostream>
 #include <stdexcept>
 #include <QtCore/QCoreApplication>
+#include <QtCore/QDir>
 #include <QtCore/QThread>
+#include <QtCore/QUuid>
 #include <QtWidgets/QWidget>
 
 namespace {
 std::vector<gpvst3::gp_audio::Binding> testBindings;
 int testRate = 44100;
-int readRate(const void *) { return testRate; }
+std::atomic<int> offThreadHostReads{0};
+bool onQtThread() { return qApp && QThread::currentThread() == qApp->thread(); }
+int readRate(const void *) { if (!onQtThread()) ++offThreadHostReads; return testRate; }
+float readInputLevel(const void *) { if (!onQtThread()) ++offThreadHostReads; return 0.25F; }
+bool readStreamRunning(const void *) { if (!onQtThread()) ++offThreadHostReads; return true; }
+int readBufferSize(const void *) { if (!onQtThread()) ++offThreadHostReads; return 512; }
 void require(bool value, const char *message) { if (!value) throw std::runtime_error(message); }
+
+void verifyTrackIdentitySurvivesHostRebuild() {
+    const auto previousDataDirectory = qgetenv("GPVST3_DATA_DIR");
+    const auto dataDirectory = QDir::temp().filePath(
+        QStringLiteral("gpvst3-identity-test-%1").arg(QUuid::createUuid().toString(QUuid::WithoutBraces)));
+    qputenv("GPVST3_DATA_DIR", dataDirectory.toUtf8());
+    try {
+        gpvst3::state::resetTrackIdentities();
+        QJsonObject chain;
+        const QJsonArray effects{QJsonObject{{"module", "fixture.vst3"},
+                                              {"class_id", "fixture"},
+                                              {"enabled", true}}};
+        gpvst3::state::setScopeEffects(chain, gpvst3::state::ScopeKind::Track,
+                                       effects, "score", "persistent-track", 0);
+        require(gpvst3::state::writeChain(chain), "write identity continuity fixture");
+
+        std::vector<gpvst3::state::HostTrackIdentity> first{{
+            "document", "score", "native-track-before-rebuild", 0, {}}};
+        require(gpvst3::state::reconcileTrackIdentities(first),
+                "initial track identity reconciliation");
+        const auto persistentKey = first.front().runtimeKey;
+
+        // Guitar Pro can replace the core Track object during a score/RSE
+        // rebuild. The native pointer based id changes, but the track index is
+        // still the only stable identity available to this bridge.
+        std::vector<gpvst3::state::HostTrackIdentity> rebuilt{{
+            "document", "score", "native-track-after-rebuild", 0, {}}};
+        require(gpvst3::state::reconcileTrackIdentities(rebuilt),
+                "reconciled rebuilt track identity");
+        require(rebuilt.front().runtimeKey == persistentKey,
+                "track rebuild must preserve the persisted runtime key");
+
+        std::vector<gpvst3::state::HostTrackIdentity> inserted{
+            {"document", "score", "native-track-inserted", 0, {}},
+            {"document", "score", "native-track-after-rebuild", 1, {}}};
+        require(gpvst3::state::reconcileTrackIdentities(inserted),
+                "reconciled inserted track identities");
+        require(inserted[1].runtimeKey == persistentKey,
+                "moved track must retain its persisted runtime key");
+        require(inserted[0].runtimeKey != persistentKey,
+                "inserted track must not steal a moved track runtime key");
+    } catch (...) {
+        QDir(dataDirectory).removeRecursively();
+        if (previousDataDirectory.isEmpty()) qunsetenv("GPVST3_DATA_DIR");
+        else qputenv("GPVST3_DATA_DIR", previousDataDirectory);
+        throw;
+    }
+    QDir(dataDirectory).removeRecursively();
+    if (previousDataDirectory.isEmpty()) qunsetenv("GPVST3_DATA_DIR");
+    else qputenv("GPVST3_DATA_DIR", previousDataDirectory);
+}
 }
 namespace gpvst3::gp_audio {
 std::size_t refresh() noexcept { return testBindings.size(); }
@@ -32,6 +91,7 @@ extern "C" __declspec(dllexport) int gpvst3_run_runtime_tests(const char *fixtur
     using namespace gpvst3::hook;
     try {
         require(fixture && *fixture && qApp, "test VST3 path and real Qt host required");
+        verifyTrackIdentitySurvivesHostRebuild();
         std::vector<Vst3SelectionEntry> entries;
         for (const auto &id : {"41302010605080701122334455667788", "42302010605080701122334455667788", "43302010605080701122334455667788"})
             entries.push_back({fixture, id});
@@ -50,6 +110,10 @@ extern "C" __declspec(dllexport) int gpvst3_run_runtime_tests(const char *fixtur
         // control API after substituting discovery and the rate accessor.
         g_runtime.master.installed = true; g_runtime.dsp.installed = true;
         g_runtime.sampleRate = &readRate; g_runtime.audioCore = reinterpret_cast<void *>(1);
+        g_runtime.audioLayer = reinterpret_cast<void *>(1);
+        g_runtime.audioLayerInputLevel = &readInputLevel;
+        g_runtime.audioLayerIsRunning = &readStreamRunning;
+        g_runtime.audioLayerBufferSize = &readBufferSize;
         auto waitMaintenance = [&] {
             const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
             while (vst3SelectionPending() && std::chrono::steady_clock::now() < deadline) {
@@ -76,6 +140,12 @@ extern "C" __declspec(dllexport) int gpvst3_run_runtime_tests(const char *fixtur
         qunsetenv("GPVST3_TEST_INITIALIZE_DELAY_MS");
         require(!vst3SelectionPending(),
                 "VST3 processors finish asynchronous initialization");
+        require(g_runtime.selectionStatus.load(std::memory_order_acquire) == 3,
+                "completed selection publishes the applied status");
+        refreshTrackContext();
+        waitMaintenance();
+        require(g_runtime.selectionStatus.load(std::memory_order_acquire) == 3,
+                "context maintenance does not overwrite the applied status");
         auto &track = g_runtime.trackRuntimes[0];
         auto *trackProcessor = track.trackSlots[track.chain.snapshot().activeSlot].effects[0].get();
         auto *globalProcessor = g_runtime.selectionSlots[g_runtime.chain.snapshot().activeSlot].effects[0].get();
@@ -142,6 +212,8 @@ extern "C" __declspec(dllexport) int gpvst3_run_runtime_tests(const char *fixtur
             reset(); require(g_runtime.chain.process(block(rate)).completed && std::abs(left[0] - 0.5125F) < 0.000001F,
                 "global actual sample after reconfiguration");
         }
+        require(offThreadHostReads.load() == 0,
+                "selection worker must not call thread-affine Guitar Pro audio accessors");
         auto missing = entries; missing[1].module = "C:/missing/P8 Missing.vst3";
         require(!setTrackVst3Selection("track", missing, &error) && error == "runtime_vst3_not_found", "missing explicit selection rejected");
         reset(); require(track.processBlock(block(testRate)) && std::abs(left[0] - 0.5125F) < 0.000001F,

@@ -654,7 +654,6 @@ bool reconcileTrackIdentities(std::vector<HostTrackIdentity> &bindings) {
         for (const auto &binding : bindings) documents.insert(binding.documentId);
         for (const auto &documentId : documents) {
             if (documentId.isEmpty()) continue;
-            const bool reopened = !sessions.contains(documentId);
             auto &session = sessions[documentId];
             const auto first = std::find_if(bindings.begin(), bindings.end(),
                 [&](const HostTrackIdentity &binding) { return binding.documentId == documentId; });
@@ -673,21 +672,37 @@ bool reconcileTrackIdentities(std::vector<HostTrackIdentity> &bindings) {
                 record.insert("present", false);
                 it.value() = record;
             }
+            QSet<QString> usedPersistentKeys;
+            // Reserve identities that are still present before matching any
+            // replacement. A newly inserted track at index 0 must not take
+            // the record of the original track that moved to index 1.
+            for (const auto &binding : bindings) {
+                if (binding.documentId != documentId) continue;
+                const auto key = session.persistentKeys.value(binding.trackId);
+                if (!key.isEmpty()) usedPersistentKeys.insert(key);
+            }
             for (const auto &binding : bindings) {
                 if (binding.documentId != documentId || binding.trackId.isEmpty() || binding.index < 0) continue;
                 auto key = session.persistentKeys.value(binding.trackId);
-                if (key.isEmpty() && reopened) {
+                if (key.isEmpty()) {
+                    // A score/RSE rebuild may replace every native Track
+                    // object in place. Preserve the existing sidecar record
+                    // by position when the new native id is not known, but
+                    // never assign one record to two live tracks in a pass.
                     QStringList candidates;
                     for (auto it = previous.begin(); it != previous.end(); ++it) {
                         const auto record = it.value().toObject();
-                        if (record.value("present").toBool(true) && record.value("track_index").toInt(-1) == binding.index)
+                        if (record.value("present").toBool(true) &&
+                            record.value("track_index").toInt(-1) == binding.index &&
+                            !usedPersistentKeys.contains(it.key()))
                             candidates.append(it.key());
                     }
-                    if (candidates.size() == 1 && !session.persistentKeys.values().contains(candidates.front()))
+                    if (candidates.size() == 1)
                         key = candidates.front();
                 }
                 if (key.isEmpty()) key = QStringLiteral("track-") + QUuid::createUuid().toString(QUuid::WithoutBraces);
                 session.persistentKeys.insert(binding.trackId, key);
+                usedPersistentKeys.insert(key);
                 auto record = tracks.value(key).toObject();
                 // New, unconfigured tracks only need a runtime key in this
                 // process. Persisting an empty record for each score is what

@@ -69,21 +69,33 @@ class ControllerObserver final : public QObject {
 public:
     bool eventFilter(QObject *object, QEvent *event) override {
         if (!object) return false;
-        if (event && event->type() == QEvent::ThreadChange) {
+        const auto type = event ? event->type() : QEvent::None;
+        if (type == QEvent::ThreadChange) {
             g_objects.forget(object);
             std::lock_guard<std::mutex> lock(mutex_);
             controllers_.removeAll(object);
             return false;
         }
+        // This observer is installed on qApp and therefore sees every Qt
+        // event. Skip class-name/property work for paint, timer, mouse and
+        // other high-frequency events; only lifecycle events can affect the
+        // controller/document graph or discover a controller.
+        if (event && type != QEvent::ChildAdded && type != QEvent::ChildRemoved &&
+            type != QEvent::Show && type != QEvent::Hide &&
+            type != QEvent::DynamicPropertyChange)
+            return false;
         const auto name = QByteArray(object->metaObject()->className());
         const bool relevant = name == "gp::rse::ConductorController" ||
             name == "gp::gui::IDocumentsManager" || name == "gp::gui::IDocument" ||
             name == "gp::gui::IDocumentView";
-        if (event && relevant && !object->property("gpvst3Owned").toBool() &&
-            (event->type() == QEvent::ChildAdded || event->type() == QEvent::ChildRemoved ||
-             event->type() == QEvent::LayoutRequest || event->type() == QEvent::Show ||
-             event->type() == QEvent::Hide || event->type() == QEvent::DynamicPropertyChange))
-            markDirty();
+        if (event && relevant && !object->property("gpvst3Owned").toBool()) {
+            const bool structureChanged = type == QEvent::ChildAdded || type == QEvent::ChildRemoved ||
+                type == QEvent::DynamicPropertyChange;
+            const bool selectionChanged = (type == QEvent::Show || type == QEvent::Hide) &&
+                name == "gp::gui::IDocumentView";
+            if (structureChanged) markDirty();
+            else if (selectionChanged) markSelectionDirty();
+        }
         if (name != "gp::rse::ConductorController" && name != "gp::gui::IDocumentsManager") return false;
         std::lock_guard<std::mutex> lock(mutex_);
         for (const auto &known : controllers_)
@@ -119,6 +131,7 @@ std::atomic<int> g_activeBuffer{0};
 std::atomic<std::size_t> g_bindingCount{0};
 std::atomic<std::uint64_t> g_generation{0};
 std::atomic<bool> g_dirty{true};
+std::atomic<bool> g_selectionDirty{false};
 std::atomic<RefreshNotifier> g_refreshNotifier{nullptr};
 std::atomic<std::uint64_t> g_structureSignature{0};
 std::atomic<std::size_t> g_expectedBridgeBindings{0};
@@ -429,12 +442,20 @@ void markDirty() noexcept {
     }
 }
 
+void markSelectionDirty() noexcept {
+    const bool wasDirty = g_selectionDirty.exchange(true, std::memory_order_acq_rel);
+    if (!wasDirty) {
+        if (const auto notifier = g_refreshNotifier.load(std::memory_order_acquire)) notifier();
+    }
+}
+
 bool refreshNeeded() noexcept { return g_dirty.load(std::memory_order_acquire); }
 
 void initialize() noexcept {
     if (g_observer || !qApp) return;
     try {
         g_dirty.store(true, std::memory_order_release);
+        g_selectionDirty.store(false, std::memory_order_release);
         g_observer = new ControllerObserver;
         g_observer->setParent(qApp);
         qApp->installEventFilter(g_observer);
@@ -450,6 +471,7 @@ void shutdown() noexcept {
     g_refreshNotifier.store(nullptr, std::memory_order_release);
     g_bindingSource.store("unresolved", std::memory_order_release);
     g_dirty.store(false, std::memory_order_release);
+    g_selectionDirty.store(false, std::memory_order_release);
     g_objects.uninstall();
     if (qApp && g_observer) qApp->removeEventFilter(g_observer);
     if (g_observer) g_observer->deleteLater();
@@ -554,6 +576,10 @@ bool checkStructureChanged() noexcept {
 
 bool refreshSelectionContext() noexcept {
     try {
+        // Consume the current notification before enumerating the bridge. If
+        // another view event arrives during the call, markSelectionDirty()
+        // sets it again and the next coalesced dispatch will not be lost.
+        g_selectionDirty.exchange(false, std::memory_order_acq_rel);
         bool available = false;
         const auto contexts = collectFromMcpBridge(&available);
         if (!available || contexts.empty()) return false;
@@ -587,10 +613,11 @@ bool refreshSelectionContext() noexcept {
             g_activeBuffer.store(target, std::memory_order_release);
             g_generation.fetch_add(1, std::memory_order_relaxed);
         }
-        // A complete, same-sized bridge snapshot is a selection-only update.
-        // Clear the generic dirty bit so the next hook pass does not repeat a
-        // full object-tree/native-chain collection for a cursor move.
-        if (complete) g_dirty.store(false, std::memory_order_release);
+        // This pass only updates active-document/selected-track flags. Keep
+        // the structure dirty bit owned by refresh(); a document rebuild can
+        // retain the same bridge count while replacing EffectsChain objects.
+        // Clearing g_dirty here would leave dispatch pointing at the old
+        // chain after P11 removed the periodic full refresh.
         return changed;
     } catch (...) {
         return false;
