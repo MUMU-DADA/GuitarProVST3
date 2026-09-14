@@ -63,7 +63,35 @@ P10 激活夹具验证下一 callback 旁路、warm/cold slot 首个处理块和
 ```
 
 状态文件中的 `selection_*`、`audio_generation`、`chain_*first_processed*` 和 `editor_stage/editor_result_code` 是 P10 的结构化证据入口。
-VST3 声音验收在 `IAudioProcessor::process()` 返回后的输出 bus 上执行：`p2_audio_adapter_test` 和 `p8_runtime_test` 必须观察到非静音 peak/RMS；真实宿主的 `test-p2-runtime.ps1` 与 `test-p8-track-runtime.ps1` 同时要求 `vst3_output_non_silent`、`vst3_output_peak` 和 `vst3_output_rms`。
+音频验收使用下方的电平变化门槛。`processed_blocks`、写回 hash 和历史成功标记仅供定位，不能作为声音验收条件。
+
+## 电平变化验收
+
+当前用户故障的验收目标是 **曲谱播放 → 音轨 VST3 的输入与输出**，适用于该路径上的所有插件。只有目标音轨的 VST3 实例通过本节输入/输出门槛，才能声明此项通过；全局链、设备输出和内部夹具的通过不替代音轨验收。`test-audio-levels.ps1` 默认选择 `track`，必须提供准确的 `-TrackKey`，可用 `-ExpectedModule` 锁定插件路径。
+
+`test-p2-runtime.ps1`、`test-p7-mcp.ps1`（非 `-EditorOnly`）、`test-p8-track-runtime.ps1` 和 `test-p8-standalone.ps1` 自动启用 `GPVST3_DIAGNOSTIC_MODE=detailed`，在播放期间同时检测所选 VST3 链末端和最终设备回调输出。P11 的 `-RunHost` 入口继承双音轨脚本的门槛。旁路、故障回退测试会明确标注未执行声音验收。
+
+- 默认采样窗口为 4 秒，要求至少 6 个不同且新鲜的电平样本，覆盖至少 3 秒；实例、选择请求和音频 generation 必须保持一致。
+- 冷启动等待独立计时，默认最多 60 秒，可用 `-ReadyTimeoutSeconds` 指定。只有选择请求完成、目标链准备好、收到提交后的新鲜输出电平采样，才开始 4 秒窗口；等待超时区分 `preparing` 和 `waiting_for_callback`。就绪判断允许零电平进入检测，不能一直等到出现有声样本才开始验收。结果单独保存准备等待耗时。
+- 测量 peak、RMS 和去除各通道直流后的 AC RMS；RMS/AC RMS 的 20% 到 80% 分位差均须达到 **3 dB**，且线性 RMS 差至少为 **0.001**，有效信号至少为 **−60 dBFS**。对 `track`/`global` 目标还要求送入该 VST3 实例的 input AC RMS 达到同一门槛并有 3 dB 变化；输入全零、静态或只有低于门槛的噪声会直接失败。分位数避免单个脉冲造成误通过。
+- 明确拒绝全零、只有直流、恒定电平、微小噪声、NaN/Infinity、缺少字段、重复/过期样本、实例切换，以及有输入时持续静音或末段丢失输出。采样或连续静音超时为 750 ms；正常短暂停顿不会单独触发失败。
+- 原始样本、实际插件 module/class ID/instance、阈值、输入与输出 RMS/dBFS 变化、通过/失败和原因均保存到独立 `audio-levels.json`。失败时也保留证据。
+
+底层每约 100 ms 测量一个完整音频块，静音结果会覆盖旧值；`vst3_output_level` 对应 `IAudioProcessor::process()` 返回后的 bus，`audio_output_level` 对应 GP 和输入路由完成后的设备缓冲。序号只用于排除旧样本，不用于判断有声。采样值通过原子快照发布，音频线程不写文件、不分配存储、不等待诊断锁；常规诊断写盘频率保持不变。
+
+单独检查正在播放的会话：启动 Guitar Pro 前设置 `$env:GPVST3_DIAGNOSTIC_MODE = 'detailed'`，启用目标插件并循环播放有明显强弱变化的测试乐句，再运行：
+
+```powershell
+./native/build.ps1 -OutputRoot .tools/native/audio-level-build
+./native/test/test-audio-level-gate.ps1
+./native/test/test-audio-levels.ps1 -ObservationPath 'C:/path/to/data/p2-observation.json' -Scope global
+./native/test/test-audio-levels.ps1 -ObservationPath 'C:/path/to/data/p2-observation.json' -Scope track -TrackKey '<track_runtime_evidence 中的准确 track_key>'
+./native/test/test-audio-levels.ps1 -ObservationPath 'C:/path/to/data/p2-observation.json' -Scope device
+```
+
+宿主必须实际加载新构建的 DLL；仅更新脚本、使用旧 JSON 会失败。可显式指定 `-DurationSeconds`、`-MinChangeDb`、`-MinRmsDbfs` 和 `-EvidencePath`，阈值会写入结果。脚本只读取本次测量期间的新电平，不向用户工程注入测试信号。恒定音量、强限制器压平动态、长休止或已结束的播放可能不满足此测试信号门槛，应使用合适的测试乐句重新测量，不应以处理块增长替代。
+
+该检查证明所选输出端在测量窗口内存在明确电平变化；它不是任意效果器音色正确、启停因果关系或扬声器声学输出的证明。`test-audio-level-gate.ps1` 覆盖错误证据的拒绝逻辑；`p2_audio_adapter_test` 和 `p8_runtime_test` 验证实际 bus 测量与先有声后全零时电平更新。
 
 ## P11 验证
 

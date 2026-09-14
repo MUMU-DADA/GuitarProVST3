@@ -24,6 +24,8 @@ using Vst3EditorCloseControl = void (*)() noexcept;
 using Vst3EditorScaleControl = void (*)(void *, double) noexcept;
 using Vst3RefreshControl = void (*)();
 using Vst3IdentifyControl = QJsonArray (*)(const QString &, QString *);
+using InputLevelSample = gpvst3::hook::InputLevelSample;
+using Vst3InputLevelControl = InputLevelSample (*)(bool, const std::string &) noexcept;
 
 // The P7 selector belongs to the sound section; the native plug-in editor
 // is a separate nonmodal window owned by the Guitar Pro main window.
@@ -40,6 +42,7 @@ void setVst3TrackControls(Vst3TrackStateControl state, Vst3TrackEditorControl ed
 void setVst3EditorControl(Vst3EditorControl open, Vst3EditorCloseControl close,
                          Vst3EditorScaleControl scale = nullptr) noexcept;
 void setVst3DiscoveryControl(Vst3RefreshControl refresh, Vst3IdentifyControl identify) noexcept;
+void setVst3InputLevelControl(Vst3InputLevelControl control) noexcept;
 void syncVst3Selection();
 void refreshVst3TrackContext();
 void reloadVst3Selections();

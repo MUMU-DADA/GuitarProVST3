@@ -225,6 +225,22 @@ QJsonArray identifyBundle(const QString &module, QString *error) {
 }
 
 QJsonObject hookStatus(const gpvst3::hook::State &value) {
+    const auto levelStatus = [](const gpvst3::audio::LevelSnapshot &level) {
+        return QJsonObject{
+            {"instance", QString::number(level.instance)},
+            {"sequence", static_cast<qint64>(level.sequence)},
+            {"sample_nanoseconds", static_cast<qint64>(level.nanoseconds)},
+            {"input_valid", level.input.valid}, {"input_peak", level.input.peak},
+            {"input_rms", level.input.rms}, {"input_ac_rms", level.input.acRms},
+            {"output_valid", level.output.valid}, {"output_peak", level.output.peak},
+            {"output_rms", level.output.rms}, {"output_ac_rms", level.output.acRms}};
+    };
+    const auto vst3LevelStatus = [&](const gpvst3::hook::Vst3LevelEvidence &level) {
+        auto result = levelStatus(level.measurement);
+        result.insert("module", QString::fromStdString(level.module));
+        result.insert("class_id", QString::fromStdString(level.classId));
+        return result;
+    };
     const auto entryStatus = [](const gpvst3::hook::EntryPointObservation &entry) {
         return QJsonObject{
             {"module_loaded", entry.moduleLoaded},
@@ -258,9 +274,14 @@ QJsonObject hookStatus(const gpvst3::hook::State &value) {
             {"write_observed", track.writeObserved},
             {"vst3_output_non_silent", track.vst3OutputNonSilent},
             {"vst3_output_peak", track.vst3OutputPeak},
-            {"vst3_output_rms", track.vst3OutputRms}});
+            {"vst3_output_rms", track.vst3OutputRms},
+            {"vst3_output_level", vst3LevelStatus(track.vst3OutputLevel)}});
     }
     return QJsonObject{
+        {"observation_nanoseconds", static_cast<qint64>(value.observationNanoseconds)},
+        {"selection_pending", value.selectionPending},
+        {"vst3_output_level", vst3LevelStatus(value.vst3OutputLevel)},
+        {"audio_output_level", levelStatus(value.audioOutputLevel)},
         {"installed", value.installed},
         {"enabled", value.enabled},
         {"host_supported", value.hostSupported},
@@ -440,6 +461,7 @@ QJsonObject initialize() {
         ui::setVst3StateControl(&hook::captureGlobalVst3States);
         ui::setVst3TrackControls(&hook::captureTrackVst3States, &hook::openTrackVst3Editor);
         ui::setVst3EditorControl(&hook::openVst3Editor, &hook::closeVst3Editors, &hook::scaleVst3Editor);
+        ui::setVst3InputLevelControl(&hook::inputLevelSample);
     } else {
         ui::setRealtimeBypassControl(nullptr);
         ui::setVst3SelectionControl(nullptr);
@@ -450,6 +472,7 @@ QJsonObject initialize() {
         ui::setVst3StateControl(nullptr);
         ui::setVst3TrackControls(nullptr, nullptr);
         ui::setVst3EditorControl(nullptr, nullptr, nullptr);
+        ui::setVst3InputLevelControl(nullptr);
     }
     const auto hookState = hook::snapshot();
     vst3::State vst3;

@@ -37,6 +37,8 @@ bool telemetryKey(const QString &key) {
     const auto name = key.toLower();
     return name.contains("count") || name.contains("sequence") || name.contains("address") ||
         name.contains("hash") || name.contains("peak") || name.contains("rms") ||
+        name.endsWith("_level") || name == QStringLiteral("observation_nanoseconds") ||
+        name == QStringLiteral("vst3_output_non_silent") ||
         name.contains("thread_id") || name.contains("frame_count") || name.endsWith("_blocks") ||
         name == QStringLiteral("last_process_nanoseconds") ||
         name == QStringLiteral("max_process_nanoseconds") ||

@@ -9,10 +9,12 @@ param(
     [switch]$CheckGain,
     [switch]$CheckCatalogRestart,
     [switch]$EditorOnly,
+    [double]$ReadyTimeoutSeconds = 60,
     [switch]$KeepHost
 )
 
 $ErrorActionPreference = 'Stop'
+. (Join-Path $PSScriptRoot 'audio-level-check.ps1')
 
 function Set-P7SoundSection($Session, $Restore = $null) {
     Invoke-McpTool $Session gp_window @{state='restore'} | Out-Null
@@ -68,6 +70,7 @@ $session = $null
 $soundSectionBefore = $null
 try {
     $environment = @{GPVST3_DATA_DIR=$dataDirectory}
+    if (-not $EditorOnly) { $environment.GPVST3_DIAGNOSTIC_MODE = 'detailed' }
     if ($HookMode -ne 'default') { $environment.GPVST3_ENABLE_P2_HOOK = if ($HookMode -eq 'disabled') { '0' } else { '1' } }
     # P7 owns its selected processors; leave the legacy single-effect probe
     # disabled so this test exercises the list-driven lifecycle in isolation.
@@ -249,7 +252,12 @@ try {
     $initialPlayback = Invoke-McpTool $session gp_playback @{operation='state';document=$operation.operation.document}
     Invoke-McpTool $session gp_playback @{operation='set_loop';document=$operation.operation.document;enabled=$true} | Out-Null
     $play = Invoke-McpTool $session gp_playback @{operation='play';document=$operation.operation.document}
-    Start-Sleep -Seconds 2
+    if ($EditorOnly) { Start-Sleep -Seconds 2 }
+    else {
+        $result.audio_levels = Measure-Gpvst3AudioLevels -ObservationPath $observationPath `
+            -Targets @(@{scope='global';module=$firstClass.module},@{scope='device'}) -ReadyTimeoutSeconds $ReadyTimeoutSeconds `
+            -EvidencePath (Join-Path $run 'audio-levels.json')
+    }
     $observation = Get-Content -LiteralPath $observationPath -Raw | ConvertFrom-Json
     $hook = $observation.gp_hook
     $result.one_enabled_observation = $hook

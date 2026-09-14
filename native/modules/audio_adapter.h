@@ -3,6 +3,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <vector>
+#include "audio_levels.h"
 
 namespace Steinberg::Vst {
 class IAudioProcessor;
@@ -74,8 +75,10 @@ struct ProcessResult {
     bool bypassed = false;
     bool outputWritten = false;
     bool ownerPointerObserved = false;
-    // Measured directly from the VST3 output bus before it is copied back to
-    // the host buffer. These values are the audio-output acceptance point.
+    // Current sampled input/output bus levels, before host writeback.
+    bool outputMeasured = false;
+    SignalLevel inputLevel;
+    SignalLevel outputLevel;
     bool outputNonSilent = false;
     float outputPeak = 0.0F;
     float outputRms = 0.0F;
@@ -91,6 +94,8 @@ ProcessResult process(Steinberg::Vst::IAudioProcessor &processor,
                       const BlockView &block, PlanarBuffer &scratch,
                       bool bypassed = false,
                       Steinberg::Vst::IParameterChanges *parameterChanges = nullptr,
-                      bool measureOutput = true) noexcept;
+                      bool measureOutput = true,
+                      std::size_t inputChannels = 0,
+                      std::size_t outputChannels = 0) noexcept;
 
 }

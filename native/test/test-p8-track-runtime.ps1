@@ -6,6 +6,7 @@ param(
     [switch]$CheckGain,
     [switch]$CheckLifecycle,
     [string]$ExpectedBindingSource = '',
+    [double]$ReadyTimeoutSeconds = 60,
     [ValidateSet('enabled', 'default')]
     [string]$HookMode = 'default',
     [switch]$KeepHost
@@ -24,6 +25,7 @@ foreach ($path in @((Join-Path $HostDirectory 'GuitarPro.exe'), $PluginPath, $mc
 $run = Join-Path $root ('artifacts/mcp-p8-track-' + [guid]::NewGuid().ToString('N'))
 New-Item -ItemType Directory -Force -Path $run | Out-Null
 . (Join-Path $PSScriptRoot 'host-session.ps1')
+. (Join-Path $PSScriptRoot 'audio-level-check.ps1')
 . $mcpClient
 $before = Get-Gpvst3HostSnapshot $HostDirectory
 $dataDirectory = $run
@@ -143,6 +145,7 @@ try {
         if ([IO.Path]::IsPathRooted($_)) { $_ } else { Join-Path $programFiles ('Common Files/VST3/' + $_) }
     })
     $environment = @{
+        GPVST3_DIAGNOSTIC_MODE = 'detailed'
         GPVST3_ENABLE_P2_EFFECT = '0'
         GPVST3_RUNTIME_VST3 = $vst3Paths[0]
         GPVST3_VST3_ROOT = $vst3Paths -join ';'
@@ -234,7 +237,13 @@ try {
     $initialPlayback = Invoke-McpTool $session gp_playback @{operation='state';document=$document}
     Invoke-McpTool $session gp_playback @{operation='set_loop';document=$document;enabled=$true} | Out-Null
     $play = Invoke-McpTool $session gp_playback @{operation='play';document=$document}
-    Start-Sleep -Seconds 3
+    Start-Sleep -Seconds 1
+    $levelTargets = @($result.before_play.gp_hook.track_runtime_evidence | ForEach-Object {
+        @{scope='track';track_key=$_.track_key}
+    }) + @(@{scope='device'})
+    if ($levelTargets.Count -ne 3) { throw 'Expected two selected track outputs and the device output for level acceptance.' }
+    $result.audio_levels = Measure-Gpvst3AudioLevels -ObservationPath (Join-Path $dataDirectory 'p2-observation.json') `
+        -Targets $levelTargets -EvidencePath (Join-Path $run 'audio-levels.json') -ReadyTimeoutSeconds $ReadyTimeoutSeconds
     $result.play = $play
     $result.observation = Get-Observation
     $hook = $result.observation.gp_hook
@@ -249,10 +258,6 @@ try {
     foreach ($evidence in @($hook.track_runtime_evidence)) {
         if (-not $evidence.processed -or (-not $CheckGain -and -not $evidence.write_observed) -or $evidence.processed_blocks -lt 1) {
             throw "Track runtime did not process/write back: $(Json $evidence)"
-        }
-        if (-not $evidence.vst3_output_non_silent -or $evidence.vst3_output_peak -le 0.000001 -or
-            $evidence.vst3_output_rms -le 0.0000001) {
-            throw "Track VST3 output bus was silent before host writeback: $(Json $evidence)"
         }
     }
     if ($CheckGain) {
@@ -401,7 +406,7 @@ try {
         }
     }
     $result | ConvertTo-Json -Depth 40 | Set-Content -LiteralPath (Join-Path $run 'verification.json') -Encoding UTF8
-    Write-Output "PASS: P8 two-track VST3 runtime mapping, processing and writeback. Evidence: $run"
+    Write-Output "PASS: P8 two-track mapping and measured VST3/device output level changes. Evidence: $run"
 }
 catch {
     $result.failure = $_.Exception.Message

@@ -3,12 +3,14 @@ param(
     [string]$PluginPath = '',
     [Parameter(Mandatory)][string]$ScorePath,
     [Parameter(Mandatory)][string]$SidecarPath,
-    [Parameter(Mandatory)][string]$Vst3Root
+    [Parameter(Mandatory)][string]$Vst3Root,
+    [double]$ReadyTimeoutSeconds = 60
 )
 $ErrorActionPreference = 'Stop'
 $root = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
 if (-not $PluginPath) { $PluginPath = Join-Path $root '.tools/native/p8-track-build/plugins/imageformats/guitarpro_vst3_autoload.dll' }
 . (Join-Path $PSScriptRoot 'host-session.ps1')
+. (Join-Path $PSScriptRoot 'audio-level-check.ps1')
 $ScorePath = (Resolve-Path -LiteralPath $ScorePath).Path
 $SidecarPath = (Resolve-Path -LiteralPath $SidecarPath).Path
 $run = Join-Path $root ('artifacts/p8-standalone-' + [guid]::NewGuid().ToString('N'))
@@ -29,6 +31,7 @@ $result = [ordered]@{run=$run;score=$fixture}
 try {
     $process = Start-Gpvst3TestHost -HostDirectory $HostDirectory -PluginPath $PluginPath -RunDirectory $run -Environment @{
         GPVST3_VST3_ROOT=$Vst3Root;GPVST3_RUNTIME_VST3=($Vst3Root -split ';')[0];GPVST3_ENABLE_P2_EFFECT='0'
+        GPVST3_DIAGNOSTIC_MODE='detailed'
         QT_PLUGIN_PATH=($driverRoot + ';' + (Split-Path -Parent (Split-Path -Parent ([IO.Path]::GetFullPath($PluginPath)))))
         QT_QPA_GENERIC_PLUGINS='gpvst3_test_driver';GPVST3_TEST_SCORE=$fixture
     }
@@ -57,10 +60,13 @@ try {
         -not $observation.gp_hook.track_runtime_processed -or -not $observation.gp_hook.track_runtime_write_observed -or
         $observation.gp_hook.global_chain_process_blocks -lt 1 -or @($actual | Where-Object { -not $_.processed -or -not $_.write_observed -or $_.error_blocks -gt 0 }).Count) { throw 'Independent playback/writeback evidence was not observed.' }
     $result.after_play = $observation
+    $targets = @($actual | ForEach-Object { @{scope='track';track_key=$_.track_key} }) + @(@{scope='global'},@{scope='device'})
+    $result.audio_levels = Measure-Gpvst3AudioLevels -ObservationPath $observationPath -Targets $targets `
+        -EvidencePath (Join-Path $run 'audio-levels.json') -ReadyTimeoutSeconds $ReadyTimeoutSeconds
     $process.Refresh()
     if (@($process.Modules | Where-Object ModuleName -ieq 'guitarpro_mcp.dll').Count) { throw 'MCP bridge appeared during playback.' }
     $result | ConvertTo-Json -Depth 30 | Set-Content -LiteralPath (Join-Path $run 'verification.json') -Encoding UTF8
-    Write-Output "PASS: P8 independent discovery, all-track/global restore and real audio writeback with no MCP bridge. Evidence: $run"
+    Write-Output "PASS: P8 independent discovery, restore and measured track/global/device output level changes. Evidence: $run"
 }
 catch {
     $result.failure = $_.Exception.Message

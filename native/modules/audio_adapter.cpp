@@ -58,7 +58,7 @@ void PlanarBuffer::clear() noexcept {
 
 ConversionResult copyToPlanar(const BlockView &source, PlanarBuffer &target) noexcept {
     ConversionResult result;
-    if (source.frameCount > target.frameCapacity() || source.channelCount > target.channelCount())
+    if (source.frameCount > target.frameCapacity())
         return result;
     if (source.frameCount == 0 || source.channelCount == 0) {
         result.valid = true;
@@ -66,11 +66,23 @@ ConversionResult copyToPlanar(const BlockView &source, PlanarBuffer &target) noe
     }
     for (std::size_t channel = 0; channel < target.channelCount(); ++channel) {
         auto *destination = target.inputChannels()[channel];
+        // If the host supplies stereo to a mono bus, fold the channels into
+        // the single input.  For a wider host buffer, copy the matching
+        // channels and clear any channels that are not part of the source.
         const auto *input = channel < source.channelCount ? sourceChannel(source, channel) : nullptr;
         if (input)
             std::memcpy(destination, input, source.frameCount * sizeof(float));
         else
             std::fill(destination, destination + source.frameCount, 0.0F);
+    }
+    if (target.channelCount() == 1 && source.channelCount > 1) {
+        auto *destination = target.inputChannels()[0];
+        const auto *left = sourceChannel(source, 0);
+        const auto *right = sourceChannel(source, 1);
+        if (left && right) {
+            for (std::size_t frame = 0; frame < source.frameCount; ++frame)
+                destination[frame] = 0.5F * (left[frame] + right[frame]);
+        }
     }
     result.valid = true;
     result.channelsCopied = std::min(source.channelCount, target.channelCount());
@@ -121,8 +133,10 @@ bool bypass(const BlockView &block) noexcept {
 ProcessResult process(Steinberg::Vst::IAudioProcessor &processor,
                       const BlockView &block, PlanarBuffer &scratch, bool bypassed,
                       Steinberg::Vst::IParameterChanges *parameterChanges,
-                      bool measureOutput) noexcept {
+                      bool measureOutput, std::size_t inputChannels,
+                      std::size_t outputChannels) noexcept {
     ProcessResult result;
+    result.outputMeasured = measureOutput;
     result.frames = block.frameCount;
     result.channels = block.channelCount;
     result.ownerPointerObserved = block.owner != nullptr;
@@ -155,18 +169,26 @@ ProcessResult process(Steinberg::Vst::IAudioProcessor &processor,
     for (std::size_t channel = 0; channel < scratch.channelCount(); ++channel)
         std::fill(scratch.outputChannels()[channel],
                   scratch.outputChannels()[channel] + block.frameCount, 0.0F);
+    // A VST3 host must describe the active bus layout exactly.  Historically
+    // this adapter always advertised one input and one output bus, even for a
+    // component whose negotiated layout had no bus (or a mono bus).  Several
+    // commercial effects then accept process() but leave both streams empty.
+    const auto inChannels = inputChannels ? inputChannels : block.channelCount;
+    const auto outChannels = outputChannels ? outputChannels : block.channelCount;
+    if (inChannels > scratch.channelCount() || outChannels > scratch.channelCount())
+        { result.error = "bus_channel_mismatch"; return result; }
     Steinberg::Vst::AudioBusBuffers inputBus;
-    inputBus.numChannels = static_cast<Steinberg::int32>(block.channelCount);
+    inputBus.numChannels = static_cast<Steinberg::int32>(inChannels);
     inputBus.channelBuffers32 = scratch.inputChannels();
     Steinberg::Vst::AudioBusBuffers outputBus;
-    outputBus.numChannels = static_cast<Steinberg::int32>(block.channelCount);
+    outputBus.numChannels = static_cast<Steinberg::int32>(outChannels);
     outputBus.channelBuffers32 = scratch.outputChannels();
     Steinberg::Vst::ProcessData data;
     data.processMode = Steinberg::Vst::kRealtime;
     data.symbolicSampleSize = Steinberg::Vst::kSample32;
     data.numSamples = static_cast<Steinberg::int32>(block.frameCount);
-    data.numInputs = block.channelCount == 0 ? 0 : 1;
-    data.numOutputs = block.channelCount == 0 ? 0 : 1;
+    data.numInputs = inChannels == 0 ? 0 : 1;
+    data.numOutputs = outChannels == 0 ? 0 : 1;
     data.inputs = data.numInputs ? &inputBus : nullptr;
     data.outputs = data.numOutputs ? &outputBus : nullptr;
     data.inputParameterChanges = parameterChanges;
@@ -174,34 +196,47 @@ ProcessResult process(Steinberg::Vst::IAudioProcessor &processor,
     data.inputEvents = nullptr;
     data.outputEvents = nullptr;
     data.processContext = nullptr;
+    if (measureOutput)
+        result.inputLevel = inChannels == 0 ? SignalLevel{} :
+            measurePlanar(scratch.inputChannels(), inChannels, block.frameCount);
     const auto processResult = processor.process(data);
     if (processResult != Steinberg::kResultOk && processResult != Steinberg::kResultTrue) {
         result.error = "processor_process_failed";
         return result;
     }
     if (measureOutput) {
-        float peak = 0.0F;
-        double sumSquares = 0.0;
-        std::size_t sampleCount = 0;
-        for (std::size_t channel = 0; channel < block.channelCount; ++channel) {
-            const auto *samples = scratch.outputChannels()[channel];
-            for (std::size_t frame = 0; frame < block.frameCount; ++frame) {
-                const auto value = samples[frame];
-                if (!std::isfinite(value)) {
-                    result.error = "processor_non_finite_output";
-                    return result;
-                }
-                peak = (std::max)(peak, std::fabs(value));
-                sumSquares += static_cast<double>(value) * static_cast<double>(value);
-                ++sampleCount;
-            }
+        result.outputLevel = outChannels == 0 ? SignalLevel{} :
+            measurePlanar(scratch.outputChannels(), outChannels, block.frameCount);
+        if (!result.outputLevel.valid) {
+            result.error = "processor_non_finite_output";
+            return result;
         }
-        result.outputPeak = peak;
-        result.outputRms = sampleCount == 0
-            ? 0.0F : static_cast<float>(std::sqrt(sumSquares / sampleCount));
-        result.outputNonSilent = peak > 0.000001F;
+        result.outputPeak = result.outputLevel.peak;
+        result.outputRms = result.outputLevel.rms;
+        result.outputNonSilent = result.outputPeak > 0.000001F;
     }
-    const auto written = copyFromPlanar(scratch, block);
+    // A mono VST3 output is a valid effect layout even when Guitar Pro's
+    // borrowed buffer is stereo.  Map the negotiated bus back to the host
+    // channels instead of treating the second channel as a missing write.
+    ConversionResult written;
+    if (block.frameCount == 0 || block.channelCount == 0) {
+        written.valid = true;
+    } else {
+        written.valid = true;
+        written.channelsCopied = block.channelCount;
+        written.framesCopied = block.frameCount;
+        for (std::size_t channel = 0; channel < block.channelCount; ++channel) {
+            auto *destination = targetChannel(block, channel);
+            const auto sourceChannelIndex = channel < outChannels ? channel :
+                (outChannels == 1 ? std::size_t{0} : outChannels);
+            if (!destination || sourceChannelIndex >= outChannels) {
+                written.valid = false;
+                continue;
+            }
+            std::memcpy(destination, scratch.outputChannels()[sourceChannelIndex],
+                        block.frameCount * sizeof(float));
+        }
+    }
     result.processed = written.valid;
     result.outputWritten = written.valid;
     result.error = written.valid ? "none" : "output_buffer";

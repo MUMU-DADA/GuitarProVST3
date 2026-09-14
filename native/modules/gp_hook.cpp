@@ -417,9 +417,13 @@ struct RuntimeEffect {
     std::atomic<bool> outputNonSilent{false};
     std::atomic<float> outputPeak{0.0F};
     std::atomic<float> outputRms{0.0F};
+    audio::LevelProbe outputLevel;
     std::atomic<bool> ownerObserved{false};
     std::atomic<int> configuredRate{0};
     std::atomic<std::size_t> configuredBlock{0};
+    std::atomic<std::size_t> inputBusChannels{0};
+    std::atomic<std::size_t> outputBusChannels{0};
+    std::atomic<bool> audioBusesConfigured{false};
     bool forceError = false;
     std::atomic_flag processing = ATOMIC_FLAG_INIT;
 
@@ -501,9 +505,13 @@ struct RuntimeEffect {
         outputNonSilent.store(false, std::memory_order_release);
         outputPeak.store(0.0F, std::memory_order_relaxed);
         outputRms.store(0.0F, std::memory_order_relaxed);
+        outputLevel.reset();
         ownerObserved.store(false, std::memory_order_release);
         configuredRate.store(0, std::memory_order_release);
         configuredBlock.store(0, std::memory_order_release);
+        inputBusChannels.store(0, std::memory_order_release);
+        outputBusChannels.store(0, std::memory_order_release);
+        audioBusesConfigured.store(false, std::memory_order_release);
         if (exit) {
             exit();
             exit = nullptr;
@@ -608,6 +616,12 @@ struct RuntimeEffect {
                         component->activateBus(Steinberg::Vst::kAudio, direction, index, true);
                 }
             }
+            processor = FUnknownPtr<IAudioProcessor>(component.get());
+            if (!processor) {
+                error = "runtime_vst3_processor_missing";
+                componentSetupCompleted = true;
+                return;
+            }
             componentStateReady = succeeded(component->getState(&componentState));
             if (componentStateReady) {
                 componentState.seek(0, Steinberg::IBStream::kIBSeekSet, nullptr);
@@ -619,7 +633,6 @@ struct RuntimeEffect {
             if (error.empty()) error = "runtime_vst3_component_ui_thread_unavailable";
             return false;
         }
-        processor = FUnknownPtr<IAudioProcessor>(component.get());
         if (!processor) {
             error = "runtime_vst3_processor_missing";
             return false;
@@ -699,12 +712,71 @@ struct RuntimeEffect {
         setup.symbolicSampleSize = Steinberg::Vst::kSample32;
         setup.maxSamplesPerBlock = static_cast<Steinberg::int32>(maxSamplesPerBlock);
         setup.sampleRate = sampleRate;
-        if (!succeeded(processor->setupProcessing(setup))) {
-            error = "runtime_vst3_processing_setup_failed";
-            return false;
-        }
-        if (!succeeded(component->setActive(true)) || !succeeded(processor->setProcessing(true)) ||
-            !scratch.prepare(2, maxSamplesPerBlock)) {
+        bool processingSetup = false;
+        const bool processingInvoked = invokeOnQtThreadBlocking([&] {
+            // setupProcessing and setActive are UI/control-thread contracts in
+            // VST3.  Keeping them on the same thread as initialize and bus
+            // negotiation avoids processors that remain alive but never bind
+            // their audio streams after a worker-thread setup.
+            if (!succeeded(processor->setupProcessing(setup))) return;
+            const auto inputCount = component->getBusCount(Steinberg::Vst::kAudio,
+                                                            Steinberg::Vst::kInput);
+            const auto outputCount = component->getBusCount(Steinberg::Vst::kAudio,
+                                                             Steinberg::Vst::kOutput);
+            if (inputCount <= 0 || outputCount <= 0) return;
+            const auto defaultArrangement = [](Steinberg::int32 channels) {
+                return channels == 1 ? Steinberg::Vst::SpeakerArr::kMono :
+                    channels == 2 ? Steinberg::Vst::SpeakerArr::kStereo :
+                    Steinberg::Vst::SpeakerArrangement{};
+            };
+            std::vector<Steinberg::Vst::SpeakerArrangement> inputArrangements(
+                static_cast<std::size_t>(inputCount));
+            std::vector<Steinberg::Vst::SpeakerArrangement> outputArrangements(
+                static_cast<std::size_t>(outputCount));
+            Steinberg::Vst::BusInfo inputBus{};
+            Steinberg::Vst::BusInfo outputBus{};
+            for (Steinberg::int32 index = 0; index < inputCount; ++index) {
+                Steinberg::Vst::BusInfo bus{};
+                if (!succeeded(component->getBusInfo(Steinberg::Vst::kAudio,
+                                                     Steinberg::Vst::kInput, index, bus)) ||
+                    bus.channelCount <= 0 || bus.channelCount > 2) return;
+                auto arrangement = defaultArrangement(bus.channelCount);
+                if (!succeeded(processor->getBusArrangement(Steinberg::Vst::kInput, index, arrangement)))
+                    arrangement = defaultArrangement(bus.channelCount);
+                inputArrangements[static_cast<std::size_t>(index)] = arrangement;
+                if (index == 0) inputBus = bus;
+            }
+            for (Steinberg::int32 index = 0; index < outputCount; ++index) {
+                Steinberg::Vst::BusInfo bus{};
+                if (!succeeded(component->getBusInfo(Steinberg::Vst::kAudio,
+                                                     Steinberg::Vst::kOutput, index, bus)) ||
+                    bus.channelCount <= 0 || bus.channelCount > 2) return;
+                auto arrangement = defaultArrangement(bus.channelCount);
+                if (!succeeded(processor->getBusArrangement(Steinberg::Vst::kOutput, index, arrangement)))
+                    arrangement = defaultArrangement(bus.channelCount);
+                outputArrangements[static_cast<std::size_t>(index)] = arrangement;
+                if (index == 0) outputBus = bus;
+            }
+            // Some legacy commercial processors return kResultFalse while
+            // mutating their internal layout to an unusable transient state.
+            // The default layout is already active after initialize; retain
+            // it unless the plug-in explicitly accepts the requested layout.
+            // Keep the component's default arrangement.  The runtime buffer
+            // is already stereo/mono matched and legacy processors can turn
+            // silent when setBusArrangements is called during activation.
+            inputBusChannels.store(static_cast<std::size_t>(inputBus.channelCount),
+                                   std::memory_order_release);
+            outputBusChannels.store(static_cast<std::size_t>(outputBus.channelCount),
+                                    std::memory_order_release);
+            audioBusesConfigured.store(true, std::memory_order_release);
+            processingSetup = succeeded(component->setActive(true)) &&
+                succeeded(processor->setProcessing(true));
+        });
+        const auto scratchChannels = (std::max)(inputBusChannels.load(std::memory_order_acquire),
+                                                outputBusChannels.load(std::memory_order_acquire));
+        if (!processingInvoked || !processingSetup || !audioBusesConfigured.load(std::memory_order_acquire) ||
+            scratchChannels == 0 ||
+            !scratch.prepare(scratchChannels, maxSamplesPerBlock)) {
             error = "runtime_vst3_processing_setup_failed";
             return false;
         }
@@ -1042,15 +1114,29 @@ struct RuntimeEffect {
         if (!ready.load(std::memory_order_acquire) || !processor || maxSamplesPerBlock == 0)
             return false;
         try {
-            processor->setProcessing(false);
-            component->setActive(false);
             Steinberg::Vst::ProcessSetup setup{};
             setup.processMode = Steinberg::Vst::kRealtime;
             setup.symbolicSampleSize = Steinberg::Vst::kSample32;
             setup.maxSamplesPerBlock = static_cast<Steinberg::int32>(maxSamplesPerBlock);
             setup.sampleRate = sampleRate;
-            if (!succeeded(processor->setupProcessing(setup)) || !scratch.prepare(2, maxSamplesPerBlock) ||
-                !succeeded(component->setActive(true)) || !succeeded(processor->setProcessing(true))) {
+            bool processingSetup = false;
+            const bool processingInvoked = invokeOnQtThreadBlocking([&] {
+                // Pair teardown and setup on the control thread so a
+                // reconfiguration cannot leave a processor half-active.
+                processor->setProcessing(false);
+                component->setActive(false);
+                if (!succeeded(processor->setupProcessing(setup))) return;
+                auto inputArrangement = inputBusChannels.load(std::memory_order_acquire) == 1
+                    ? Steinberg::Vst::SpeakerArr::kMono : Steinberg::Vst::SpeakerArr::kStereo;
+                auto outputArrangement = outputBusChannels.load(std::memory_order_acquire) == 1
+                    ? Steinberg::Vst::SpeakerArr::kMono : Steinberg::Vst::SpeakerArr::kStereo;
+                processingSetup = succeeded(component->setActive(true)) &&
+                    succeeded(processor->setProcessing(true));
+            });
+            const auto scratchChannels = (std::max)(inputBusChannels.load(std::memory_order_acquire),
+                                                    outputBusChannels.load(std::memory_order_acquire));
+            if (!processingInvoked || !processingSetup || scratchChannels == 0 ||
+                !scratch.prepare(scratchChannels, maxSamplesPerBlock)) {
                 error = "runtime_vst3_reconfigure_failed";
                 ready.store(false, std::memory_order_release);
                 return false;
@@ -1063,6 +1149,7 @@ struct RuntimeEffect {
         error.clear();
         configuredRate.store(static_cast<int>(sampleRate), std::memory_order_release);
         configuredBlock.store(maxSamplesPerBlock, std::memory_order_release);
+        outputLevel.reset();
         ready.store(true, std::memory_order_release);
         return true;
     }
@@ -1084,21 +1171,26 @@ struct RuntimeEffect {
         try {
             parameterChanges.drain();
             result = audio::process(*processor, block, scratch, false, &parameterChanges,
-                                    !outputNonSilent.load(std::memory_order_acquire));
+                                    outputLevel.due(block.frameCount, block.sampleRate),
+                                    inputBusChannels.load(std::memory_order_acquire),
+                                    outputBusChannels.load(std::memory_order_acquire));
             parameterChanges.clear();
         } catch (...) {
             parameterChanges.clear();
+            outputLevel.publish({}, {});
             processing.clear(std::memory_order_release);
             return false;
         }
-        processing.clear(std::memory_order_release);
         if (result.outputWritten) outputWritten.store(true, std::memory_order_release);
-        if (result.outputNonSilent) {
+        if (result.outputMeasured) {
             outputPeak.store(result.outputPeak, std::memory_order_relaxed);
             outputRms.store(result.outputRms, std::memory_order_relaxed);
-            outputNonSilent.store(true, std::memory_order_release);
+            outputNonSilent.store(result.outputNonSilent, std::memory_order_release);
+            outputLevel.publish(result.inputLevel,
+                result.outputWritten ? result.outputLevel : audio::SignalLevel{});
         }
         if (result.ownerPointerObserved) ownerObserved.store(true, std::memory_order_release);
+        processing.clear(std::memory_order_release);
         return result.processed;
     }
 
@@ -1395,6 +1487,7 @@ struct Runtime {
     std::atomic<bool> outputObserved{false};
     std::atomic<bool> outputWriteObserved{false};
     std::atomic<bool> outputEvidenceClaimed{false};
+    audio::LevelProbe deviceOutputLevel;
     std::atomic<std::size_t> outputCalls{0};
     std::atomic<std::uint64_t> outputBeforeHash{0};
     std::atomic<std::uint64_t> outputAfterHash{0};
@@ -2765,8 +2858,18 @@ State prepare(const host::Verification &verification, bool enableForSelection) n
 State snapshot() noexcept {
     static std::shared_ptr<const State> previous = std::make_shared<const State>();
     std::unique_lock<std::mutex> runtimeLock(g_runtime.selectionMutex, std::try_to_lock);
-    if (!runtimeLock.owns_lock()) return *std::atomic_load(&previous);
+    if (!runtimeLock.owns_lock()) {
+        auto result = *std::atomic_load(&previous);
+        // An old ready snapshot must not start an audio acceptance window
+        // while the worker holds the selection lock for cold initialization.
+        result.selectionPending = true;
+        return result;
+    }
     State result = g_initial;
+    const auto selectionStatus = g_runtime.selectionStatus.load(std::memory_order_acquire);
+    result.selectionPending = g_runtime.selectionWorkerBusy.load(std::memory_order_acquire) ||
+        selectionStatus == 1 || selectionStatus == 2;
+    result.audioOutputLevel = g_runtime.deviceOutputLevel.snapshot();
     result.trackBindingSource = gp_audio::bindingSource();
     const auto chain = g_runtime.chain.snapshot();
     const auto input = g_runtime.inputRouter.snapshot();
@@ -2903,6 +3006,7 @@ State snapshot() noexcept {
                     evidence.vst3OutputNonSilent = effect->outputNonSilent.load(std::memory_order_acquire);
                     evidence.vst3OutputPeak = effect->outputPeak.load(std::memory_order_relaxed);
                     evidence.vst3OutputRms = effect->outputRms.load(std::memory_order_relaxed);
+                    evidence.vst3OutputLevel = {effect->outputLevel.snapshot(), effect->identity.module, effect->identity.classId};
                 }
             }
             result.trackRuntimeEvidence.push_back(std::move(evidence));
@@ -2944,6 +3048,7 @@ State snapshot() noexcept {
             result.vst3OutputNonSilent = effect->outputNonSilent.load(std::memory_order_acquire);
             result.vst3OutputPeak = effect->outputPeak.load(std::memory_order_relaxed);
             result.vst3OutputRms = effect->outputRms.load(std::memory_order_relaxed);
+            result.vst3OutputLevel = {effect->outputLevel.snapshot(), effect->identity.module, effect->identity.classId};
         }
     }
     const auto active = chain.activeSlot >= 0 && chain.activeSlot < 2 ? chain.activeSlot : 0;
@@ -3066,6 +3171,7 @@ State snapshot() noexcept {
         g_runtime.inputObservedRate.load(std::memory_order_relaxed));
     result.inputConfigurationErrors =
         g_runtime.inputConfigurationErrors.load(std::memory_order_relaxed);
+    result.observationNanoseconds = steadyNanoseconds();
     std::atomic_store(&previous, std::make_shared<const State>(result));
     return result;
 }
@@ -3339,6 +3445,11 @@ int streamCallbackHook(const void *input, void *output, unsigned long frames,
         }
     }
     const auto after = needOutputHashes ? outputHash(output, frames) : 0;
+    // This is the final device buffer, after GP and the optional input route.
+    // A hash mutation (including clearing a buffer) is not an audio level.
+    if (configurationValid && g_runtime.deviceOutputLevel.due(frames, configuration.sampleRate))
+        g_runtime.deviceOutputLevel.publish({}, audio::measureInterleaved(
+            static_cast<const float *>(output), configuration.outputChannels, frames));
     g_runtime.outputObserved.store(output != nullptr && frames != 0, std::memory_order_release);
     if (needOutputHashes && before != after) {
         bool expected = false;
@@ -3618,6 +3729,33 @@ bool requestTrackVst3Selection(const std::string &trackKey,
     }
     g_runtime.selectionCondition.notify_one();
     return true;
+}
+
+InputLevelSample inputLevelSample(bool global, const std::string &trackKey) noexcept {
+    InputLevelSample result;
+    result.pending = vst3SelectionPending();
+    if (global) {
+        const int active = g_runtime.chain.snapshot().activeSlot;
+        if (active < 0 || active >= 2 || g_runtime.selectionSlots[active].count == 0) return result;
+        const auto &effect = g_runtime.selectionSlots[active].effects[
+            g_runtime.selectionSlots[active].count - 1];
+        if (!effect) return result;
+        const auto level = effect->outputLevel.snapshot().input;
+        result = {level.valid, result.pending, level.peak, level.rms, level.acRms};
+        return result;
+    }
+    if (trackKey.empty()) return result;
+    for (const auto &runtime : g_runtime.trackRuntimes) {
+        if (runtime.trackKey != trackKey) continue;
+        const int active = runtime.chain.snapshot().activeSlot;
+        if (active < 0 || active >= 2 || runtime.trackSlots[active].count == 0) return result;
+        const auto &effect = runtime.trackSlots[active].effects[runtime.trackSlots[active].count - 1];
+        if (!effect) return result;
+        const auto level = effect->outputLevel.snapshot().input;
+        result = {level.valid, result.pending, level.peak, level.rms, level.acRms};
+        return result;
+    }
+    return result;
 }
 
 bool sameSelectionIdentity(const std::vector<Vst3SelectionEntry> &left,

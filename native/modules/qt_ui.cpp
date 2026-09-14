@@ -13,6 +13,7 @@
 #include <QtCore/QTimer>
 #include <QtCore/QSignalBlocker>
 #include <functional>
+#include <cmath>
 #include <QtWidgets/QAbstractItemView>
 #include <QtWidgets/QAbstractButton>
 #include <QtWidgets/QBoxLayout>
@@ -65,6 +66,7 @@ Vst3EditorCloseControl g_vst3EditorCloseControl = nullptr;
 Vst3EditorScaleControl g_vst3EditorScaleControl = nullptr;
 Vst3RefreshControl g_refreshControl = nullptr;
 Vst3IdentifyControl g_identifyControl = nullptr;
+Vst3InputLevelControl g_inputLevelControl = nullptr;
 QJsonArray g_vst3Catalog;
 QString g_scanButtonText = QStringLiteral("VST3");
 QString g_scanMessage;
@@ -679,6 +681,18 @@ public:
                                                                : QStringLiteral("gpvst3GlobalStatus"));
         status_->setWordWrap(true);
         root->addWidget(status_);
+        inputLevel_ = new QLabel(this);
+        inputLevel_->setObjectName(scope == state::ScopeKind::Track
+            ? QStringLiteral("gpvst3InputLevel")
+            : QStringLiteral("gpvst3GlobalInputLevel"));
+        inputLevel_->setText(QStringLiteral("VST3 输入电平：等待音频回调"));
+        inputLevel_->setProperty("gpvst3AudioEvidence", true);
+        inputLevel_->setStyleSheet(QStringLiteral("color:#16803c; font-weight:600;"));
+        root->addWidget(inputLevel_);
+        levelTimer_ = new QTimer(this);
+        levelTimer_->setInterval(200);
+        connect(levelTimer_, &QTimer::timeout, this, &P7Panel::refreshInputLevel);
+        levelTimer_->start();
         connect(list_->model(), &QAbstractItemModel::rowsMoved, this,
                 [this] { syncOrderFromList(); });
         list_->setContextMenuPolicy(Qt::ActionsContextMenu);
@@ -1206,6 +1220,28 @@ private:
         return availableList_;
     }
 
+    void refreshInputLevel() {
+        if (!inputLevel_) return;
+        if (!g_inputLevelControl) {
+            inputLevel_->setText(QStringLiteral("VST3 输入电平：等待音频回调"));
+            return;
+        }
+        const auto sample = g_inputLevelControl(scope_ == state::ScopeKind::Global,
+                                                trackKey_.toStdString());
+        if (sample.pending) {
+            inputLevel_->setText(QStringLiteral("VST3 输入电平：等待音频回调"));
+            return;
+        }
+        if (!sample.valid) {
+            inputLevel_->setText(QStringLiteral("VST3 输入电平：无有效样本"));
+            return;
+        }
+        const auto dbfs = 20.0 * std::log10(qMax(1.0e-9, static_cast<double>(sample.rms)));
+        const auto acDbfs = 20.0 * std::log10(qMax(1.0e-9, static_cast<double>(sample.acRms)));
+        inputLevel_->setText(QStringLiteral("VST3 输入电平：Peak %1 · RMS %2 dBFS · AC %3 dBFS")
+            .arg(sample.peak, 0, 'f', 3).arg(dbfs, 0, 'f', 1).arg(acDbfs, 0, 'f', 1));
+    }
+
     bool selectionRowsMatchLive() const {
         if (!g_vst3SelectionMatchControl) return false;
         std::vector<Vst3SelectionEntry> desired;
@@ -1258,6 +1294,8 @@ private:
     QListWidget *list_ = nullptr, *availableList_ = nullptr;
     QLabel *trackContext_ = nullptr;
     QLabel *status_ = nullptr;
+    QLabel *inputLevel_ = nullptr;
+    QTimer *levelTimer_ = nullptr;
     QJsonObject sidecar_;
     QJsonArray effects_;
     const state::ScopeKind scope_;
@@ -1521,6 +1559,10 @@ void setVst3Catalog(const QJsonArray &catalog) {
 void setVst3DiscoveryControl(Vst3RefreshControl refresh, Vst3IdentifyControl identify) noexcept {
     g_refreshControl = refresh;
     g_identifyControl = identify;
+}
+
+void setVst3InputLevelControl(Vst3InputLevelControl control) noexcept {
+    g_inputLevelControl = control;
 }
 
 void setVst3ScanState(const QString &state, int checked, int total, bool cached, const QString &detail) {

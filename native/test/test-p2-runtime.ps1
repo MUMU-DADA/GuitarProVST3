@@ -8,6 +8,7 @@ param(
     [switch]$ExpectMissingPlugin,
     [switch]$EnableP4,
     [switch]$P6Workflow,
+    [double]$ReadyTimeoutSeconds = 60,
     [ValidateSet('input_insert','bus_mix')]
     [string]$P4Route = 'bus_mix'
 )
@@ -25,6 +26,7 @@ foreach ($path in @($PluginPath, $mcpGeneric, $mcpClient, (Join-Path $HostDirect
 $run = Join-Path $root ('artifacts/p2-runtime-' + [guid]::NewGuid().ToString('N'))
 New-Item -ItemType Directory -Force -Path $run | Out-Null
 . (Join-Path $PSScriptRoot 'host-session.ps1')
+. (Join-Path $PSScriptRoot 'audio-level-check.ps1')
 $before = Get-Gpvst3HostSnapshot $HostDirectory
 
 $fixture = Join-Path $run 'runtime.gp'
@@ -47,7 +49,7 @@ try {
 $process = $null
 $session = $null
 try {
-    $environment = @{GPVST3_ENABLE_P2_HOOK='1';GPVST3_ENABLE_P2_EFFECT='1'}
+    $environment = @{GPVST3_ENABLE_P2_HOOK='1';GPVST3_ENABLE_P2_EFFECT='1';GPVST3_DIAGNOSTIC_MODE='detailed'}
     if ($EnableP4) {
         $environment.GPVST3_ENABLE_P4_INPUT = '1'
         $environment.GPVST3_P4_ROUTE = $P4Route
@@ -82,6 +84,7 @@ try {
     if ($operation.operation.status -ne 'opened') { throw "Fixture did not open: $($operation | ConvertTo-Json -Depth 8 -Compress)" }
     $document = $operation.operation.document
     Invoke-McpTool $session gp_activate @{document=$document} | Out-Null
+    Invoke-McpTool $session gp_playback @{operation='set_loop';document=$document;enabled=$true} | Out-Null
     Invoke-McpTool $session gp_playback @{operation='play';document=$document} | Out-Null
     $deadline = [DateTime]::UtcNow.AddSeconds(10)
     do {
@@ -89,7 +92,14 @@ try {
         $playback = Invoke-McpTool $session gp_playback @{document=$document}
     } while (-not $playback.playing -and [DateTime]::UtcNow -lt $deadline)
     if (-not $playback.playing) { throw 'Fixture playback did not start.' }
-    Start-Sleep -Seconds 2
+    $levelEvidence = $null
+    $expectVst3Sound = -not $ExpectMissingPlugin -and -not $ExpectP3Fallback -and -not $ExpectP3TotalBypass
+    if ($expectVst3Sound) {
+        Start-Sleep -Seconds 1
+        $levelEvidence = Measure-Gpvst3AudioLevels -ObservationPath (Join-Path $run 'p2-observation.json') `
+            -Targets @(@{scope='global';module=$environment.GPVST3_RUNTIME_VST3},@{scope='device'}) -EvidencePath (Join-Path $run 'audio-levels.json') `
+            -ReadyTimeoutSeconds $ReadyTimeoutSeconds
+    } else { Start-Sleep -Seconds 2 }
     Invoke-McpTool $session gp_playback @{operation='stop';document=$document} | Out-Null
     Start-Sleep -Milliseconds 400
     $observationPath = Join-Path $run 'p2-observation.json'
@@ -118,11 +128,6 @@ try {
         }
     } elseif (-not $hook.runtime_effect_enabled -or -not $hook.runtime_processor_ready) {
         throw "P2 runtime VST3 processor was not ready: $($hook | ConvertTo-Json -Depth 8 -Compress)"
-    }
-    $expectVst3Sound = -not $ExpectMissingPlugin -and -not $ExpectP3Fallback -and -not $ExpectP3TotalBypass
-    if ($expectVst3Sound -and (-not $hook.vst3_output_non_silent -or
-        $hook.vst3_output_peak -le 0.000001 -or $hook.vst3_output_rms -le 0.0000001)) {
-        throw "VST3 output bus was silent before host writeback: $($hook | ConvertTo-Json -Depth 8 -Compress)"
     }
     if ($EnableP4) {
         if (-not $hook.input_route_enabled -or -not $hook.input_processor_ready -or
@@ -190,9 +195,9 @@ try {
         . (Join-Path $PSScriptRoot 'p6_workflow.ps1')
         $workflow = Invoke-P6Workflow -Session $session -Document $document -FixturePath $fixture -RunDirectory $run -Process $process
     }
-    @{status='passed';identity=$identity;playback=$playback;gp_hook=$hook;p6_workflow=$workflow;host_sha256=$identity.host_sha256;plugin_sha256=$identity.plugin_sha256} |
+    @{status='passed';identity=$identity;playback=$playback;gp_hook=$hook;audio_levels=$levelEvidence;p6_workflow=$workflow;host_sha256=$identity.host_sha256;plugin_sha256=$identity.plugin_sha256} |
         ConvertTo-Json -Depth 20 | Set-Content -LiteralPath (Join-Path $run 'verification.json')
-    $scope = if ($P6Workflow) { 'P6 VST3 processing and host workflow' } elseif ($ExpectMissingPlugin) { 'missing VST3 bypass fallback' } elseif ($ExpectP3Fallback) { 'detectable processing error fallback' } else { 'P2/P3 realtime VST3 processing' }
+    $scope = if ($P6Workflow) { 'P6 measured VST3/device output level changes and host workflow' } elseif ($ExpectMissingPlugin) { 'missing VST3 bypass fallback (no audio level acceptance)' } elseif ($ExpectP3Fallback) { 'detectable processing error fallback (no audio level acceptance)' } elseif ($ExpectP3TotalBypass) { 'total bypass (no audio level acceptance)' } else { 'P2/P3 measured VST3/device output level changes' }
     Write-Output "PASS: $scope. Evidence: $run"
 } finally {
     if ($session) { try { Invoke-McpTool $session gp_playback @{operation='stop'} -AllowError | Out-Null } catch {} ; try { Close-McpSession $session } catch {} }

@@ -1,6 +1,6 @@
 # P11 实现记录
 
-状态：代码实现完成，专项和真实 MCP 宿主回归通过；主线程 CPU 长时 A/B 门槛仍需在固定设备矩阵上采样（2026-09-13）。
+状态：代码实现完成；静态、维护、UI、激活和电平检测专项通过。真实宿主的声音验收现在要求冷启动完成后的新鲜 peak/RMS/AC RMS 电平窗口；未通过该窗口的宿主回归不得标记为声音能力完成。
 
 ## 已实现
 
@@ -12,6 +12,7 @@
 - About/侧栏挂载使用共享 pending 调度、QPointer/父子关系复用和有限退避；稳定窗口停止维护，隐藏面板不执行周期扫描。
 - `p2-observation.json` 使用 normal/detailed 两种模式、generation 和有界 latest-slot writer；normal 模式状态变化按秒合并，纯计数遥测最多每 5 秒提交一次，Qt 线程不执行 QSaveFile。
 - `status.json` 的 scanner poll 结果通过单槽后台 writer 提交；退出时 writer join，避免旧快照覆盖新 generation。
+- `audio-level-check.ps1` 只接受冷启动完成后、module/class/instance/generation/request 一致的连续电平样本；4 秒窗口要求 VST3 输入与输出均有有效 AC 电平和至少 3 dB 的分位变化，同时检查最终设备缓冲。处理块计数和 hash 写回只作为诊断字段。
 - scanner 仅在 static future/recognition job 活跃时启动 100 ms poll；音轨 fallback 只在启动或重建 settling window 内检查，稳定后停止。
 
 ## 验证证据
@@ -25,6 +26,8 @@
 | P11 套件含真实宿主 | 通过 | `.tools/native/p11-suite-release-final2/verification.json` |
 
 真实回归使用已安装 Guitar Pro 8.1.1.17、MCP bridge、`ParametricOD.vst3;Gateway.vst3`，验证两条独立 track runtime 均完成处理和 writeback，并覆盖 track/global UI scope 切换。测试没有使用 computer use。
+
+上述旧回归证据只证明当时的处理/writeback 路径；从电平门槛启用起，必须重新运行带 `GPVST3_DIAGNOSTIC_MODE=detailed` 的 `test-p8-track-runtime.ps1`/`test-p11.ps1 -RunHost`。准备超时和电平采样不足会分别报告，不能用旧 evidence 或 `process_blocks` 替代。
 
 最终发布 DLL SHA-256：`804F9E8C7867564DE39B1E60C49609249B9FB764E793BD6AE8A8B7A1C17A15DF`。
 
@@ -57,7 +60,7 @@ hook 安装，worker 只负责 VST3 实例准备和链切换。上下文维护�
 事件不再触发全量收集，文档视图的 `Show/Hide` 只更新选中上下文；稳定会话的兜底扫描仅在有限
 settling window 内运行，并在编辑器打开时暂停。
 
-当前修正的验证证据：
+此前修正的验证证据（处理/writeback 专项，不代替当前电平验收）：
 
 - `.tools/native/p11-final-fix5/plugins/imageformats/guitarpro_vst3_autoload.dll` 编译通过。
 - `native/test/test-p11.ps1` 的 static、maintenance、UI、activation 套件通过。
@@ -71,3 +74,13 @@ settling window 内运行，并在编辑器打开时暂停。
 该路径不作为本次用户已确认的曲谱播放验收依据。
 
 发布包使用 `native/package.ps1`，包内包含本记录和 P11 计划；构建产物、MCP session、宿主配置和 `artifacts/` 均不提交。
+
+## 2026-09-14 音轨输入/输出电平验收
+
+用户确认故障范围是“曲谱播放 → 音轨 VST3”，涉及该路径上的所有插件。全局曲谱链或设备输出有电平，不作为音轨通过的证据。
+
+- 已验证：新 DLL 构建、原生 adapter 输入/输出电平测量、RuntimeEffect 先有声后全零更新，以及 21 种无效电平证据的拒绝逻辑；冷启动等待与实际采样窗口分别计时。
+- 未通过：`test-p8-track-runtime.ps1` 使用真实 Guitar Pro 和 `ParametricOD.vst3;Gateway.vst3`，等待就绪后开始 4 秒窗口。两条音轨各只取得 2 个新鲜输入/输出电平样本，之后停止更新；同一窗口设备端取得 16 个样本。检测明确返回失败，没有沿用历史电平或累计处理次数。
+- 最新失败证据：`artifacts/mcp-p8-track-aea8fed386e745b19e0c1710c87ab407/audio-levels.json`；原生 runtime 夹具证据：`artifacts/p8-runtime-cc89e424ae664373a4d1620d7d52b943`；电平门槛/冷启动反例：`.tools/native/audio-level-gate/`。
+
+本轮修改检测与诊断，没有修复音轨输入流中断。采样中断的原因仍需结合当前音轨绑定与宿主回调继续定位；不能把本轮结果表述为音轨声音能力已完成。

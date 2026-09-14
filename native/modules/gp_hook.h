@@ -7,6 +7,7 @@
 
 #include "input_router.h"
 #include "host_lock.h"
+#include "audio_levels.h"
 #include <QtCore/QJsonArray>
 
 namespace gpvst3::hook {
@@ -43,6 +44,20 @@ struct EntryPointObservation {
     std::uint64_t afterHash = 0;
 };
 
+struct Vst3LevelEvidence {
+    audio::LevelSnapshot measurement;
+    std::string module;
+    std::string classId;
+};
+
+struct InputLevelSample {
+    bool valid = false;
+    bool pending = false;
+    float peak = 0.0F;
+    float rms = 0.0F;
+    float acRms = 0.0F;
+};
+
 struct TrackRuntimeEvidence {
     std::string trackKey;
     std::string trackId;
@@ -57,9 +72,12 @@ struct TrackRuntimeEvidence {
     bool vst3OutputNonSilent = false;
     float vst3OutputPeak = 0.0F;
     float vst3OutputRms = 0.0F;
+    Vst3LevelEvidence vst3OutputLevel;
 };
 
 struct State {
+    std::uint64_t observationNanoseconds = 0;
+    bool selectionPending = false;
     std::string trackBindingSource;
     bool installed = false;
     bool enabled = false;
@@ -76,6 +94,8 @@ struct State {
     bool vst3OutputNonSilent = false;
     float vst3OutputPeak = 0.0F;
     float vst3OutputRms = 0.0F;
+    Vst3LevelEvidence vst3OutputLevel;
+    audio::LevelSnapshot audioOutputLevel;
     bool effectsChainInsideMaster = false;
     bool effectsChainAfterMasterObserved = false;
     bool crossThreadObserved = false;
@@ -234,6 +254,7 @@ void setSelectionNotifier(SelectionNotifier notifier) noexcept;
 // persisted as disabled; the UI reloads the actual accepted selection.
 bool consumeSelectionStateChanges() noexcept;
 bool vst3SelectionPending() noexcept;
+InputLevelSample inputLevelSample(bool global, const std::string &trackKey) noexcept;
 
 // Thread-safe control used by the Qt panel. It only changes an atomic bypass
 // flag; processor creation and destruction remain on the worker thread.

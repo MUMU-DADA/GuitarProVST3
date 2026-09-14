@@ -4,6 +4,7 @@
 #include <cmath>
 #include <cstdint>
 #include <iostream>
+#include <limits>
 
 #include "pluginterfaces/vst/ivstaudioprocessor.h"
 
@@ -69,6 +70,9 @@ int main() {
                          reinterpret_cast<void *>(0x1234), 7, true};
     const auto processed = process(processor, mono, scratch);
     if (!check(processed.processed && processed.outputWritten && processed.ownerPointerObserved &&
+                   processed.inputLevel.valid && close(processed.inputLevel.peak, 0.5F) &&
+                   close(processed.inputLevel.rms, std::sqrt(0.15625F)) &&
+                   close(processed.inputLevel.acRms, std::sqrt(0.15625F)) &&
                    processed.outputNonSilent && processed.outputPeak > 0.000001F &&
                    processed.outputRms > 0.0000001F && processed.channels == 1 &&
                    close(outputLeft[0], 0.5F) && close(outputLeft[3], -1.0F),
@@ -82,6 +86,33 @@ int main() {
                "silent VST3 output is rejected by the sound probe"))
         return 1;
     std::fill(std::begin(inputLeft), std::end(inputLeft), 0.25F);
+
+    const auto dc = process(processor, mono, scratch);
+    if (!check(dc.outputLevel.valid && close(dc.outputRms, 0.5F) && dc.outputLevel.acRms == 0,
+               "DC has a level but no audible AC energy")) return 1;
+    const float oppositeDc[]{0.25F, -0.25F, 0.25F, -0.25F};
+    const auto stereoDc = measureInterleaved(oppositeDc, 2, 2);
+    if (!check(close(stereoDc.rms, 0.25F) && stereoDc.acRms == 0,
+               "opposite stereo DC offsets are not audio")) return 1;
+
+    LevelProbe probe;
+    probe.publish(processed.inputLevel, processed.outputLevel);
+    const auto loud = probe.snapshot();
+    probe.publish(silent.inputLevel, silent.outputLevel);
+    const auto quiet = probe.snapshot();
+    if (!check(quiet.instance == loud.instance && quiet.sequence > loud.sequence &&
+                   quiet.output.valid && quiet.output.peak == 0 && quiet.output.rms == 0 && quiet.output.acRms == 0,
+               "a later silent block replaces previous successful level evidence")) return 1;
+    if (!check(probe.due(64, 48000), "first level sample is immediate")) return 1;
+    int measured = 0;
+    for (int block = 0; block < 750; ++block) if (probe.due(64, 48000)) ++measured;
+    if (!check(measured == 10, "level sampling continues at ten measurements per second")) return 1;
+
+    inputLeft[0] = std::numeric_limits<float>::quiet_NaN();
+    const auto invalid = process(processor, mono, scratch);
+    if (!check(!invalid.processed && !invalid.outputLevel.valid,
+               "non-finite processor output never becomes valid level evidence")) return 1;
+    inputLeft[0] = 0.25F;
 
     outputLeft[0] = 9.0F;
     const BlockView readOnly{inputs, nullptr, outputs, nullptr, 1, 4, 48000.0, 4,

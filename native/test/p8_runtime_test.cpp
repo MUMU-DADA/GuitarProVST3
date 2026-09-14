@@ -261,6 +261,24 @@ extern "C" __declspec(dllexport) int gpvst3_run_runtime_tests(const char *fixtur
         };
         verifySoundBus(false);
         verifySoundBus(true);
+        // Exercise the production RuntimeEffect probe beyond its first good
+        // block: keep processing valid input after muting the fixture chain.
+        auto &levelSlot = track.trackSlots[track.chain.snapshot().activeSlot];
+        auto *levelTail = levelSlot.effects[levelSlot.count - 1].get();
+        const auto levelBeforeMute = levelTail->outputLevel.snapshot();
+        require(levelSlot.effects[1]->queueParameter(1, 0.0) && levelTail->queueParameter(1, 0.0),
+                "mute the fixture gain and final offset");
+        for (int i = 0; i < 32; ++i) {
+            reset();
+            require(track.processBlock(block(testRate)), "muted processor still receives blocks");
+        }
+        const auto mutedLevel = levelTail->outputLevel.snapshot();
+        require(mutedLevel.sequence > levelBeforeMute.sequence && mutedLevel.output.valid &&
+                    mutedLevel.output.peak == 0 && mutedLevel.output.rms == 0 &&
+                    !levelTail->outputNonSilent.load(),
+                "muted VST3 output replaces previous successful measurements despite growing block counts");
+        require(levelSlot.effects[1]->queueParameter(1, 0.5) && levelTail->queueParameter(1, 0.25),
+                "restore fixture level parameters");
         require(offThreadHostReads.load() == 0,
                 "selection worker must not call thread-affine Guitar Pro audio accessors");
         auto missing = entries; missing[1].module = "C:/missing/P8 Missing.vst3";

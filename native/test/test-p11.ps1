@@ -83,6 +83,7 @@ if ($LASTEXITCODE) { throw 'P11 UI fixture compilation failed.' }
 if ($LASTEXITCODE) { throw 'P11 UI fixture failed.' }
 
 & (Join-Path $PSScriptRoot 'test-p10-activation.ps1') -OutputRoot (Join-Path $OutputRoot 'activation')
+& (Join-Path $PSScriptRoot 'test-audio-level-gate.ps1') -OutputRoot (Join-Path $OutputRoot 'audio-level-gate')
 & (Join-Path $PSScriptRoot 'test-p9-ui.ps1') -QtDir $QtDir -OutputRoot (Join-Path $OutputRoot 'ui')
 
 if ($RunHost) {
@@ -91,6 +92,6 @@ if ($RunHost) {
     if ($CheckLifecycle) { $hostArgs.CheckLifecycle = $true }
     & (Join-Path $PSScriptRoot 'test-p8-track-runtime.ps1') @hostArgs
 }
-@{schema=1;static_gate='pass';maintenance='pass';ui_fixture='pass';activation='pass';ui='pass';host_validation=([bool]$RunHost);lifecycle=([bool]$CheckLifecycle)} |
+@{schema=1;static_gate='pass';maintenance='pass';ui_fixture='pass';activation='pass';audio_level_gate='pass';ui='pass';host_validation=([bool]$RunHost);lifecycle=([bool]$CheckLifecycle)} |
     ConvertTo-Json -Depth 8 | Set-Content -LiteralPath (Join-Path $OutputRoot 'verification.json') -Encoding UTF8
 Write-Output "PASS: P11 scheduling, maintenance writer, UI and activation regression suite. Evidence: $OutputRoot"
