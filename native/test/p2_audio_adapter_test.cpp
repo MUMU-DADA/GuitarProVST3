@@ -1,5 +1,6 @@
 #include "audio_adapter.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <iostream>
@@ -68,9 +69,19 @@ int main() {
                          reinterpret_cast<void *>(0x1234), 7, true};
     const auto processed = process(processor, mono, scratch);
     if (!check(processed.processed && processed.outputWritten && processed.ownerPointerObserved &&
-                   processed.channels == 1 && close(outputLeft[0], 0.5F) && close(outputLeft[3], -1.0F),
+                   processed.outputNonSilent && processed.outputPeak > 0.000001F &&
+                   processed.outputRms > 0.0000001F && processed.channels == 1 &&
+                   close(outputLeft[0], 0.5F) && close(outputLeft[3], -1.0F),
                "mono process and owner evidence"))
         return 1;
+
+    std::fill(std::begin(inputLeft), std::end(inputLeft), 0.0F);
+    const auto silent = process(processor, mono, scratch);
+    if (!check(silent.processed && !silent.outputNonSilent && silent.outputPeak == 0.0F &&
+                   silent.outputRms == 0.0F,
+               "silent VST3 output is rejected by the sound probe"))
+        return 1;
+    std::fill(std::begin(inputLeft), std::end(inputLeft), 0.25F);
 
     outputLeft[0] = 9.0F;
     const BlockView readOnly{inputs, nullptr, outputs, nullptr, 1, 4, 48000.0, 4,

@@ -24,6 +24,7 @@
 - [P10 实现记录](docs/P10_IMPLEMENTATION.md)：P10 当前实现、验证证据和宿主受限项。
 - [P11 UI 性能计划](docs/P11_UI_PERFORMANCE_PLAN.md)：周期扫描、侧栏维护、诊断写盘与扫描轮询的去除/替换方案和验收门槛。
 - [P11 实现记录](docs/P11_IMPLEMENTATION.md)：后台维护、诊断 writer、扫描收敛、专项证据和真实宿主边界。
+- [P12 首次启用生效优化计划](docs/P12_AUDIO_ACTIVATION_OPTIMIZATION_PLAN.md)：冷启动、warm 实例、global/input 解耦、提交时序和延迟验收方案。
 - [测试与验证](docs/TESTING.md)：构建、免安装宿主回归和常用测试命令。
 
 历史阶段记录和完整计划快照见 [docs/archive](docs/archive/README.md)。

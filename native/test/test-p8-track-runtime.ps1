@@ -250,6 +250,10 @@ try {
         if (-not $evidence.processed -or (-not $CheckGain -and -not $evidence.write_observed) -or $evidence.processed_blocks -lt 1) {
             throw "Track runtime did not process/write back: $(Json $evidence)"
         }
+        if (-not $evidence.vst3_output_non_silent -or $evidence.vst3_output_peak -le 0.000001 -or
+            $evidence.vst3_output_rms -le 0.0000001) {
+            throw "Track VST3 output bus was silent before host writeback: $(Json $evidence)"
+        }
     }
     if ($CheckGain) {
         $beforeGain = @(Read-Gain 0; Read-Gain 1)

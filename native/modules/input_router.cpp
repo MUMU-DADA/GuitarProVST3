@@ -255,7 +255,10 @@ Router::Result Router::processInterleaved(const InterleavedView &view) noexcept 
             std::fill(destination, destination + view.frameCount, 0.0F);
     }
     GeneratedView generated;
-    if (route_.load(std::memory_order_acquire) == Route::BusMix) {
+    // Both active routes need the host-generated stream at the final device
+    // boundary. BusMix feeds it into the VST3 input, while InputInsert adds
+    // the processed capture beside it after the processor returns.
+    if (route_.load(std::memory_order_acquire) != Route::Disabled) {
         if (!deinterleave(view.output, view.frameCount, view.outputChannelCount,
                           interleavedGeneratedScratch_)) {
             interleavedMissingBlocks_.fetch_add(1, std::memory_order_relaxed);
@@ -311,17 +314,42 @@ Router::Result Router::process(const CaptureView &capture, const GeneratedView &
         return result;
     }
     if (route == Route::InputInsert) {
-        if (!validOutput(output, capture.channelCount)) {
+        const auto outputChannels = output.channelCount;
+        if (!validOutput(output, outputChannels) || outputChannels > channelCapacity_) {
             droppedBlocks_.fetch_add(1, std::memory_order_relaxed);
             return result;
         }
-        const audio::BlockView block{capture.channels, nullptr, output.channels, nullptr,
+        // Process the borrowed capture into scratch first. InputInsert is
+        // additive at the final device boundary: replacing the host-generated
+        // stream with capture-only audio makes score playback silent whenever
+        // the input device is quiet. This also keeps the processor output
+        // isolated from the output buffer until the whole block is validated.
+        if (!copyCapture(capture)) {
+            droppedBlocks_.fetch_add(1, std::memory_order_relaxed);
+            return result;
+        }
+        const audio::BlockView block{mixScratch_.inputChannels(), nullptr,
+                                     mixScratch_.outputChannels(), nullptr,
                                      capture.channelCount, capture.frameCount,
                                      capture.sampleRate, capture.blockSize};
         bool processed = processor_.process && processor_.process(processor_.context, block);
-        if (processed && !finiteOutput(output.channels, capture.channelCount, capture.frameCount))
+        if (processed && !finiteOutput(mixScratch_.outputChannels(), capture.channelCount,
+                                       capture.frameCount))
             processed = false;
         if (processed) {
+            for (std::size_t channel = 0; channel < outputChannels; ++channel) {
+                auto *destination = output.channels[channel];
+                const auto *generatedSamples = generatedChannel(generated, channel);
+                const auto captureChannelIndex = channel < capture.channelCount
+                    ? channel : (capture.channelCount == 1 ? 0U : capture.channelCount);
+                const auto *processedSamples = captureChannelIndex < capture.channelCount
+                    ? mixScratch_.outputChannels()[captureChannelIndex] : nullptr;
+                for (std::size_t frame = 0; frame < capture.frameCount; ++frame) {
+                    const auto generatedValue = generatedSamples ? generatedSamples[frame] : 0.0F;
+                    const auto captureValue = processedSamples ? processedSamples[frame] : 0.0F;
+                    destination[frame] = clampFinite(generatedValue + captureValue);
+                }
+            }
             inputProcessedBlocks_.fetch_add(1, std::memory_order_relaxed);
             result.completed = true;
             result.processed = true;
@@ -329,7 +357,9 @@ Router::Result Router::process(const CaptureView &capture, const GeneratedView &
         }
         errorBlocks_.fetch_add(1, std::memory_order_relaxed);
         result.error = true;
-        result.completed = audio::bypass(block);
+        // Preserve the generated host stream when the input processor fails;
+        // a failed optional input effect must not mute score playback.
+        result.completed = passthrough(capture, generated, output);
         result.bypassed = result.completed;
         if (result.completed) bypassBlocks_.fetch_add(1, std::memory_order_relaxed);
         return result;

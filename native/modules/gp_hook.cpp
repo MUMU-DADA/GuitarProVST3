@@ -414,6 +414,9 @@ struct RuntimeEffect {
     std::string error;
     std::atomic<bool> ready{false};
     std::atomic<bool> outputWritten{false};
+    std::atomic<bool> outputNonSilent{false};
+    std::atomic<float> outputPeak{0.0F};
+    std::atomic<float> outputRms{0.0F};
     std::atomic<bool> ownerObserved{false};
     std::atomic<int> configuredRate{0};
     std::atomic<std::size_t> configuredBlock{0};
@@ -495,6 +498,9 @@ struct RuntimeEffect {
         clearEditorError();
         setEditorStage(EditorStage::None);
         outputWritten.store(false, std::memory_order_release);
+        outputNonSilent.store(false, std::memory_order_release);
+        outputPeak.store(0.0F, std::memory_order_relaxed);
+        outputRms.store(0.0F, std::memory_order_relaxed);
         ownerObserved.store(false, std::memory_order_release);
         configuredRate.store(0, std::memory_order_release);
         configuredBlock.store(0, std::memory_order_release);
@@ -1077,7 +1083,8 @@ struct RuntimeEffect {
         audio::ProcessResult result{};
         try {
             parameterChanges.drain();
-            result = audio::process(*processor, block, scratch, false, &parameterChanges);
+            result = audio::process(*processor, block, scratch, false, &parameterChanges,
+                                    !outputNonSilent.load(std::memory_order_acquire));
             parameterChanges.clear();
         } catch (...) {
             parameterChanges.clear();
@@ -1086,6 +1093,11 @@ struct RuntimeEffect {
         }
         processing.clear(std::memory_order_release);
         if (result.outputWritten) outputWritten.store(true, std::memory_order_release);
+        if (result.outputNonSilent) {
+            outputPeak.store(result.outputPeak, std::memory_order_relaxed);
+            outputRms.store(result.outputRms, std::memory_order_relaxed);
+            outputNonSilent.store(true, std::memory_order_release);
+        }
         if (result.ownerPointerObserved) ownerObserved.store(true, std::memory_order_release);
         return result.processed;
     }
@@ -2369,7 +2381,14 @@ bool configureInputSelection(const std::vector<Vst3SelectionEntry> &selection,
     g_runtime.retainedInputSelectionSlot = static_cast<int>(target);
     g_runtime.inputRouter.setRoute(configuredInputRoute());
     g_runtime.inputRouter.setProcessor({&g_runtime.inputChain, &processInputChain});
-    g_runtime.inputRouter.setBypassed(false);
+    const bool totalBypass = [] {
+        const char *value = std::getenv("GPVST3_TOTAL_BYPASS");
+        return value && std::strcmp(value, "1") == 0;
+    }();
+    // Keep the prepared input chain active for diagnostics and fast resume;
+    // the router's bypass flag is the authoritative total-bypass gate.
+    g_runtime.inputChain.setBypassed(false);
+    g_runtime.inputRouter.setBypassed(totalBypass);
     // A PortAudio callback can begin before AudioLayer's observation accessor
     // reports its first running state. The callback itself is the authoritative
     // liveness signal; the maintenance path will still clear this flag when GP
@@ -2711,6 +2730,15 @@ State prepare(const host::Verification &verification, bool enableForSelection) n
             // slots; doing it afterwards would erase the live copy just
             // prepared for that selection.
             configureInputRouter();
+            // The legacy P2 runtime path has no P7 selection vector to drive
+            // the independent input instance. When that path is explicitly
+            // enabled, mirror its first prepared processor into the input
+            // route so the capture callback is actually processed as well.
+            if (result.runtimeEffectEnabled && result.runtimeProcessorReady &&
+                g_runtime.stream.installed &&
+                !g_runtime.effects[0].identity.module.empty()) {
+                configureInputSelection({g_runtime.effects[0].identity});
+            }
             std::lock_guard<std::mutex> lock(g_runtime.selectionMutex);
             if (!g_runtime.requestedSelection.empty() &&
                 configureSelectedChain(g_runtime.requestedSelection)) {
@@ -2867,6 +2895,16 @@ State snapshot() noexcept {
             evidence.configured = runtime.configured.load(std::memory_order_acquire);
             evidence.processed = runtime.processed.load(std::memory_order_acquire);
             evidence.writeObserved = runtime.writeObserved.load(std::memory_order_acquire);
+            const auto activeSlot = runtime.chain.snapshot().activeSlot;
+            if (activeSlot >= 0 && activeSlot < 2 && runtime.trackSlots[activeSlot].count > 0) {
+                const auto *effect = runtime.trackSlots[activeSlot].effects[
+                    runtime.trackSlots[activeSlot].count - 1].get();
+                if (effect) {
+                    evidence.vst3OutputNonSilent = effect->outputNonSilent.load(std::memory_order_acquire);
+                    evidence.vst3OutputPeak = effect->outputPeak.load(std::memory_order_relaxed);
+                    evidence.vst3OutputRms = effect->outputRms.load(std::memory_order_relaxed);
+                }
+            }
             result.trackRuntimeEvidence.push_back(std::move(evidence));
         }
     }
@@ -2897,6 +2935,17 @@ State snapshot() noexcept {
         g_runtime.frames.load(std::memory_order_relaxed) <= activeBlock;
     result.runtimeProcessObserved = g_runtime.effectProcessed.load(std::memory_order_relaxed);
     result.runtimeBufferWriteObserved = g_runtime.effectWriteObserved.load(std::memory_order_relaxed);
+    if (chain.activeSlot >= 0 && chain.activeSlot < 2) {
+        const auto &slot = g_runtime.selectionSlots[chain.activeSlot];
+        const auto *effect = g_runtime.selectionMode.load(std::memory_order_acquire)
+            ? (slot.count > 0 ? slot.effects[slot.count - 1].get() : nullptr)
+            : g_runtime.effects + chain.activeSlot;
+        if (effect) {
+            result.vst3OutputNonSilent = effect->outputNonSilent.load(std::memory_order_acquire);
+            result.vst3OutputPeak = effect->outputPeak.load(std::memory_order_relaxed);
+            result.vst3OutputRms = effect->outputRms.load(std::memory_order_relaxed);
+        }
+    }
     const auto active = chain.activeSlot >= 0 && chain.activeSlot < 2 ? chain.activeSlot : 0;
     if (g_runtime.selectionMode.load(std::memory_order_acquire)) {
         result.runtimeEffectName = g_runtime.selectionSlots[active].effects[0]->name;

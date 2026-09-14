@@ -119,6 +119,11 @@ try {
     } elseif (-not $hook.runtime_effect_enabled -or -not $hook.runtime_processor_ready) {
         throw "P2 runtime VST3 processor was not ready: $($hook | ConvertTo-Json -Depth 8 -Compress)"
     }
+    $expectVst3Sound = -not $ExpectMissingPlugin -and -not $ExpectP3Fallback -and -not $ExpectP3TotalBypass
+    if ($expectVst3Sound -and (-not $hook.vst3_output_non_silent -or
+        $hook.vst3_output_peak -le 0.000001 -or $hook.vst3_output_rms -le 0.0000001)) {
+        throw "VST3 output bus was silent before host writeback: $($hook | ConvertTo-Json -Depth 8 -Compress)"
+    }
     if ($EnableP4) {
         if (-not $hook.input_route_enabled -or -not $hook.input_processor_ready -or
             $hook.input_route -ne $P4Route -or -not $hook.audio_layer_input_level_accessor_found) {

@@ -792,6 +792,28 @@ public:
 
 private:
     void restoreSelection() {
+        // Catalog refreshes also rebuild the global panel. An empty panel is
+        // not an explicit user request to clear the live chain: in legacy P2
+        // mode the runtime chain is intentionally not exposed through the
+        // selection-state callback, so publishing an empty vector here would
+        // deactivate a working processor and leave the final output dry.
+        // Explicit user unchecking still goes through the checkbox handler
+        // and publishes the empty selection directly.
+        bool hasEnabledEffect = false;
+        for (const auto &value : effects_)
+            hasEnabledEffect |= value.toObject().value("enabled").toBool() &&
+                                value.toObject().value("identified").toBool();
+        if (!hasEnabledEffect) {
+            const auto live = scope_ == state::ScopeKind::Track
+                ? (g_vst3TrackStateControl ? g_vst3TrackStateControl(trackKey_.toStdString())
+                                           : std::vector<Vst3SelectionEntry>{})
+                : (g_vst3StateControl ? g_vst3StateControl() : std::vector<Vst3SelectionEntry>{});
+            if (live.empty()) {
+                selectionDirty_ = false;
+                setProperty("gpvst3SelectionState", "applied");
+                return;
+            }
+        }
         if (publishSelection()) return;
         const auto error = status_->toolTip();
         const auto live = scope_ == state::ScopeKind::Track

@@ -165,7 +165,14 @@ extern "C" __declspec(dllexport) int gpvst3_run_runtime_tests(const char *fixtur
         const input::InterleavedView inputView{
             capture, inputOutput, 256, 2, 2, 44100.0, 256,
             reinterpret_cast<void *>(0x44), 1, input::InterleavedSampleFormat::Float32};
-        require(processExternalInputInterleaved(inputView), "process guitar input through selected VST3 chain");
+        const auto processInput = [&] {
+            // A real PortAudio callback supplies a fresh GP-generated output
+            // block each time. Reset the fixture's borrowed output to that
+            // generated baseline before exercising the input route.
+            std::fill(std::begin(inputOutput), std::end(inputOutput), 0.0F);
+            return processExternalInputInterleaved(inputView);
+        };
+        require(processInput(), "process guitar input through selected VST3 chain");
         require(std::abs(inputOutput[200 * 2] - 0.5125F) < 0.000001F,
                 "guitar input follows the selected VST3 chain order");
         require(g_runtime.inputRouter.snapshot().inputProcessedBlocks > 0 &&
@@ -173,19 +180,19 @@ extern "C" __declspec(dllexport) int gpvst3_run_runtime_tests(const char *fixtur
                 "guitar input writes the processed block back to the host output");
         require(globalProcessor->queueParameter(1, 0.25),
                 "global editor parameter publishes to the selected chain");
-        require(processExternalInputInterleaved(inputView),
+        require(processInput(),
                 "guitar input accepts a mirrored global parameter");
         require(std::abs(inputOutput[200 * 2] - 0.575F) < 0.000001F,
                 "global parameter edit reaches the independent live input instance");
         require(trackProcessor->queueParameter(1, 0.75),
                 "track editor parameter publishes to the track chain");
-        require(processExternalInputInterleaved(inputView),
+        require(processInput(),
                 "guitar input remains available after a track parameter edit");
         require(std::abs(inputOutput[200 * 2] - 0.575F) < 0.000001F,
                 "track parameter edit does not leak into the live input instance");
         require(globalProcessor->queueParameter(1, 0.125) && trackProcessor->queueParameter(1, 0.125),
                 "restore independent playback and input parameter values");
-        require(processExternalInputInterleaved(inputView), "restore the live input parameter value");
+        require(processInput(), "restore the live input parameter value");
         require(std::abs(inputOutput[200 * 2] - 0.5125F) < 0.000001F,
                 "restored global parameter reaches the live input instance");
         float left[256], right[256]; float *channels[]{left, right};
@@ -209,9 +216,51 @@ extern "C" __declspec(dllexport) int gpvst3_run_runtime_tests(const char *fixtur
             reset(); bool processed = false;
             require(track.processBlock(block(rate), &processed) && processed && std::abs(left[0] - 0.5125F) < 0.000001F,
                 "track actual sample after reconfiguration");
+            require(trackProcessor->outputNonSilent.load(std::memory_order_acquire) &&
+                        trackProcessor->outputPeak.load(std::memory_order_relaxed) > 0.000001F &&
+                        trackProcessor->outputRms.load(std::memory_order_relaxed) > 0.0000001F,
+                    "track VST3 output bus must contain non-silent audio");
             reset(); require(g_runtime.chain.process(block(rate)).completed && std::abs(left[0] - 0.5125F) < 0.000001F,
                 "global actual sample after reconfiguration");
+            require(globalProcessor->outputNonSilent.load(std::memory_order_acquire) &&
+                        globalProcessor->outputPeak.load(std::memory_order_relaxed) > 0.000001F &&
+                        globalProcessor->outputRms.load(std::memory_order_relaxed) > 0.0000001F,
+                    "global VST3 output bus must contain non-silent audio");
         }
+        // Sound acceptance is sampled at the last VST3's output bus, before
+        // host writeback or input mixing. A varying tone and its expected AC
+        // energy prevent a constant/DC-only output from passing as sound.
+        const auto verifySoundBus = [&](bool global) {
+            constexpr double pi = 3.14159265358979323846;
+            for (std::size_t frame = 0; frame < 256; ++frame) {
+                const auto phase = 2.0 * pi * 4.0 * static_cast<double>(frame) / 256.0;
+                left[frame] = static_cast<float>(0.2 * std::sin(phase));
+                right[frame] = static_cast<float>(0.1 * std::cos(phase));
+            }
+            if (global) require(g_runtime.chain.process(block(testRate)).completed,
+                                "global tone reached the VST3 chain");
+            else require(track.processBlock(block(testRate)), "track tone reached the VST3 chain");
+            auto &slot = global ? g_runtime.selectionSlots[g_runtime.chain.snapshot().activeSlot]
+                                : track.trackSlots[track.chain.snapshot().activeSlot];
+            const auto *const *bus = slot.effects[slot.count - 1]->scratch.outputChannels();
+            double acEnergy = 0.0;
+            for (std::size_t channel = 0; channel < 2; ++channel) {
+                for (std::size_t frame = 0; frame < 256; ++frame) {
+                    const auto phase = 2.0 * pi * 4.0 * static_cast<double>(frame) / 256.0;
+                    const auto inputSample = channel == 0 ? 0.2 * std::sin(phase) : 0.1 * std::cos(phase);
+                    const auto expected = inputSample * 0.5 + 0.3125;
+                    require(std::isfinite(bus[channel][frame]) &&
+                                std::abs(bus[channel][frame] - expected) < 0.000001,
+                            "VST3 output bus contains the expected processed tone");
+                    const auto ac = static_cast<double>(bus[channel][frame]) - 0.3125;
+                    acEnergy += ac * ac;
+                }
+            }
+            require(std::sqrt(acEnergy / 512.0) > 0.01,
+                    "VST3 output bus must contain audible-band AC energy");
+        };
+        verifySoundBus(false);
+        verifySoundBus(true);
         require(offThreadHostReads.load() == 0,
                 "selection worker must not call thread-affine Guitar Pro audio accessors");
         auto missing = entries; missing[1].module = "C:/missing/P8 Missing.vst3";

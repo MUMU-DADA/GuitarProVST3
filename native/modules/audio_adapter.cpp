@@ -1,6 +1,7 @@
 #include "audio_adapter.h"
 
 #include <algorithm>
+#include <cmath>
 #include <cstring>
 
 #include "pluginterfaces/vst/ivstaudioprocessor.h"
@@ -119,7 +120,8 @@ bool bypass(const BlockView &block) noexcept {
 
 ProcessResult process(Steinberg::Vst::IAudioProcessor &processor,
                       const BlockView &block, PlanarBuffer &scratch, bool bypassed,
-                      Steinberg::Vst::IParameterChanges *parameterChanges) noexcept {
+                      Steinberg::Vst::IParameterChanges *parameterChanges,
+                      bool measureOutput) noexcept {
     ProcessResult result;
     result.frames = block.frameCount;
     result.channels = block.channelCount;
@@ -176,6 +178,28 @@ ProcessResult process(Steinberg::Vst::IAudioProcessor &processor,
     if (processResult != Steinberg::kResultOk && processResult != Steinberg::kResultTrue) {
         result.error = "processor_process_failed";
         return result;
+    }
+    if (measureOutput) {
+        float peak = 0.0F;
+        double sumSquares = 0.0;
+        std::size_t sampleCount = 0;
+        for (std::size_t channel = 0; channel < block.channelCount; ++channel) {
+            const auto *samples = scratch.outputChannels()[channel];
+            for (std::size_t frame = 0; frame < block.frameCount; ++frame) {
+                const auto value = samples[frame];
+                if (!std::isfinite(value)) {
+                    result.error = "processor_non_finite_output";
+                    return result;
+                }
+                peak = (std::max)(peak, std::fabs(value));
+                sumSquares += static_cast<double>(value) * static_cast<double>(value);
+                ++sampleCount;
+            }
+        }
+        result.outputPeak = peak;
+        result.outputRms = sampleCount == 0
+            ? 0.0F : static_cast<float>(std::sqrt(sumSquares / sampleCount));
+        result.outputNonSilent = peak > 0.000001F;
     }
     const auto written = copyFromPlanar(scratch, block);
     result.processed = written.valid;

@@ -48,8 +48,9 @@ int main() {
     const input::OutputView output{outputChannels, 2};
 
     router.setRoute(input::Route::InputInsert);
-    auto result = router.process(capture, {}, output);
-    if (!check(result.completed && result.processed && close(outputLeft[0], 0.5F),
+    auto result = router.process(capture, generated, output);
+    if (!check(result.completed && result.processed && close(outputLeft[0], 1.0F) &&
+                   close(outputRight[0], 0.45F),
                "input insert"))
         return 1;
 
@@ -80,14 +81,15 @@ int main() {
     // buffers. Verify the mono-capture to stereo-output mapping and writeback.
     router.setRoute(input::Route::InputInsert);
     float captureInterleaved[frames]{0.25F, -0.25F, 0.5F, -0.5F};
-    float outputInterleaved[frames * 2]{};
+    float outputInterleaved[frames * 2]{0.5F, 0.25F, 0.5F, 0.25F, 0.5F, 0.25F, 0.5F, 0.25F};
     const input::InterleavedView interleaved{
         captureInterleaved, outputInterleaved, frames, 1, 2, 48000.0, frames,
         reinterpret_cast<void *>(0x42), 17, input::InterleavedSampleFormat::Float32};
     result = router.processInterleaved(interleaved);
-    if (!check(result.completed && result.processed && close(outputInterleaved[0], 0.5F) &&
-                   close(outputInterleaved[1], 0.5F) && close(outputInterleaved[6], -1.0F) &&
-                   close(outputInterleaved[7], -1.0F),
+    if (!check(result.completed && result.processed && close(outputInterleaved[0], 1.0F) &&
+                   close(outputInterleaved[1], 0.75F) && close(outputInterleaved[2], 0.0F) &&
+                   close(outputInterleaved[3], -0.25F) && close(outputInterleaved[6], -0.5F) &&
+                   close(outputInterleaved[7], -0.75F),
                "interleaved mono capture to stereo output"))
         return 1;
     const auto interleavedSnapshot = router.snapshot();

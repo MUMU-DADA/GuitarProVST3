@@ -255,7 +255,10 @@ QJsonObject hookStatus(const gpvst3::hook::State &value) {
             {"configured_effects", static_cast<qint64>(track.configuredEffects)},
             {"configured", track.configured},
             {"processed", track.processed},
-            {"write_observed", track.writeObserved}});
+            {"write_observed", track.writeObserved},
+            {"vst3_output_non_silent", track.vst3OutputNonSilent},
+            {"vst3_output_peak", track.vst3OutputPeak},
+            {"vst3_output_rms", track.vst3OutputRms}});
     }
     return QJsonObject{
         {"installed", value.installed},
@@ -269,6 +272,9 @@ QJsonObject hookStatus(const gpvst3::hook::State &value) {
         {"audio_output_callback_installed", value.audioOutputCallbackInstalled},
         {"audio_output_observed", value.audioOutputObserved},
         {"audio_output_writeback_observed", value.audioOutputWritebackObserved},
+        {"vst3_output_non_silent", value.vst3OutputNonSilent},
+        {"vst3_output_peak", value.vst3OutputPeak},
+        {"vst3_output_rms", value.vst3OutputRms},
         {"effects_chain_inside_master", value.effectsChainInsideMaster},
         {"effects_chain_after_master_observed", value.effectsChainAfterMasterObserved},
         {"cross_thread_observed", value.crossThreadObserved},

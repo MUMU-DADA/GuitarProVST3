@@ -54,6 +54,9 @@ struct TrackRuntimeEvidence {
     bool configured = false;
     bool processed = false;
     bool writeObserved = false;
+    bool vst3OutputNonSilent = false;
+    float vst3OutputPeak = 0.0F;
+    float vst3OutputRms = 0.0F;
 };
 
 struct State {
@@ -69,6 +72,10 @@ struct State {
     bool audioOutputCallbackInstalled = false;
     bool audioOutputObserved = false;
     bool audioOutputWritebackObserved = false;
+    // Level measured from the VST3 processor output bus before host writeback.
+    bool vst3OutputNonSilent = false;
+    float vst3OutputPeak = 0.0F;
+    float vst3OutputRms = 0.0F;
     bool effectsChainInsideMaster = false;
     bool effectsChainAfterMasterObserved = false;
     bool crossThreadObserved = false;

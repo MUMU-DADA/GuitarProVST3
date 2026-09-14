@@ -411,12 +411,12 @@ flowchart TD
     I10 --> I11{Router active?\nenabled + !bypassed + streamRunning}
     I11 -- 否 --> I12["passthrough\n无处理旁路"]
     I11 -- 是 --> I13{route}
-    I13 -->|input_insert| II["capture -> VST3 input chain\n结果写入 output scratch"]
+    I13 -->|input_insert| II["capture -> VST3 input chain\n结果与 GP generated 相加"]
     I13 -->|bus_mix| IM["capture + 原 output generated\n逐通道相加 -> VST3 input chain"]
     II --> I14["finiteOutput 校验"]
     IM --> I14
     I14 --> I15{处理成功?}
-    I15 -- 否 --> I16["errorBlocks++\naudio::bypass(block)"]
+    I15 -- 否 --> I16["errorBlocks++\n保留 GP generated output"]
     I15 -- 是 --> I17["interleave planar -> borrowed output\n单声道输出时双声道平均"]
     I12 --> I17
     I16 --> I17
@@ -431,7 +431,7 @@ flowchart TD
 | 路由 | 处理输入 | 处理输出 | 失败行为 | 当前计数 |
 | --- | --- | --- | --- | --- |
 | `disabled` | 不处理 | 保留 GP 原 output | 不进入 VST3 | `input_bypass_blocks` |
-| `input_insert` | 仅 capture | capture 经 input chain 直接写 output | 复制 capture 旁路 | `input_processed_blocks` |
+| `input_insert` | 仅 capture | capture 经 input chain 后与 GP 原 output 相加 | 保留 GP 原 output | `input_processed_blocks` |
 | `bus_mix` | capture + GP 原 output/generated | 混合后经 input chain 写 output | 混合输入旁路 | `input_bus_mixed_blocks` |
 
 默认安装路径将选中的 global chain 复制为 live-input chain；显式设置 `GPVST3_P4_ROUTE` 时保留旧 P4 fixture 语义，可改用独立 `GPVST3_RUNTIME_VST3`。

@@ -63,6 +63,7 @@ P10 激活夹具验证下一 callback 旁路、warm/cold slot 首个处理块和
 ```
 
 状态文件中的 `selection_*`、`audio_generation`、`chain_*first_processed*` 和 `editor_stage/editor_result_code` 是 P10 的结构化证据入口。
+VST3 声音验收在 `IAudioProcessor::process()` 返回后的输出 bus 上执行：`p2_audio_adapter_test` 和 `p8_runtime_test` 必须观察到非静音 peak/RMS；真实宿主的 `test-p2-runtime.ps1` 与 `test-p8-track-runtime.ps1` 同时要求 `vst3_output_non_silent`、`vst3_output_peak` 和 `vst3_output_rms`。
 
 ## P11 验证
 

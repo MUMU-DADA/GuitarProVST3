@@ -74,6 +74,11 @@ struct ProcessResult {
     bool bypassed = false;
     bool outputWritten = false;
     bool ownerPointerObserved = false;
+    // Measured directly from the VST3 output bus before it is copied back to
+    // the host buffer. These values are the audio-output acceptance point.
+    bool outputNonSilent = false;
+    float outputPeak = 0.0F;
+    float outputRms = 0.0F;
     std::size_t frames = 0;
     std::size_t channels = 0;
     const char *error = "none";
@@ -85,6 +90,7 @@ struct ProcessResult {
 ProcessResult process(Steinberg::Vst::IAudioProcessor &processor,
                       const BlockView &block, PlanarBuffer &scratch,
                       bool bypassed = false,
-                      Steinberg::Vst::IParameterChanges *parameterChanges = nullptr) noexcept;
+                      Steinberg::Vst::IParameterChanges *parameterChanges = nullptr,
+                      bool measureOutput = true) noexcept;
 
 }

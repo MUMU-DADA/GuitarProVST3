@@ -97,6 +97,7 @@ git diff --check
 - [P9 实现记录](docs/P9_IMPLEMENTATION.md)
 - [P10 editor/音频生效优化计划](docs/P10_EDITOR_AUDIO_ACTIVATION_PLAN.md)
 - [P10 实现记录](docs/P10_IMPLEMENTATION.md)
+- [P12 首次启用生效优化计划](docs/P12_AUDIO_ACTIVATION_OPTIMIZATION_PLAN.md)
 - [测试与验证](docs/TESTING.md)
 - [免责声明](DISCLAIMER.md)
 - [VST3 SDK 许可](third_party/vst3sdk/LICENSE.txt)

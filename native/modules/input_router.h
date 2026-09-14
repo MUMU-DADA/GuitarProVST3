@@ -54,6 +54,8 @@ struct InterleavedView {
 
 enum class Route : std::uint8_t {
     Disabled,
+    // Process capture through the input chain and add it to the host-generated
+    // output at the final device boundary.
     InputInsert,
     BusMix,
 };
