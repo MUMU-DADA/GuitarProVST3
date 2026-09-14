@@ -215,6 +215,11 @@ void shutdown() noexcept;
 // Refresh the verified GuitarProMCP EffectsChain -> track binding table on
 // the Qt/control thread. The audio callback only consumes its atomics.
 void refreshTrackContext() noexcept;
+using SelectionNotifier = void (*)() noexcept;
+using TrackContextNotifier = void (*)() noexcept;
+void setSelectionNotifier(SelectionNotifier notifier) noexcept;
+void setTrackContextNotifier(TrackContextNotifier notifier) noexcept;
+bool editorCallbackActive() noexcept;
 // Control-thread notification after a failed restored/running entry was
 // persisted as disabled; the UI reloads the actual accepted selection.
 bool consumeSelectionStateChanges() noexcept;

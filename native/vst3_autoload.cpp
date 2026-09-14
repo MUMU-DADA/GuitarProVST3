@@ -2,10 +2,16 @@
 #include <QtCore/QFileInfo>
 #include <QtCore/QTimer>
 #include <QtGui/QImageIOPlugin>
+#include <QtCore/QJsonDocument>
 
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include <windows.h>
+#include <atomic>
+#include <chrono>
+#include <condition_variable>
+#include <mutex>
+#include <thread>
 
 #include "modules/bootstrap.h"
 #include "modules/gp_audio_runtime.h"
@@ -25,26 +31,81 @@ QString pluginPath() {
     return length && length < 32768 ? QString::fromWCharArray(path, static_cast<int>(length)) : QString{};
 }
 
-void writeObservation() {
-    const auto hook = gpvst3::bootstrap::hookSnapshot();
-    // The hook snapshot is polled for diagnostics, but an unchanged snapshot
-    // does not need another QSaveFile replacement. This removes idle disk I/O
-    // while retaining an immediate write whenever counters or state change.
-    static QJsonObject lastHook;
-    static bool haveLastHook = false;
-    if (!haveLastHook || hook != lastHook) {
-        if (gpvst3::state::writeRealtimeObservation(hook)) {
-            lastHook = hook;
-            haveLastHook = true;
-        }
-    }
-    if (auto *application = QCoreApplication::instance())
-        QTimer::singleShot(250, application, &writeObservation);
+bool telemetryKey(const QString &key) {
+    const auto name = key.toLower();
+    return name.contains("count") || name.contains("sequence") || name.contains("address") ||
+        name.contains("hash") || name.contains("peak") || name.contains("rms") ||
+        name.contains("thread_id") || name.contains("frame_count") || name.endsWith("_blocks") ||
+        name == QStringLiteral("last_process_nanoseconds") || name == QStringLiteral("max_process_nanoseconds") ||
+        name == QStringLiteral("total_process_nanoseconds");
 }
 
+QJsonValue stableObservation(const QJsonValue &value) {
+    if (value.isArray()) {
+        QJsonArray result;
+        for (const auto &item : value.toArray()) result.append(stableObservation(item));
+        return result;
+    }
+    if (!value.isObject()) return value;
+    QJsonObject result;
+    const auto object = value.toObject();
+    for (auto it = object.constBegin(); it != object.constEnd(); ++it)
+        if (!telemetryKey(it.key())) result.insert(it.key(), stableObservation(it.value()));
+    return result;
+}
+
+void writeObservation() {
+    const auto hook = gpvst3::bootstrap::hookSnapshot();
+    static QByteArray lastStable, lastFull;
+    static auto lastSubmit = std::chrono::steady_clock::time_point{};
+    const auto stable = QJsonDocument(stableObservation(hook).toObject()).toJson(QJsonDocument::Compact);
+    const auto full = QJsonDocument(hook).toJson(QJsonDocument::Compact);
+    const auto now = std::chrono::steady_clock::now();
+    const bool detailed = qEnvironmentVariable("GPVST3_DIAGNOSTIC_MODE") == QStringLiteral("detailed");
+    if (detailed || stable != lastStable ||
+        (!lastSubmit.time_since_epoch().count() || (full != lastFull && now - lastSubmit >= std::chrono::seconds(5)))) {
+        if (gpvst3::state::writeRealtimeObservation(hook)) {
+            lastStable = stable; lastFull = full; lastSubmit = now;
+        }
+    }
+}
+
+class ObservationMonitor {
+public:
+    void start() {
+        if (thread_.joinable()) return;
+        stopping_.store(false, std::memory_order_release);
+        thread_ = std::thread([this] {
+            writeObservation();
+            std::unique_lock<std::mutex> lock(mutex_);
+            while (!stopping_.load(std::memory_order_acquire)) {
+                const auto detailed = qEnvironmentVariable("GPVST3_DIAGNOSTIC_MODE") == QStringLiteral("detailed");
+                condition_.wait_for(lock, detailed ? std::chrono::milliseconds(250) : std::chrono::seconds(1));
+                if (stopping_.load(std::memory_order_acquire)) break;
+                lock.unlock(); writeObservation(); lock.lock();
+            }
+        });
+    }
+    void stop() noexcept {
+        stopping_.store(true, std::memory_order_release);
+        condition_.notify_all();
+        if (thread_.joinable()) thread_.join();
+    }
+private:
+    std::atomic<bool> stopping_{false};
+    std::mutex mutex_;
+    std::condition_variable condition_;
+    std::thread thread_;
+};
+
+ObservationMonitor g_observationMonitor;
+
 void stopObservation() {
+    g_observationMonitor.stop();
     gpvst3::vst3::shutdownScan();
     gpvst3::state::writeRealtimeObservation(gpvst3::bootstrap::hookSnapshot());
+    gpvst3::state::stopRealtimeObservationWriter();
+    gpvst3::state::stopStatusWriter();
     gpvst3::ui::shutdownEditors();
     gpvst3::hook::shutdown();
     gpvst3::gp_audio::shutdown();
@@ -55,6 +116,7 @@ void initializePlugin() {
     auto status = gpvst3::bootstrap::initialize();
     status.insert("plugin_path", pluginPath());
     gpvst3::state::writeStatus(status);
+    gpvst3::state::startStatusWriter();
     gpvst3::ui::showEffectChainPanel(false);
     if (!gpvst3::state::pluginEnabled()) {
         // The About dialog remains available so the user can re-enable the
@@ -65,14 +127,11 @@ void initializePlugin() {
     // A new Guitar Pro session starts with every VST3 effect bypassed. The
     // persisted chain is shown in the selector, but processors are created
     // only after an explicit user enable action.
-    auto *scanTimer = new QTimer(application);
-    scanTimer->setInterval(100);
-    QObject::connect(scanTimer, &QTimer::timeout, application,
-                     [status]() mutable { gpvst3::bootstrap::pollVst3(status); });
-    scanTimer->start();
+    // bootstrap owns a single 100 ms poll timer and starts it only while a
+    // static scan or recognition job is active.
     // A P7 selection can start the hook after bootstrap. Keep its
     // observation and shutdown lifecycle available in default launches.
-    writeObservation();
+    g_observationMonitor.start();
     QObject::connect(application, &QCoreApplication::aboutToQuit, application, &gpvst3::ui::shutdownEditors);
     QObject::connect(application, &QCoreApplication::aboutToQuit, application, &gpvst3::hook::saveVst3States);
     QObject::connect(application, &QCoreApplication::aboutToQuit, application, &gpvst3::vst3::shutdownScan);

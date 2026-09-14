@@ -22,6 +22,8 @@ P8 交付范围已在 **Guitar Pro 8.1.1.17 / Windows x64** 上完成专项验�
 
 P9 的切换框架、紧凑侧栏、About 窗口和扫描反馈已通过夹具及 MCP 流程验证。P10 已补齐原生 editor 生命周期、首次启停旁路/提交时序和首个处理块诊断，并通过 Qt/HWND 夹具与 MCP 宿主回归；实现细节见 [P10 实现记录](docs/P10_IMPLEMENTATION.md)。
 
+P11 已完成周期维护替换：音轨刷新、侧栏挂载、诊断写盘和 scanner poll 均按事件或任务活动触发；实现与验证见 [P11 实现记录](docs/P11_IMPLEMENTATION.md)。
+
 ## 运行边界
 
 | 项目 | 说明 |
@@ -97,6 +99,8 @@ git diff --check
 - [P9 实现记录](docs/P9_IMPLEMENTATION.md)
 - [P10 editor/音频生效优化计划](docs/P10_EDITOR_AUDIO_ACTIVATION_PLAN.md)
 - [P10 实现记录](docs/P10_IMPLEMENTATION.md)
+- [P11 UI 性能计划](docs/P11_UI_PERFORMANCE_PLAN.md)
+- [P11 实现记录](docs/P11_IMPLEMENTATION.md)
 - [测试与验证](docs/TESTING.md)
 - [免责声明](DISCLAIMER.md)
 - [VST3 SDK 许可](third_party/vst3sdk/LICENSE.txt)

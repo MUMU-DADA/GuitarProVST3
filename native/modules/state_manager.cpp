@@ -14,6 +14,9 @@
 #include <QtCore/QStandardPaths>
 #include <mutex>
 #include <algorithm>
+#include <condition_variable>
+#include <thread>
+#include <atomic>
 
 namespace gpvst3::state {
 namespace {
@@ -38,6 +41,59 @@ struct TrackLocation { QString score, key; int index = -1; };
 QHash<QString, DocumentTracks> g_documentTracks;
 QHash<QString, TrackLocation> g_trackLocations;
 QString g_identitySignature;
+bool writeJson(const QString &path, const QJsonObject &object);
+
+class ObservationWriter {
+public:
+    explicit ObservationWriter(QString fileName) : fileName_(std::move(fileName)) {}
+    ~ObservationWriter() { stop(); }
+    void start() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (thread_.joinable()) return;
+        stopping_ = false;
+        thread_ = std::thread([this] { run(); });
+    }
+    void submit(const QJsonObject &object) {
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            latest_ = object;
+            pending_ = true;
+        }
+        condition_.notify_one();
+    }
+    void stop() noexcept {
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            stopping_ = true;
+        }
+        condition_.notify_one();
+        if (thread_.joinable()) thread_.join();
+    }
+private:
+    void run() {
+        for (;;) {
+            QJsonObject value;
+            {
+                std::unique_lock<std::mutex> lock(mutex_);
+                condition_.wait(lock, [this] { return stopping_ || pending_; });
+                if (stopping_ && !pending_) return;
+                value = latest_;
+                pending_ = false;
+            }
+            writeJson(QDir(dataDirectory()).filePath(fileName_), value);
+        }
+    }
+    std::mutex mutex_;
+    std::condition_variable condition_;
+    std::thread thread_;
+    QJsonObject latest_;
+    bool pending_ = false;
+    bool stopping_ = false;
+    QString fileName_;
+};
+
+ObservationWriter g_observationWriter(QStringLiteral("p2-observation.json"));
+ObservationWriter g_statusWriter(QStringLiteral("status.json"));
 
 bool writeJson(const QString &path, const QJsonObject &object) {
     const QFileInfo info(path);
@@ -572,15 +628,28 @@ bool writeStatus(const QJsonObject &input) {
     status.insert("pid", QCoreApplication::applicationPid());
     status.insert("executable", QCoreApplication::applicationFilePath());
     status.insert("time", QDateTime::currentDateTimeUtc().toString(Qt::ISODate));
-    return writeJson(QDir(dataDirectory()).filePath(QStringLiteral("status.json")), status);
+    g_statusWriter.start();
+    g_statusWriter.submit(status);
+    return true;
 }
 
 bool writeRealtimeObservation(const QJsonObject &hookStatus) {
+    static std::atomic<quint64> generation{0};
     const QJsonObject status{
         {"schema", 1},
         {"gp_hook", hookStatus},
+        {"generation", static_cast<qint64>(generation.fetch_add(1, std::memory_order_relaxed) + 1)},
+        {"sample_mode", qEnvironmentVariable("GPVST3_DIAGNOSTIC_MODE") == QStringLiteral("detailed")
+            ? QStringLiteral("detailed") : QStringLiteral("normal")},
         {"time", QDateTime::currentDateTimeUtc().toString(Qt::ISODate)}};
-    return writeJson(QDir(dataDirectory()).filePath(QStringLiteral("p2-observation.json")), status);
+    g_observationWriter.start();
+    g_observationWriter.submit(status);
+    return true;
 }
+
+void startRealtimeObservationWriter() { g_observationWriter.start(); }
+void stopRealtimeObservationWriter() noexcept { g_observationWriter.stop(); }
+void startStatusWriter() { g_statusWriter.start(); }
+void stopStatusWriter() noexcept { g_statusWriter.stop(); }
 
 }

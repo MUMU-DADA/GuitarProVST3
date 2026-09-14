@@ -698,6 +698,11 @@ bool poll(State &completed) noexcept {
     return true;
 }
 
+bool pollNeeded() noexcept {
+    std::lock_guard<std::mutex> lock(scanMutex);
+    return scanFuture.valid() || static_cast<bool>(recognitionJob) || !recognitionQueue.isEmpty();
+}
+
 void shutdownScan() noexcept {
     stopping.store(true);
     std::future<State> worker;

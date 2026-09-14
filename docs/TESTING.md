@@ -63,3 +63,14 @@ P10 激活夹具验证下一 callback 旁路、warm/cold slot 首个处理块和
 ```
 
 状态文件中的 `selection_*`、`audio_generation`、`chain_*first_processed*` 和 `editor_stage/editor_result_code` 是 P10 的结构化证据入口。
+
+## P11 验证
+
+P11 专项不使用 computer use；维护 writer、dirty 合并、scanner poll、P9 UI 和 P10 activation 由 `test-p11.ps1` 串联。真实宿主使用已安装 MCP bridge 与 `test-p8-track-runtime.ps1`：
+
+```powershell
+./native/test/test-p11.ps1 -QtDir C:/path/to/Qt/5.15.x/msvc2019_64 -OutputRoot .tools/native/p11-suite
+./native/test/test-p8-track-runtime.ps1 -PluginPath .tools/native/p11-build/plugins/imageformats/guitarpro_vst3_autoload.dll -ExpectedBindingSource mcp_context_native_registry -HookMode enabled
+```
+
+P11 的静态门禁确认没有旧的 250/500 ms 维护路径、`musician->updateAll()` 或 `snapshot()` 音频副作用；真实宿主证据保留在 `artifacts/`，构建产物和宿主副本不提交。

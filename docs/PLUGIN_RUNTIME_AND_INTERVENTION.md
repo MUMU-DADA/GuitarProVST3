@@ -101,7 +101,7 @@ sequenceDiagram
         Boot->>Hook: refreshTrackContext()
         Boot->>UI: 注入 selection、editor、旁路、扫描回调
         Boot->>Catalog: beginAsync(hostSupported)
-        Boot->>Qt: 启动 scan poll(100ms)、track tick(250ms)、catalog refresh(60s)
+        Boot->>Qt: 启动按需 scan poll(100ms) 与事件合并刷新
         Qt->>UI: showEffectChainPanel(false)
     end
     loop 运行期间
@@ -220,7 +220,7 @@ sequenceDiagram
     participant Worker as selectionWorkerLoop
     participant Chain as 双槽 Chain
     participant Input as live-input copy
-    participant Tick as 250ms control tick
+    participant Tick as 合并控制通知
 
     User->>Panel: 勾选/取消勾选、排序、参数编辑
     Panel->>Panel: 更新 enabled/bypass/order/configured
@@ -535,7 +535,7 @@ flowchart LR
 | `effect-chain.json` | 勾选、排序、参数、关闭、退出、runtime retire | schema 2 的 global/track 链、顺序、enabled/bypass、component/controller state、错误 |
 | `vst3-catalog-cache.json` | static scan、factory recognition、timeout | 路径指纹、metadata entries、recognition 状态和重试时间 |
 | `status.json` | bootstrap 初始化和 scan poll | host、VST3 catalog、hook、UI、adapter 摘要 |
-| `p2-observation.json` | 250ms 诊断 tick（快照变化时写）和退出 | Master/DSP/stream、chain、track、input、selection、editor 时间线和证据 |
+| `p2-observation.json` | 后台合并快照和退出最终 flush | Master/DSP/stream、chain、track、input、selection、editor 时间线和证据 |
 
 ## 13. 控制线程、实时线程和 editor 线程关系
 

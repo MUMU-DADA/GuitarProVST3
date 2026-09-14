@@ -74,6 +74,8 @@ class P7Panel;
 P7Panel *g_p7Panel = nullptr;
 P7Panel *g_globalPanel = nullptr;
 QPointer<QTimer> g_panelAttachTimer;
+std::function<void()> g_panelAttach;
+bool g_panelAttachPending = false;
 QPointer<QDialog> g_aboutDialog;
 QPointer<QObject> g_aboutObserver;
 QPointer<QMainWindow> g_aboutObservedWindow;
@@ -436,7 +438,7 @@ QDialog *aboutDialog() {
     title->setFont(titleFont);
     layout->addWidget(title);
     auto *details = new QLabel(
-        QStringLiteral("版本：0.9.7\n"
+        QStringLiteral("版本：0.9.13\n"
                        "已验证宿主：Guitar Pro 8.1.1.17（Windows x64）\n"
                        "许可证：MIT License\n"
                        "第三方声明：VST3 SDK 及插件各自遵循其许可证。\n"
@@ -489,6 +491,15 @@ void showAboutDialog() {
 
 void ensureAboutEntry();
 
+void schedulePanelAttach() {
+    if (g_panelAttachPending || !g_panelAttach || !qApp) return;
+    g_panelAttachPending = true;
+    QTimer::singleShot(0, qApp, [] {
+        g_panelAttachPending = false;
+        if (g_panelAttach) g_panelAttach();
+    });
+}
+
 class AboutEntryObserver final : public QObject {
 public:
     explicit AboutEntryObserver(QObject *parent = nullptr) : QObject(parent) {}
@@ -502,7 +513,7 @@ protected:
             // Guitar Pro rebuilds the title/sidebar hierarchy while changing
             // score pages. Reattach after the host finishes that mutation so
             // the About entry survives toolbar replacement immediately.
-            QTimer::singleShot(0, qApp, [] { ensureAboutEntry(); });
+            schedulePanelAttach();
         }
         return QObject::eventFilter(object, event);
     }
@@ -1545,7 +1556,7 @@ void showEffectChainPanel(bool show) {
     auto *timer = g_panelAttachTimer.data();
     if (!timer) {
         timer = new QTimer(qApp);
-        timer->setInterval(500);
+        timer->setSingleShot(true);
         g_panelAttachTimer = timer;
     }
     const auto attachPanel = [timer] {
@@ -1660,14 +1671,30 @@ void showEffectChainPanel(bool show) {
         }
         timer->setProperty("dockReady", dockReady);
     };
+    g_panelAttach = attachPanel;
     if (!timer->property("gpvst3Connected").toBool()) {
-        QObject::connect(timer, &QTimer::timeout, timer, attachPanel);
+        QObject::connect(timer, &QTimer::timeout, timer, [timer] {
+            if (g_panelAttach) g_panelAttach();
+            if (findSoundHost()) {
+                timer->setProperty("gpvst3AttachRetries", 0);
+                timer->stop();
+                return;
+            }
+            const int retries = timer->property("gpvst3AttachRetries").toInt() + 1;
+            timer->setProperty("gpvst3AttachRetries", retries);
+            if (retries >= 20) timer->stop();
+            else timer->start(100);
+        });
         timer->setProperty("gpvst3Connected", true);
     }
     // A user click must display a newly recreated selector in this event,
     // without waiting for another click or the sidebar maintenance timer.
     attachPanel();
-    timer->start();
+    timer->stop();
+    if (!findSoundHost()) {
+        timer->setProperty("gpvst3AttachRetries", 0);
+        timer->start(50);
+    }
 }
 
 }

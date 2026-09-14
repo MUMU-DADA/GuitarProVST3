@@ -7,6 +7,8 @@
 
 namespace gpvst3::gp_audio {
 
+using RefreshNotifier = void (*)() noexcept;
+
 struct Binding {
     void *chain = nullptr;
     int trackIndex = -1;
@@ -24,10 +26,18 @@ struct Binding {
 // thread.  No native model calls are made from the audio callback.
 void initialize() noexcept;
 void shutdown() noexcept;
+void setRefreshNotifier(RefreshNotifier notifier) noexcept;
+void markDirty() noexcept;
+void markSelectionDirty() noexcept;
+bool refreshNeeded() noexcept;
+bool refreshIncomplete() noexcept;
+bool checkStructureChanged() noexcept;
 
 // Refreshes the immutable chain binding snapshot. Must run on the Qt/control
 // thread. Returns the number of verified bindings published.
 std::size_t refresh() noexcept;
+std::size_t refreshIfNeeded() noexcept;
+bool refreshSelectionContext() noexcept;
 
 // Returns the track selected by the active Guitar Pro document according to
 // the MCP bridge. This is a control-thread snapshot; the audio callback uses

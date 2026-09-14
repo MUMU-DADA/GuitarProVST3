@@ -12,8 +12,68 @@
 #include <QtCore/QString>
 #include <QtCore/QTimer>
 #include <QtCore/QCoreApplication>
+#include <QtCore/QMetaObject>
+#include <QtCore/QPointer>
+#include <atomic>
 
 namespace {
+
+QPointer<QTimer> g_scanTimer;
+QPointer<QTimer> g_trackFallbackTimer;
+QJsonObject g_scanStatus;
+std::atomic<bool> g_trackRefreshQueued{false};
+
+void dispatchTrackRefresh();
+void ensureScanTimer();
+void scheduleTrackRefresh() noexcept {
+    auto *application = QCoreApplication::instance();
+    if (!application) return;
+    bool expected = false;
+    if (!g_trackRefreshQueued.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) return;
+    if (!QMetaObject::invokeMethod(application, [application] {
+            QTimer::singleShot(0, application, [] { dispatchTrackRefresh(); });
+        }, Qt::QueuedConnection)) g_trackRefreshQueued.store(false, std::memory_order_release);
+}
+
+void notifyTrackContextComplete() noexcept {
+    if (auto *application = QCoreApplication::instance())
+        QMetaObject::invokeMethod(application, [] {
+            if (gpvst3::hook::consumeSelectionStateChanges()) gpvst3::ui::reloadVst3Selections();
+            gpvst3::ui::syncVst3Selection();
+            gpvst3::ui::refreshVst3TrackContext();
+        }, Qt::QueuedConnection);
+}
+
+void dispatchTrackRefresh() {
+    g_trackRefreshQueued.store(false, std::memory_order_release);
+    if (gpvst3::hook::editorCallbackActive()) {
+        // An open editor must not trigger a full native graph walk, but the
+        // MCP bridge can still provide the selected-track flags needed to
+        // switch the track scope before opening the next editor.
+        gpvst3::gp_audio::refreshSelectionContext();
+        gpvst3::ui::refreshVst3TrackContext();
+        return;
+    }
+    gpvst3::gp_audio::refreshSelectionContext();
+    gpvst3::hook::refreshTrackContext();
+    if (gpvst3::hook::consumeSelectionStateChanges()) gpvst3::ui::reloadVst3Selections();
+    gpvst3::ui::syncVst3Selection();
+    gpvst3::ui::refreshVst3TrackContext();
+}
+
+void ensureScanTimer() {
+    auto *application = QCoreApplication::instance();
+    if (!application) return;
+    if (!g_scanTimer) {
+        g_scanTimer = new QTimer(application);
+        g_scanTimer->setInterval(100);
+        QObject::connect(g_scanTimer, &QTimer::timeout, g_scanTimer, [] {
+            gpvst3::bootstrap::pollVst3(g_scanStatus);
+            if (!gpvst3::vst3::pollNeeded()) g_scanTimer->stop();
+        });
+    }
+    if (gpvst3::vst3::pollNeeded()) g_scanTimer->start();
+}
 
 QJsonObject classStatus(const gpvst3::vst3::ClassState &value) {
     return QJsonObject{
@@ -126,6 +186,7 @@ void scanFeedback(const gpvst3::vst3::State &scan) {
 void refreshCatalog(bool retryTimedOut = false) {
     const auto pending = gpvst3::vst3::beginAsync(gpvst3::hook::snapshot().hostSupported, retryTimedOut);
     scanFeedback(pending);
+    ensureScanTimer();
 }
 
 QJsonArray identifyBundle(const QString &module, QString *error) {
@@ -338,7 +399,10 @@ QJsonObject initialize() {
     if (enabled) state::disableAllEffectsAtStartup();
     if (enabled) {
         gpvst3::gp_audio::initialize();
+        gpvst3::gp_audio::setRefreshNotifier(&scheduleTrackRefresh);
         hook::prepare(host);
+        hook::setSelectionNotifier(&scheduleTrackRefresh);
+        hook::setTrackContextNotifier(&notifyTrackContextComplete);
         hook::refreshTrackContext();
         ui::setRealtimeBypassControl(&hook::setTotalBypass);
         ui::setVst3SelectionControl(&hook::setGlobalVst3Selection);
@@ -364,21 +428,32 @@ QJsonObject initialize() {
     if (enabled) {
         vst3::setRecognitionControl(&vst3::identifyBundle);
         ui::setVst3DiscoveryControl([] { refreshCatalog(true); }, &identifyBundle);
-        auto *refreshTimer = new QTimer(QCoreApplication::instance());
-        refreshTimer->setInterval(60000);
-        QObject::connect(refreshTimer, &QTimer::timeout, refreshTimer, [] { refreshCatalog(); });
-        refreshTimer->start();
-        auto *trackTimer = new QTimer(QCoreApplication::instance());
-        trackTimer->setInterval(250);
-        QObject::connect(trackTimer, &QTimer::timeout, trackTimer, [] {
-            hook::refreshTrackContext();
-            if (hook::consumeSelectionStateChanges()) ui::reloadVst3Selections();
-            ui::syncVst3Selection();
-            ui::refreshVst3TrackContext();
-        });
-        trackTimer->start();
         vst3 = qEnvironmentVariable("GPVST3_RUN_LIFECYCLE_PROBE") == "1"
             ? vst3::prepare(host.supported) : vst3::beginAsync(host.supported);
+        g_scanStatus = QJsonObject{};
+        g_scanStatus.insert("vst3_host", vst3Status(vst3));
+        g_scanStatus.insert("vst3_catalog", vst3Catalog(vst3));
+        ensureScanTimer();
+        g_trackFallbackTimer = new QTimer(QCoreApplication::instance());
+        g_trackFallbackTimer->setInterval(2000);
+        QObject::connect(g_trackFallbackTimer, &QTimer::timeout, g_trackFallbackTimer, [] {
+            static int attempts = 0;
+            const auto state = gpvst3::hook::snapshot();
+            if (!state.trackScopeUnresolved && attempts++ >= 5) {
+                // Keep a bounded low-frequency selection check for hosts that
+                // do not expose cursor changes as Qt lifecycle events.
+                if (attempts >= 30) { g_trackFallbackTimer->stop(); return; }
+            }
+            gpvst3::gp_audio::markSelectionDirty();
+            // Some Guitar Pro builds expose cursor changes only through the
+            // native score model. During the bounded settling window, one
+            // full refresh every two seconds is the documented fallback.
+            gpvst3::gp_audio::markDirty();
+            gpvst3::gp_audio::checkStructureChanged();
+            if (gpvst3::gp_audio::refreshIncomplete()) gpvst3::gp_audio::markDirty();
+            scheduleTrackRefresh();
+        });
+        g_trackFallbackTimer->start();
     } else {
         vst3.status = "disabled_by_user";
         ui::setVst3DiscoveryControl(nullptr, nullptr);
@@ -439,6 +514,7 @@ bool pollVst3(QJsonObject &status) {
     status.insert("vst3_host", vst3Status(completed));
     status.insert("vst3_catalog", catalog);
     state::writeStatus(status);
+    if (!vst3::pollNeeded() && g_scanTimer) g_scanTimer->stop();
     return true;
 }
 

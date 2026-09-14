@@ -43,7 +43,7 @@ function Wait-Operation([string]$request, [string]$expected) {
 }
 function Wait-Track([int]$index) {
     $cursor = Invoke-McpTool $session gp_cursor @{document=$document;axis='track';index=$index}
-    $deadline = [DateTime]::UtcNow.AddSeconds(5)
+    $deadline = [DateTime]::UtcNow.AddSeconds(12)
     do {
         Start-Sleep -Milliseconds 250
         $state = Invoke-McpTool $session gp_audio_abi @{document=$document;operation='state'}

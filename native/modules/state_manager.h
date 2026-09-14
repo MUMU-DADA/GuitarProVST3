@@ -51,5 +51,9 @@ bool reconcileTrackIdentities(std::vector<HostTrackIdentity> &tracks);
 void resetTrackIdentities();
 bool writeStatus(const QJsonObject &status);
 bool writeRealtimeObservation(const QJsonObject &hookStatus);
+void startRealtimeObservationWriter();
+void stopRealtimeObservationWriter() noexcept;
+void startStatusWriter();
+void stopStatusWriter() noexcept;
 
 }
