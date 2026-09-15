@@ -41,6 +41,7 @@ void notifyTrackContextComplete() noexcept {
             if (gpvst3::hook::consumeSelectionStateChanges()) gpvst3::ui::reloadVst3Selections();
             gpvst3::ui::syncVst3Selection();
             gpvst3::ui::refreshVst3TrackContext();
+            gpvst3::hook::preloadSavedSelections();
         }, Qt::QueuedConnection);
 }
 
@@ -205,6 +206,12 @@ QJsonArray identifyBundle(const QString &module, QString *error) {
 }
 
 QJsonObject hookStatus(const gpvst3::hook::State &value) {
+    QJsonArray instances;
+    for (const auto &entry : value.instances) instances.append(QJsonObject{
+        {"scope", QString::fromStdString(entry.scope)}, {"track_key", QString::fromStdString(entry.trackKey)},
+        {"module", QString::fromStdString(entry.module)}, {"class_id", QString::fromStdString(entry.classId)},
+        {"instance_id", QString::number(entry.instanceId)}, {"processed_blocks", qint64(entry.processedBlocks)},
+        {"sample_rate", entry.sampleRate}, {"active", entry.active}, {"preloaded", entry.preloaded}});
     const auto entryStatus = [](const gpvst3::hook::EntryPointObservation &entry) {
         return QJsonObject{
             {"module_loaded", entry.moduleLoaded},
@@ -257,6 +264,12 @@ QJsonObject hookStatus(const gpvst3::hook::State &value) {
         {"runtime_processor_ready", value.runtimeProcessorReady},
         {"runtime_process_observed", value.runtimeProcessObserved},
         {"runtime_buffer_write_observed", value.runtimeBufferWriteObserved},
+        {"preload_pending", value.preloadPending},
+        {"global_preloaded", value.globalPreloaded},
+        {"input_preloaded", value.inputPreloaded},
+        {"track_preloaded", static_cast<qint64>(value.trackPreloaded)},
+        {"preload_completed", qint64(value.preloadCompleted)}, {"preload_failed", qint64(value.preloadFailed)},
+        {"preload_error", QString::fromStdString(value.preloadError)}, {"instances", instances},
         {"runtime_process_count", static_cast<qint64>(value.runtimeProcessCount)},
         {"runtime_configuration_mismatch_blocks", static_cast<qint64>(value.runtimeConfigurationMismatchBlocks)},
         {"runtime_configuration_matches", value.runtimeConfigurationMatches},
@@ -463,6 +476,7 @@ QJsonObject initialize() {
     const auto catalog = vst3Catalog(vst3);
     if (enabled) {
         hook::setVst3Catalog(catalog);
+        hook::preloadSavedSelections();
         if (hook::consumeSelectionStateChanges()) ui::reloadVst3Selections();
     }
     ui::setVst3Catalog(catalog);
@@ -508,6 +522,7 @@ bool pollVst3(QJsonObject &status) {
     if (!vst3::poll(completed)) return false;
     const auto catalog = vst3Catalog(completed);
     hook::setVst3Catalog(catalog);
+    hook::preloadSavedSelections();
     if (hook::consumeSelectionStateChanges()) ui::reloadVst3Selections();
     ui::setVst3Catalog(catalog);
     scanFeedback(completed);

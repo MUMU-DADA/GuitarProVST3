@@ -11,6 +11,7 @@
 - About/侧栏使用共享 pending 调度和有限启动重试，稳定后停止调度。
 - `p2-observation.json` 和 `status.json` 使用 latest-slot 后台 writer；正常诊断按状态变化合并写入，详细模式才允许高频采样，退出时先 drain writer 再清理 runtime。
 - scanner poll 只在 static future 或 recognition job/queue 活跃时运行，完成后停止 100 ms timer。
+- 启动后 selection worker 会按识别成功的 catalog 逐个为 global、每个 track 及显式输入路由准备实例并保持 bypass；显式勾选、停用和切换都复用所属 scope 的实例，不把冷启动时间放在点击路径上。输入路由默认关闭，避免启用 global 时形成输入回音。
 
 验证入口：
 
@@ -33,5 +34,20 @@
 - 新曲谱双音轨真实 Archetype 处理：`artifacts/mcp-p8-track-0c3318d76a694134a77a5aad2dcca434`。
 - 用户曲谱/sidecar 副本复验：`artifacts/mcp-existing-track-dbc482a469274a258b58991f92504bc9`；原始用户数据未写入。
 - 同时修复异步 `status.json` writer 覆盖 `plugin_path` 身份字段的问题，避免测试和诊断读取到不属于当前 DLL 的状态。
+
+## 后台预加载证据
+
+旧预加载实现的用户曲谱/sidecar 副本证据：`artifacts/preload-check-7ea2aaba346d4f309851a78f5e417303`。该轮只覆盖保存为 `desired_enabled` 的条目，不代表完整 catalog 预加载验收。
+
+## 2026-09-15 完整预加载、实例保留和输入回音修复
+
+- 已实现：预加载读取完整 ready catalog，并合并每个 scope 的保存状态；未启用和未写入 sidecar 的插件同样预加载。预加载不受同时启用 8 个效果器的链容量限制；每处理一个插件就让出 worker 给显式选择，单个失败继续处理后续插件。
+- 已实现：global、track、显式 input 路由各自持有实例池，双槽只负责当前处理顺序。停用不销毁组件、控制器或模块；切换到其他插件再回来复用原实例和参数。预加载不激活音频，诊断 `instances` 包含全部保留实例及各自的 `active`、`preloaded`、`processed_blocks`。
+- 已实现：未设置 `GPVST3_P4_ROUTE` 时输入路由为 `disabled`，勾选 global 不再把输入设备声音送回输出。显式 `input_insert` / `bus_mix` 保留原有路由语义。
+- 已验证：`test-p8-runtime.ps1` 使用生产 runtime 和真实 VST3 夹具验证每个 scope 的 9 个插件预加载、失败后继续、预加载期间显式选择、A→B→C→A 多轮启停原实例复用、参数保留、重排后的实际采样结果、采样率重配及状态错误隔离。证据：`artifacts/p8-runtime-21dd2fc0ec63474b92ac5d7560c5f320`。
+- 已验证：真实 Guitar Pro + MCP 三插件/双音轨，共 9 个独立实例，6 次切换均保持全部实例 ID；所有 global 启用阶段 `input_route=disabled`、`input_route_enabled=false`、`input_processed_blocks=0`。证据：`artifacts/preload-mcp-5637c18a15f74996a4d59b9f0ea2aafd`。
+- 已验证：真实 Archetype Mateus Asato、Archetype Nolly X 在 global 和两音轨预加载共 6 个独立实例，global/track 分别 A→B→A 后 ID 不变，激活插件实际处理块增加，输入监听保持关闭。证据：`artifacts/preload-mcp-09ab93e4dc704bc2b1d30dd1c432a9b8`。商业插件批量初始化可能超过 30 秒，宿主测试为此使用 120 秒上限。
+- 已验证：生产 DLL 构建、PowerShell 语法、`git diff --check`、P11 调度/UI/activation 和 P4 router 专项；宿主测试使用独立数据目录，安装目录完整性检查通过。
+- 宿主受限：旧 `test-p8-order.ps1` 新建曲谱流程在本次及修改前 DLL 都出现没有新的处理回调/读取旧块结果，未计为通过；本次顺序正确性由生产 runtime 的确定性采样回归验证。设备听感和跨设备矩阵仍未验收。
 
 宿主边界：未声明跨 Guitar Pro 版本的 ABI 兼容；商业插件自身的 editor/线程合同仍由插件实现决定。计划要求的 120 秒×3 固定设备 CPU A/B 需要宿主设备矩阵，不能由夹具结果代替。

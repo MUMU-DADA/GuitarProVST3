@@ -12,6 +12,7 @@
 namespace gpvst3::hook {
 
 void setVst3Catalog(const QJsonArray &catalog);
+void preloadSavedSelections() noexcept;
 void saveVst3States();
 
 struct Vst3SelectionEntry {
@@ -52,6 +53,13 @@ struct TrackRuntimeEvidence {
     bool writeObserved = false;
 };
 
+struct InstanceEvidence {
+    std::string scope, trackKey, module, classId;
+    std::uint64_t instanceId = 0, processedBlocks = 0;
+    int sampleRate = 0;
+    bool active = false, preloaded = false;
+};
+
 struct State {
     std::string trackBindingSource;
     bool installed = false;
@@ -73,6 +81,13 @@ struct State {
     bool runtimeProcessorReady = false;
     bool runtimeProcessObserved = false;
     bool runtimeBufferWriteObserved = false;
+    bool preloadPending = false;
+    bool globalPreloaded = false;
+    bool inputPreloaded = false;
+    std::size_t trackPreloaded = 0;
+    std::uint64_t preloadCompleted = 0, preloadFailed = 0;
+    std::string preloadError;
+    std::vector<InstanceEvidence> instances;
     std::size_t runtimeProcessCount = 0;
     std::size_t runtimeConfigurationMismatchBlocks = 0;
     bool runtimeConfigurationMatches = false;

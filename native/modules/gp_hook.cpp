@@ -36,6 +36,7 @@
 #include <QtCore/QMetaObject>
 #include <QtCore/QThread>
 #include <QtCore/QEventLoop>
+#include <QtCore/QByteArray>
 #include "portaudio_capture_abi.h"
 #include "pluginterfaces/base/funknownimpl.h"
 #include "pluginterfaces/base/ipluginbase.h"
@@ -374,7 +375,11 @@ fs::path runtimeBinary(const fs::path &path) {
     return fs::is_regular_file(candidate, error) ? candidate : fs::path{};
 }
 
+std::atomic<std::uint64_t> g_nextInstanceId{1};
+
 struct RuntimeEffect {
+    const std::uint64_t instanceId = g_nextInstanceId.fetch_add(1, std::memory_order_relaxed);
+    std::atomic<std::uint64_t> processedBlocks{0};
     HMODULE module = nullptr;
     ExitModuleProc exit = nullptr;
     IPtr<Steinberg::IPluginFactory> factory;
@@ -394,6 +399,8 @@ struct RuntimeEffect {
     QEventLoop *editorCloseLoop = nullptr;
     vst3::ParameterChanges parameterChanges;
     Vst3SelectionEntry identity;
+    Vst3SelectionEntry loadedSelection;
+    bool preloaded = false; // Control-thread diagnostic; never enables processing.
     FUnknownPtr<Steinberg::Vst::IConnectionPoint> componentConnection;
     FUnknownPtr<Steinberg::Vst::IConnectionPoint> controllerConnection;
     std::atomic<std::size_t> parameterEdits{0};
@@ -565,6 +572,7 @@ struct RuntimeEffect {
         }
         name = selected.name;
         identity = saved ? *saved : Vst3SelectionEntry{path.u8string(), uidString(selected.cid)};
+        loadedSelection = identity;
         auto *hostUnknown = static_cast<Steinberg::FUnknown *>(
             static_cast<Steinberg::Vst::IHostApplication *>(&host));
         Steinberg::MemoryStream componentState;
@@ -779,6 +787,9 @@ struct RuntimeEffect {
                 result.controllerState.assign(control.getData(), control.getData() + control.getSize());
         }
         identity = result;
+        // Parameter edits have already been mirrored to the independent input
+        // instance. Keep its saved-state identity in sync for warm reuse.
+        if (const auto mirror = inputParameterMirror.lock()) mirror->identity = result;
         return result;
     }
 
@@ -1098,6 +1109,7 @@ struct RuntimeEffect {
         processing.clear(std::memory_order_release);
         if (result.outputWritten) outputWritten.store(true, std::memory_order_release);
         if (result.ownerPointerObserved) ownerObserved.store(true, std::memory_order_release);
+        if (result.processed) processedBlocks.fetch_add(1, std::memory_order_relaxed);
         return result.processed;
     }
 
@@ -1133,6 +1145,75 @@ Steinberg::tresult PLUGIN_API RuntimeComponentHandler::restartComponent(Steinber
     return Steinberg::kNotImplemented;
 }
 
+bool matchesEffect(const RuntimeEffect &effect, const Vst3SelectionEntry &entry) noexcept {
+    const auto matches = [&](const Vst3SelectionEntry &saved) {
+        return saved.module == entry.module && saved.classId == entry.classId &&
+            saved.componentState == entry.componentState && saved.controllerState == entry.controllerState;
+    };
+    return effect.ready.load(std::memory_order_acquire) &&
+        (matches(effect.identity) || matches(effect.loadedSelection));
+}
+
+// Slot handoffs own the current processing order; the pool owns every loaded
+// instance for the lifetime of its scope, including disabled effects. Access
+// is serialized by selectionMutex and never happens in the audio callback.
+struct EffectPool {
+    std::vector<std::shared_ptr<RuntimeEffect>> effects;
+
+    bool hasPreloaded() const noexcept {
+        return std::any_of(effects.begin(), effects.end(), [](const auto &effect) {
+            return effect->preloaded && effect->ready.load(std::memory_order_acquire);
+        });
+    }
+
+    bool covers(const std::vector<Vst3SelectionEntry> &entries) const noexcept {
+        return std::all_of(entries.begin(), entries.end(), [&](const auto &entry) {
+            return std::any_of(effects.begin(), effects.end(), [&](const auto &effect) {
+                return effect->preloaded && matchesEffect(*effect, entry);
+            });
+        });
+    }
+
+    std::shared_ptr<RuntimeEffect> acquire(const Vst3SelectionEntry &entry, double rate,
+                                         std::size_t maxBlock, std::string *error,
+                                         bool preload = false) {
+        for (const auto &effect : effects) {
+            // Catalog refresh cannot overwrite a live or edited state.
+            const bool sameIdentity = effect->ready.load(std::memory_order_acquire) &&
+                effect->identity.module == entry.module && effect->identity.classId == entry.classId;
+            if (preload ? sameIdentity : matchesEffect(*effect, entry)) {
+                if (!preload && (effect->configuredRate.load() != static_cast<int>(rate) ||
+                                 effect->configuredBlock.load() < maxBlock) &&
+                    !effect->reconfigure(rate, maxBlock)) {
+                    if (error) *error = effect->error;
+                    return {};
+                }
+                return effect;
+            }
+            // A dormant preload may have been created without state. Apply the
+            // requested state on first explicit enable, preserving the same
+            // processor while still rejecting malformed state chunks.
+            if (!preload && sameIdentity && effect->preloaded) {
+                if (!effect->restoreState(entry)) {
+                    if (error) *error = effect->error;
+                    return {};
+                }
+                effect->identity = entry;
+                effect->preloaded = false;
+                return effect;
+            }
+        }
+        auto effect = std::make_shared<RuntimeEffect>();
+        if (!effect->initialize(rate, maxBlock, fs::u8path(entry.module), entry.classId, &entry)) {
+            if (error) *error = effect->error;
+            return {};
+        }
+        effect->preloaded = preload;
+        effects.push_back(effect);
+        return effect;
+    }
+};
+
 // A selected P7 list is prepared as one immutable callback context. Each
 // processor writes into the next preallocated planar buffer; the final one
 // writes to the host buffer. Rebuilding happens off the audio callback.
@@ -1143,6 +1224,18 @@ struct SelectionSlot {
     std::size_t count = 0;
     std::atomic<int> failedIndex{-1};
 
+    bool matches(const std::vector<Vst3SelectionEntry> &entries, double rate,
+                 std::size_t maxBlock) const noexcept {
+        if (entries.empty() || count != entries.size()) return false;
+        for (std::size_t i = 0; i < count; ++i) {
+            const auto &effect = effects[i];
+            if (!effect || !matchesEffect(*effect, entries[i]) ||
+                effect->configuredRate.load() != static_cast<int>(rate) ||
+                effect->configuredBlock.load() < maxBlock) return false;
+        }
+        return true;
+    }
+
     void shutdown() noexcept {
         for (auto &effect : effects) effect.reset();
         count = 0;
@@ -1150,12 +1243,7 @@ struct SelectionSlot {
     }
 
     bool prepare(const std::vector<Vst3SelectionEntry> &entries, double rate,
-                 std::size_t maxBlock, const SelectionSlot *previous, std::string *error) {
-        // Preserve a warm, disabled instance even when the slot being reused
-        // is also the last active slot. Copy ownership before clearing it.
-        std::array<std::shared_ptr<RuntimeEffect>, kMaxEffects> reusable;
-        const auto previousCount = previous ? previous->count : 0;
-        for (std::size_t i = 0; i < previousCount; ++i) reusable[i] = previous->effects[i];
+                 std::size_t maxBlock, EffectPool &pool, std::string *error) {
         shutdown();
         if (entries.empty()) return true;
         if (entries.size() > kMaxEffects || !pipeline[0].prepare(2, maxBlock) ||
@@ -1164,27 +1252,18 @@ struct SelectionSlot {
             return false;
         }
         for (std::size_t index = 0; index < entries.size(); ++index) {
-            for (std::size_t old = 0; old < previousCount; ++old) {
-                const auto &effect = reusable[old];
-                if (effect->identity.module == entries[index].module &&
-                    effect->identity.classId == entries[index].classId &&
-                    effect->identity.componentState == entries[index].componentState &&
-                    effect->identity.controllerState == entries[index].controllerState &&
-                    effect->configuredRate.load() == static_cast<int>(rate))
-                    effects[index] = effect;
-            }
+            effects[index] = pool.acquire(entries[index], rate, maxBlock, error);
             if (!effects[index]) {
-                effects[index] = std::make_shared<RuntimeEffect>();
-                if (!effects[index]->initialize(rate, maxBlock, fs::u8path(entries[index].module),
-                                                entries[index].classId, &entries[index])) {
-                    if (error) *error = effects[index]->error;
-                    shutdown();
-                    return false;
-                }
+                shutdown();
+                return false;
             }
         }
         count = entries.size();
         return true;
+    }
+
+    void markActive() noexcept {
+        for (std::size_t i = 0; i < count; ++i) effects[i]->preloaded = false;
     }
 
     bool processBlock(const audio::BlockView &block) noexcept {
@@ -1223,6 +1302,7 @@ struct SelectionSlot {
 // control-thread reconfiguration drains the chain before replacing instances.
 struct TrackRuntime {
     SelectionSlot trackSlots[2];
+    EffectPool pool;
     effects::Chain chain;
     std::atomic<std::size_t> count{0};
     std::string trackKey;
@@ -1234,6 +1314,8 @@ struct TrackRuntime {
     std::atomic<int> configuredRate{0};
     std::vector<Vst3SelectionEntry> requested;
     std::atomic<bool> configured{false};
+    std::atomic<bool> preloaded{false};
+    int retainedSlot = -1;
     std::atomic<std::size_t> processBlocks{0};
     std::atomic<std::size_t> processedBlocks{0};
     std::atomic<std::size_t> bypassBlocks{0};
@@ -1247,6 +1329,7 @@ struct TrackRuntime {
         chain.deactivate();
         trackSlots[0].shutdown();
         trackSlots[1].shutdown();
+        pool.effects.clear();
         count.store(0, std::memory_order_release);
         configuredRate.store(0, std::memory_order_release);
         processBlocks.store(0, std::memory_order_relaxed);
@@ -1254,6 +1337,8 @@ struct TrackRuntime {
         bypassBlocks.store(0, std::memory_order_relaxed);
         errorBlocks.store(0, std::memory_order_relaxed);
         configured.store(false, std::memory_order_release);
+        preloaded.store(false, std::memory_order_release);
+        retainedSlot = -1;
         processed.store(false, std::memory_order_release);
         writeObserved.store(false, std::memory_order_release);
     }
@@ -1265,9 +1350,32 @@ struct TrackRuntime {
             if (error) *error = "runtime_vst3_chain_full";
             return false;
         }
+        if (entries.empty()) {
+            chain.setBypassed(true);
+            chain.deactivate();
+            count.store(0, std::memory_order_release);
+            configured.store(true, std::memory_order_release);
+            return true;
+        }
         const auto old = chain.snapshot().activeSlot;
-        const auto target = old == 0 ? 1U : 0U;
-        const auto *previous = old >= 0 ? &trackSlots[old] : nullptr;
+        const auto previousSlot = old >= 0 ? old : retainedSlot;
+        const auto *previous = previousSlot >= 0 ? &trackSlots[previousSlot] : nullptr;
+        if (old >= 0 && configuredRate.load() != static_cast<int>(rate)) chain.deactivate();
+        if (previous && previous->matches(entries, rate, maxBlock)) {
+            if (!chain.activate(static_cast<unsigned>(previousSlot))) {
+                if (error) *error = "runtime_vst3_track_chain_activate_failed";
+                return false;
+            }
+            chain.clearFault();
+            chain.setBypassed(false);
+            trackSlots[previousSlot].markActive();
+            preloaded.store(pool.hasPreloaded(), std::memory_order_release);
+            count.store(entries.size(), std::memory_order_release);
+            configured.store(true, std::memory_order_release);
+            configuredRate.store(static_cast<int>(rate), std::memory_order_release);
+            return true;
+        }
+        const auto target = previousSlot == 0 ? 1U : 0U;
         // Reuse only a slot that has been retired at a block boundary. The
         // chain admission check drains readers before the slot's shared
         // processor instances are replaced.
@@ -1275,14 +1383,8 @@ struct TrackRuntime {
             if (error) *error = "runtime_vst3_track_chain_prepare_failed";
             return false;
         }
-        if (!trackSlots[target].prepare(entries, rate, maxBlock, previous, error)) return false;
+        if (!trackSlots[target].prepare(entries, rate, maxBlock, pool, error)) return false;
         count.store(entries.size(), std::memory_order_release);
-        if (entries.empty()) {
-            chain.clearFault();
-            chain.setBypassed(true);
-            configured.store(true, std::memory_order_release);
-            return true;
-        }
         if (!chain.prepareSlot(target, {&trackSlots[target], &SelectionSlot::processCallback}) ||
             !chain.activate(target)) {
             if (error) *error = "runtime_vst3_track_chain_activate_failed";
@@ -1291,6 +1393,9 @@ struct TrackRuntime {
         }
         chain.clearFault();
         chain.setBypassed(false);
+        retainedSlot = static_cast<int>(target);
+        trackSlots[target].markActive();
+        preloaded.store(pool.hasPreloaded(), std::memory_order_release);
         configured.store(true, std::memory_order_release);
         configuredRate.store(static_cast<int>(rate), std::memory_order_release);
         return true;
@@ -1410,6 +1515,7 @@ struct Runtime {
     std::atomic<unsigned long> dspThread{0};
     RuntimeEffect effects[2];
     SelectionSlot selectionSlots[2];
+    EffectPool selectionPool;
     std::recursive_mutex editorMutex;
     std::mutex selectionMutex;
     std::mutex selectionRequestMutex;
@@ -1451,6 +1557,7 @@ struct Runtime {
     // Guitar Pro can call both paths concurrently from different audio
     // callbacks, while a RuntimeEffect intentionally rejects re-entrant calls.
     SelectionSlot inputSelectionSlots[2];
+    EffectPool inputSelectionPool;
     effects::Chain inputChain;
     std::atomic<std::size_t> inputAfterOriginalBlocks{0};
     std::atomic<std::uint64_t> inputPostOriginalHash{0}, inputPostRouteHash{0};
@@ -1486,6 +1593,19 @@ struct Runtime {
     std::uint64_t selectionRequestGeneration = 0;
     std::vector<Vst3SelectionEntry> pendingSelection;
     std::vector<Vst3SelectionEntry> appliedSelection;
+    struct PreloadRequest {
+        std::vector<Vst3SelectionEntry> selection;
+        double rate = 44100.0;
+        std::uint64_t generation = 0;
+        std::size_t next = 0;
+    };
+    // At most one request/attempt per global or live track scope. Explicit
+    // selections always take priority over this queue on the same worker.
+    std::unordered_map<std::string, PreloadRequest> pendingPreloads, preloadAttempts;
+    std::atomic<bool> preloadBusy{false};
+    bool globalPreloaded = false, inputPreloaded = false;
+    std::uint64_t preloadCompleted = 0, preloadFailed = 0;
+    std::string preloadError;
     std::unordered_map<std::string, std::vector<Vst3SelectionEntry>> pendingTrackSelections;
     std::unordered_map<std::string, std::uint64_t> pendingTrackGenerations;
     std::vector<gp_audio::Binding> pendingBindings;
@@ -1572,6 +1692,8 @@ struct EditorCallbackScope {
 
 double callbackSampleRate() noexcept;
 void updateAudioLayerState() noexcept;
+bool sameSelection(const std::vector<Vst3SelectionEntry> &left,
+                   const std::vector<Vst3SelectionEntry> &right) noexcept;
 bool configureInputSelection(const std::vector<Vst3SelectionEntry> &selection,
                              std::string *error = nullptr) noexcept;
 void refreshInputParameterMirrors() noexcept;
@@ -1598,6 +1720,50 @@ bool trackSelectionQueued(const std::string &trackKey) noexcept {
 
 void refreshTrackContextWorkerImpl(std::vector<gp_audio::Binding> bindings,
                                    std::size_t discovered) noexcept;
+bool inputFeatureEnabled() noexcept;
+input::Route configuredInputRoute() noexcept;
+
+void runPreload(const std::string &scope, const Runtime::PreloadRequest &request) {
+    std::lock_guard<std::recursive_mutex> editorLock(g_runtime.editorMutex);
+    std::lock_guard<std::mutex> lock(g_runtime.selectionMutex);
+    {
+        std::lock_guard<std::mutex> requestLock(g_runtime.selectionRequestMutex);
+        const auto it = g_runtime.preloadAttempts.find(scope);
+        if (g_runtime.selectionWorkerStop || it == g_runtime.preloadAttempts.end() ||
+            it->second.generation != request.generation) return;
+    }
+    if (request.next >= request.selection.size()) return;
+    const auto &entry = request.selection[request.next];
+    std::string error;
+    const auto preload = [&](EffectPool &pool) {
+        const bool ready = static_cast<bool>(pool.acquire(entry, request.rate, 16384, &error, true));
+        if (ready) ++g_runtime.preloadCompleted;
+        else {
+            ++g_runtime.preloadFailed;
+            g_runtime.preloadError = entry.module + ":" + entry.classId + ":" + error;
+        }
+    };
+    if (scope.empty()) {
+        preload(g_runtime.selectionPool);
+        if (inputFeatureEnabled() && configuredInputRoute() != input::Route::Disabled)
+            preload(g_runtime.inputSelectionPool);
+        g_runtime.globalPreloaded = g_runtime.selectionPool.covers(request.selection);
+        g_runtime.inputPreloaded = g_runtime.inputSelectionPool.covers(request.selection);
+    } else {
+        auto runtime = std::find_if(std::begin(g_runtime.trackRuntimes), std::end(g_runtime.trackRuntimes),
+            [&](const TrackRuntime &value) { return value.trackKey == scope; });
+        if (runtime == std::end(g_runtime.trackRuntimes)) {
+            // Track context can arrive after catalog delivery. Forget this
+            // attempt so the context notifier schedules it again once the
+            // fixed runtime table has been published.
+            std::lock_guard<std::mutex> requestLock(g_runtime.selectionRequestMutex);
+            g_runtime.preloadAttempts.erase(scope);
+            return;
+        }
+        preload(runtime->pool);
+        runtime->preloaded.store(runtime->pool.covers(request.selection), std::memory_order_release);
+    }
+}
 
 void selectionWorkerLoop() {
     struct ComApartment {
@@ -1611,11 +1777,15 @@ void selectionWorkerLoop() {
         std::vector<gp_audio::Binding> contextBindings;
         std::size_t contextDiscovered = 0;
         bool contextRefresh = false;
+        Runtime::PreloadRequest preloadRequest;
+        std::string preloadScope;
+        bool preloadRefresh = false;
         {
             std::unique_lock<std::mutex> lock(g_runtime.selectionRequestMutex);
             g_runtime.selectionCondition.wait(lock, [] {
                 return g_runtime.selectionWorkerStop || g_runtime.selectionRequestPending ||
-                       !g_runtime.pendingTrackSelections.empty() || g_runtime.trackContextRequestPending;
+                       !g_runtime.pendingTrackSelections.empty() || g_runtime.trackContextRequestPending ||
+                       !g_runtime.pendingPreloads.empty();
             });
             if (g_runtime.selectionWorkerStop && !g_runtime.selectionRequestPending &&
                 g_runtime.pendingTrackSelections.empty()) {
@@ -1631,7 +1801,7 @@ void selectionWorkerLoop() {
                 selection = std::move(it->second);
                 generation = g_runtime.pendingTrackGenerations[trackKey];
                 g_runtime.pendingTrackSelections.erase(it);
-            } else {
+            } else if (g_runtime.trackContextRequestPending) {
                 contextRefresh = g_runtime.trackContextRequestPending;
                 if (contextRefresh) {
                     contextBindings = std::move(g_runtime.pendingBindings);
@@ -1640,15 +1810,45 @@ void selectionWorkerLoop() {
                     g_runtime.pendingDiscovered = 0;
                     g_runtime.trackContextRequestPending = false;
                 }
+            } else {
+                auto it = g_runtime.pendingPreloads.begin();
+                preloadScope = it->first;
+                preloadRequest = std::move(it->second);
+                g_runtime.pendingPreloads.erase(it);
+                g_runtime.preloadBusy.store(true, std::memory_order_release);
+                preloadRefresh = true;
             }
             g_runtime.selectionWorkerBusy.store(true, std::memory_order_release);
-            g_runtime.selectionWorkerStartedNanoseconds.store(steadyNanoseconds(), std::memory_order_release);
-            if (!contextRefresh) g_runtime.selectionStatus.store(2, std::memory_order_release);
+            if (!contextRefresh && !preloadRefresh) {
+                g_runtime.selectionWorkerStartedNanoseconds.store(steadyNanoseconds(), std::memory_order_release);
+                g_runtime.selectionStatus.store(2, std::memory_order_release);
+            }
         }
         if (contextRefresh) {
             refreshTrackContextWorkerImpl(std::move(contextBindings), contextDiscovered);
             g_runtime.selectionWorkerBusy.store(false, std::memory_order_release);
             if (const auto notifier = g_trackContextNotifier.load(std::memory_order_acquire)) notifier();
+            continue;
+        }
+        if (preloadRefresh) {
+            try { runPreload(preloadScope, preloadRequest); }
+            catch (...) {
+                std::lock_guard<std::mutex> lock(g_runtime.selectionMutex);
+                ++g_runtime.preloadFailed;
+                g_runtime.preloadError = "preload_exception";
+            }
+            // Yield between plugins so explicit selections are serviced before
+            // continuing. A failed plugin never cancels the rest of the catalog.
+            {
+                std::lock_guard<std::mutex> requestLock(g_runtime.selectionRequestMutex);
+                const auto attempt = g_runtime.preloadAttempts.find(preloadScope);
+                if (!g_runtime.selectionWorkerStop && attempt != g_runtime.preloadAttempts.end() &&
+                    attempt->second.generation == preloadRequest.generation &&
+                    ++preloadRequest.next < preloadRequest.selection.size())
+                    g_runtime.pendingPreloads[preloadScope] = std::move(preloadRequest);
+            }
+            g_runtime.preloadBusy.store(false, std::memory_order_release);
+            g_runtime.selectionWorkerBusy.store(false, std::memory_order_release);
             continue;
         }
         {
@@ -1713,7 +1913,8 @@ void selectionWorkerLoop() {
                                             });
                 if (runtime != std::end(g_runtime.trackRuntimes)) {
                     std::string error;
-                    if (prepared && runtime->prepare(selection, callbackSampleRate(), 16384, &error)) {
+                    const bool accepted = prepared && runtime->prepare(selection, callbackSampleRate(), 16384, &error);
+                    if (accepted) {
                         runtime->requested = selection;
                         g_runtime.requestedTrackSelections[trackKey] = selection;
                         runtime->error.clear();
@@ -1768,6 +1969,7 @@ void stopSelectionWorker() noexcept {
         g_runtime.pendingBindings.clear();
         g_runtime.pendingDiscovered = 0;
         g_runtime.trackContextRequestPending = false;
+        g_runtime.pendingPreloads.clear();
     }
     g_runtime.selectionCondition.notify_all();
     g_runtime.selectionWorker.join();
@@ -2039,6 +2241,22 @@ void refreshTrackContextWorkerImpl(std::vector<gp_audio::Binding> bindings,
     g_runtime.publishedBindings = bindings;
 }
 
+std::vector<Vst3SelectionEntry> selectionFromEffects(const QJsonArray &effects) {
+    std::vector<Vst3SelectionEntry> result;
+    for (const auto &value : effects) {
+        const auto effect = value.toObject();
+        const auto module = effect.value("module").toString();
+        const auto classId = effect.value("class_id").toString();
+        if (module.isEmpty() || classId.isEmpty()) continue;
+        const auto decode = [&](const char *field) {
+            const auto bytes = QByteArray::fromBase64(effect.value(field).toString().toLatin1());
+            return std::vector<unsigned char>(bytes.cbegin(), bytes.cend());
+        };
+        result.push_back({module.toStdString(), classId.toStdString(), decode("component_state"), decode("controller_state")});
+    }
+    return result;
+}
+
 void refreshTrackContextImpl() noexcept {
     if (g_inEditorCallback || !g_initial.hostSupported) return;
     updateAudioLayerState();
@@ -2072,10 +2290,7 @@ const Runtime::TrackDispatch *findTrackDispatch(void *self) noexcept {
 }
 
 double callbackSampleRate() noexcept {
-    if (g_runtime.sampleRate && g_runtime.audioCore) {
-        const auto rate = g_runtime.sampleRate(g_runtime.audioCore);
-        if (rate > 0) return static_cast<double>(rate);
-    }
+    // Private host getters stay on Qt; workers use its published control value.
     const auto observedRate = g_runtime.rate.load(std::memory_order_relaxed);
     if (observedRate > 0) return static_cast<double>(observedRate);
     return 44100.0;
@@ -2228,11 +2443,10 @@ bool configureRuntimeChain() noexcept {
 
 input::Route configuredInputRoute() noexcept {
     const char *configured = std::getenv("GPVST3_P4_ROUTE");
-    // A selected VST3 chain is also the live-input chain by default. Keep the
-    // old environment override for diagnostics and for hosts that explicitly
-    // want the native input path.
+    // Global effects process score playback. Input monitoring is a separate,
+    // explicit route; enabling a global effect must not open a microphone loop.
     if (!configured || !*configured)
-        return input::Route::InputInsert;
+        return input::Route::Disabled;
     if (std::strcmp(configured, "disabled") == 0)
         return input::Route::Disabled;
     if (std::strcmp(configured, "input_insert") == 0)
@@ -2243,6 +2457,10 @@ input::Route configuredInputRoute() noexcept {
 }
 
 void updateAudioLayerState() noexcept {
+    if (g_runtime.sampleRate && g_runtime.audioCore) {
+        const auto rate = g_runtime.sampleRate(g_runtime.audioCore);
+        if (rate > 0) g_runtime.rate.store(rate, std::memory_order_release);
+    }
     if (!g_runtime.audioLayer) return;
     if (g_runtime.audioLayerInputLevel) {
         const auto level = g_runtime.audioLayerInputLevel(g_runtime.audioLayer);
@@ -2282,9 +2500,6 @@ bool configureInputRouter() noexcept {
     g_runtime.inputRouter.setProcessor({});
     g_runtime.inputChain.setBypassed(true);
     g_runtime.inputChain.deactivate();
-    g_runtime.inputSelectionSlots[0].shutdown();
-    g_runtime.inputSelectionSlots[1].shutdown();
-    g_runtime.retainedInputSelectionSlot = -1;
     if (route == input::Route::Disabled) return true;
     const double initialRate = callbackSampleRate();
     if (!g_runtime.inputRouter.prepare(2, portaudio::kMaxFrames))
@@ -2344,25 +2559,28 @@ bool configureInputSelection(const std::vector<Vst3SelectionEntry> &selection,
             inputSelection = {{runtimePath, {}}};
     }
     const auto old = g_runtime.inputChain.snapshot().activeSlot;
-    const auto target = old == 0 ? 1U : 0U;
-    if (!g_runtime.inputChain.prepareSlot(target,
-            {&g_runtime.inputSelectionSlots[target], &SelectionSlot::processCallback})) {
-        if (error) *error = "input_vst3_chain_prepare_failed";
-        return false;
-    }
     const auto previousSlot = old >= 0 ? old : g_runtime.retainedInputSelectionSlot;
     const auto *previous = previousSlot >= 0 ? &g_runtime.inputSelectionSlots[previousSlot] : nullptr;
-    if (!g_runtime.inputSelectionSlots[target].prepare(inputSelection, rate, 16384, previous, error))
-        return false;
-    if (!g_runtime.inputChain.prepareSlot(target,
-            {&g_runtime.inputSelectionSlots[target], &SelectionSlot::processCallback}) ||
-        !g_runtime.inputChain.activate(target)) {
+    const bool warm = previous && previous->matches(inputSelection, rate, 16384);
+    const auto target = warm ? static_cast<unsigned>(previousSlot) : (previousSlot == 0 ? 1U : 0U);
+    if (!warm) {
+        if (!g_runtime.inputChain.prepareSlot(target,
+                {&g_runtime.inputSelectionSlots[target], &SelectionSlot::processCallback})) {
+            if (error) *error = "input_vst3_chain_prepare_failed";
+            return false;
+        }
+        if (!g_runtime.inputSelectionSlots[target].prepare(inputSelection, rate, 16384, g_runtime.inputSelectionPool, error))
+            return false;
+    }
+    if (!g_runtime.inputChain.activate(target)) {
         if (error && error->empty()) *error = "input_vst3_chain_activate_failed";
         g_runtime.inputSelectionSlots[target].shutdown();
         return false;
     }
     g_runtime.inputChain.clearFault();
     g_runtime.inputChain.setBypassed(false);
+    g_runtime.inputSelectionSlots[target].markActive();
+    g_runtime.inputPreloaded = g_runtime.inputSelectionPool.hasPreloaded();
     g_runtime.retainedInputSelectionSlot = static_cast<int>(target);
     g_runtime.inputRouter.setRoute(configuredInputRoute());
     g_runtime.inputRouter.setProcessor({&g_runtime.inputChain, &processInputChain});
@@ -2642,6 +2860,7 @@ State prepare(const host::Verification &verification, bool enableForSelection) n
         g_runtime.sampleRate = reinterpret_cast<SampleRateFn>(GetProcAddress(amaudio, kSampleRate));
         const auto coreInstance = reinterpret_cast<AudioCoreInstanceFn>(GetProcAddress(amaudio, kAudioCoreInstance));
         if (coreInstance) g_runtime.audioCore = coreInstance();
+        updateAudioLayerState();
         const bool master = install(g_runtime.master, GetProcAddress(gprse, kMasterProcess),
                                     reinterpret_cast<void *>(&masterProcessHook), kMasterPrologue,
                                     kMasterPatchBytes);
@@ -2706,9 +2925,44 @@ State prepare(const host::Verification &verification, bool enableForSelection) n
 State snapshot() noexcept {
     static std::shared_ptr<const State> previous = std::make_shared<const State>();
     std::unique_lock<std::mutex> runtimeLock(g_runtime.selectionMutex, std::try_to_lock);
-    if (!runtimeLock.owns_lock()) return *std::atomic_load(&previous);
+    if (!runtimeLock.owns_lock()) {
+        auto result = *std::atomic_load(&previous);
+        result.preloadPending = g_runtime.preloadBusy.load(std::memory_order_acquire);
+        return result;
+    }
     State result = g_initial;
     result.trackBindingSource = gp_audio::bindingSource();
+    {
+        std::lock_guard<std::mutex> preloadLock(g_runtime.selectionRequestMutex);
+        result.preloadPending = !g_runtime.pendingPreloads.empty() || g_runtime.preloadBusy.load();
+    }
+    result.globalPreloaded = g_runtime.globalPreloaded;
+    result.inputPreloaded = g_runtime.inputPreloaded;
+    result.preloadCompleted = g_runtime.preloadCompleted;
+    result.preloadFailed = g_runtime.preloadFailed;
+    result.preloadError = g_runtime.preloadError;
+    result.trackPreloaded = static_cast<std::size_t>(std::count_if(
+        std::begin(g_runtime.trackRuntimes), std::end(g_runtime.trackRuntimes),
+        [](const TrackRuntime &runtime) { return runtime.preloaded.load(std::memory_order_acquire); }));
+    const auto appendInstances = [&](const char *scope, const std::string &track, const EffectPool &pool,
+                                      const SelectionSlot (&preparedSlots)[2], const effects::Chain &chain) {
+        const auto slot = chain.snapshot().activeSlot;
+        for (const auto &effect : pool.effects) {
+            if (!effect || !effect->ready.load(std::memory_order_acquire)) continue;
+            bool active = false;
+            if (slot >= 0 && !chain.bypassed())
+                for (std::size_t i = 0; i < preparedSlots[slot].count; ++i)
+                    active |= preparedSlots[slot].effects[i] == effect;
+            result.instances.push_back({scope, track, effect->identity.module, effect->identity.classId,
+                effect->instanceId, effect->processedBlocks.load(), effect->configuredRate.load(), active,
+                !active && effect->preloaded});
+        }
+    };
+    appendInstances("global", {}, g_runtime.selectionPool, g_runtime.selectionSlots, g_runtime.chain);
+    appendInstances("input", {}, g_runtime.inputSelectionPool, g_runtime.inputSelectionSlots, g_runtime.inputChain);
+    for (const auto &runtime : g_runtime.trackRuntimes)
+        if (!runtime.trackKey.empty()) appendInstances("track", runtime.trackKey, runtime.pool,
+            runtime.trackSlots, runtime.chain);
     const auto chain = g_runtime.chain.snapshot();
     const auto input = g_runtime.inputRouter.snapshot();
     result.selectionRequestId = g_runtime.selectionRequestId.load(std::memory_order_relaxed);
@@ -2997,18 +3251,43 @@ bool configureSelectedChain(const std::vector<Vst3SelectionEntry> &selection, st
         return false;
     }
     const auto rate = callbackSampleRate();
+    if (selection.empty()) {
+        g_runtime.chain.setBypassed(true);
+        g_runtime.chain.deactivate();
+        g_runtime.selectionMode.store(false, std::memory_order_release);
+        g_runtime.selectionPublished.store(true, std::memory_order_release);
+        return true;
+    }
     const auto old = g_runtime.chain.snapshot().activeSlot;
-    const auto target = old == 0 ? 1U : 0U;
+    const int previousSlot = old >= 0 ? old : g_runtime.retainedSelectionSlot;
+    const auto *previous = previousSlot >= 0 ? &g_runtime.selectionSlots[previousSlot] : nullptr;
+    if (old >= 0 && g_runtime.selectionConfiguredRate.load() != static_cast<int>(rate))
+        g_runtime.chain.deactivate();
+    if (previous && previous->matches(selection, rate, 16384)) {
+        const auto slot = static_cast<unsigned>(previousSlot);
+        if (!g_runtime.chain.activate(slot)) {
+            if (error) *error = "runtime_vst3_chain_activate_failed";
+            return false;
+        }
+        g_runtime.selectionMode.store(true, std::memory_order_release);
+        g_runtime.selectionConfiguredRate.store(static_cast<int>(rate), std::memory_order_release);
+        g_runtime.selectionPublished.store(true, std::memory_order_release);
+        g_runtime.chain.clearFault();
+        g_runtime.chain.setBypassed(false);
+        g_runtime.retainedSelectionSlot = static_cast<int>(slot);
+        g_runtime.selectionSlots[slot].markActive();
+        g_runtime.globalPreloaded = g_runtime.selectionPool.hasPreloaded();
+        refreshInputParameterMirrors();
+        return true;
+    }
+    const auto target = previousSlot == 0 ? 1U : 0U;
     if (!g_runtime.chain.prepareSlot(target,
             {&g_runtime.selectionSlots[target], &SelectionSlot::processCallback})) {
         if (error) *error = "runtime_vst3_chain_prepare_failed";
         return false;
     }
-    const int previousSlot = old >= 0 ? old : g_runtime.retainedSelectionSlot;
-    const auto *previous = previousSlot >= 0 && g_runtime.selectionPublished.load(std::memory_order_acquire)
-        ? &g_runtime.selectionSlots[previousSlot] : nullptr;
     try {
-        if (!g_runtime.selectionSlots[target].prepare(selection, rate, 16384, previous, error)) return false;
+        if (!g_runtime.selectionSlots[target].prepare(selection, rate, 16384, g_runtime.selectionPool, error)) return false;
     } catch (...) {
         g_runtime.selectionSlots[target].shutdown();
         if (error) *error = "runtime_vst3_initialize_exception";
@@ -3021,6 +3300,8 @@ bool configureSelectedChain(const std::vector<Vst3SelectionEntry> &selection, st
     g_runtime.selectionMode.store(!selection.empty(), std::memory_order_release);
     g_runtime.selectionConfiguredRate.store(static_cast<int>(rate), std::memory_order_release);
     g_runtime.selectionPublished.store(true, std::memory_order_release);
+    g_runtime.selectionSlots[target].markActive();
+    g_runtime.globalPreloaded = g_runtime.selectionPool.hasPreloaded();
     g_runtime.chain.clearFault();
     if (!selection.empty()) {
         g_runtime.chain.activate(target);
@@ -3093,6 +3374,7 @@ void shutdown() noexcept {
     g_runtime.inputChain.deactivate();
     g_runtime.inputSelectionSlots[0].shutdown();
     g_runtime.inputSelectionSlots[1].shutdown();
+    g_runtime.inputSelectionPool.effects.clear();
     g_runtime.retainedInputSelectionSlot = -1;
     g_runtime.inputRouter.setProcessor({});
     unlockInputProcessing();
@@ -3113,6 +3395,7 @@ void shutdown() noexcept {
     g_runtime.effects[1].shutdown();
     g_runtime.selectionSlots[0].shutdown();
     g_runtime.selectionSlots[1].shutdown();
+    g_runtime.selectionPool.effects.clear();
     {
         std::lock_guard<std::mutex> lock(g_runtime.selectionMutex);
         g_runtime.requestedSelection.clear();
@@ -3156,6 +3439,11 @@ void shutdown() noexcept {
     g_runtime.globalChainProcessBlocks.store(0, std::memory_order_relaxed);
     g_runtime.selectionMode.store(false, std::memory_order_release);
     g_runtime.selectionPublished.store(false, std::memory_order_release);
+    g_runtime.globalPreloaded = false;
+    g_runtime.inputPreloaded = false;
+    g_runtime.retainedSelectionSlot = -1;
+    g_runtime.preloadBusy.store(false, std::memory_order_release);
+    g_runtime.preloadAttempts.clear();
     g_runtime.pendingSelection.clear();
     g_runtime.appliedSelection.clear();
 }
@@ -3352,8 +3640,10 @@ bool requestGlobalVst3Selection(const std::vector<Vst3SelectionEntry> &selection
 }
 
 void saveVst3States() {
-    std::lock_guard<std::recursive_mutex> editorLock(g_runtime.editorMutex);
-    std::lock_guard<std::mutex> lock(g_runtime.selectionMutex);
+    std::unique_lock<std::recursive_mutex> editorLock(g_runtime.editorMutex, std::try_to_lock);
+    if (!editorLock.owns_lock()) return;
+    std::unique_lock<std::mutex> lock(g_runtime.selectionMutex, std::try_to_lock);
+    if (!lock.owns_lock()) return;
     const auto active = g_runtime.chain.snapshot().activeSlot;
     if (active >= 0 && g_runtime.selectionMode.load(std::memory_order_acquire)) {
         std::vector<Vst3SelectionEntry> entries;
@@ -3386,10 +3676,64 @@ void setVst3Catalog(const QJsonArray &catalog) {
         g_runtime.catalogEntries = entries;
         g_runtime.catalogReady = true;
     }
-    // Catalog delivery is metadata-only. Persisted selections are deliberately
-    // not restored here: loading a factory/processor belongs exclusively to an
-    // explicit user request handled by the selection worker.
+    // Catalog delivery updates metadata; background preloading and explicit
+    // activation are both serialized by the selection worker.
     refreshTrackContextImpl();
+}
+
+void preloadSavedSelections() noexcept {
+    if (!onQtThread() || !g_initial.hostSupported || g_qtDispatchStopping.load(std::memory_order_acquire) ||
+        qEnvironmentVariable("GPVST3_ENABLE_P2_HOOK") == "0" || !state::pluginEnabled()) return;
+    QJsonObject chain;
+    if (!state::loadChain(chain)) return;
+    std::vector<Vst3SelectionEntry> catalog;
+    {
+        std::lock_guard<std::mutex> lock(g_runtime.catalogMutex);
+        if (!g_runtime.catalogReady) return;
+        catalog = g_runtime.catalogEntries;
+    }
+    // Every recognized plugin is prepared, including never-enabled catalog
+    // entries. Saved state is overlaid per scope without changing activation.
+    const auto selections = [&](const QJsonArray &effects) {
+        auto entries = catalog;
+        for (const auto &saved : selectionFromEffects(effects))
+            for (auto &entry : entries)
+                if (entry.module == saved.module && entry.classId == saved.classId) entry = saved;
+        return entries;
+    };
+    std::unordered_map<std::string, std::vector<Vst3SelectionEntry>> desired;
+    if (!catalog.empty()) desired[""] = selections(state::scopeEffects(chain, state::ScopeKind::Global));
+    for (const auto &binding : gp_audio::snapshot()) {
+        if (!binding.chain || !binding.activeDocument || binding.trackKey.empty() || catalog.empty()) continue;
+        desired[binding.trackKey] = selections(state::scopeEffects(chain, state::ScopeKind::Track,
+            QString::fromStdString(binding.scoreKey), QString::fromStdString(binding.trackKey)));
+    }
+    if (desired.empty()) return;
+    // Install dormant dispatch before the worker starts. Later UI requests
+    // never block in prepare() behind a preload's call into Qt.
+    if (!g_runtime.master.installed && !prepare(g_verification, true).installed) return;
+    updateAudioLayerState();
+    const double rate = callbackSampleRate();
+    startSelectionWorker();
+    {
+        std::lock_guard<std::mutex> lock(g_runtime.selectionRequestMutex);
+        for (auto it = g_runtime.preloadAttempts.begin(); it != g_runtime.preloadAttempts.end();) {
+            if (desired.find(it->first) == desired.end()) {
+                g_runtime.pendingPreloads.erase(it->first);
+                it = g_runtime.preloadAttempts.erase(it);
+            } else ++it;
+        }
+        for (auto &item : desired) {
+            const auto previous = g_runtime.preloadAttempts.find(item.first);
+            if (previous != g_runtime.preloadAttempts.end() && previous->second.rate == rate &&
+                sameSelection(previous->second.selection, item.second)) continue;
+            const auto generation = previous == g_runtime.preloadAttempts.end() ? 1 : previous->second.generation + 1;
+            Runtime::PreloadRequest request{std::move(item.second), rate, generation};
+            g_runtime.preloadAttempts[item.first] = request;
+            g_runtime.pendingPreloads[item.first] = std::move(request);
+        }
+    }
+    g_runtime.selectionCondition.notify_one();
 }
 
 bool consumeSelectionStateChanges() noexcept {
@@ -3401,7 +3745,7 @@ bool vst3SelectionPending() noexcept {
     std::lock_guard<std::mutex> lock(g_runtime.selectionRequestMutex);
     return g_runtime.selectionWorkerBusy.load(std::memory_order_acquire) ||
         g_runtime.selectionRequestPending || !g_runtime.pendingTrackSelections.empty() ||
-        g_runtime.trackContextRequestPending;
+        g_runtime.trackContextRequestPending || !g_runtime.pendingPreloads.empty();
 }
 
 bool setTrackVst3Selection(const std::string &trackKey,

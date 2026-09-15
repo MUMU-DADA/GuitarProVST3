@@ -434,7 +434,7 @@ flowchart TD
 | `input_insert` | 仅 capture | capture 经 input chain 直接写 output | 复制 capture 旁路 | `input_processed_blocks` |
 | `bus_mix` | capture + GP 原 output/generated | 混合后经 input chain 写 output | 混合输入旁路 | `input_bus_mixed_blocks` |
 
-默认安装路径将选中的 global chain 复制为 live-input chain；显式设置 `GPVST3_P4_ROUTE` 时保留旧 P4 fixture 语义，可改用独立 `GPVST3_RUNTIME_VST3`。
+默认安装路径不启用 live-input 监听；显式设置 `GPVST3_P4_ROUTE=input_insert|bus_mix` 后才会把选中的 global chain 复制为独立 live-input chain，可改用独立 `GPVST3_RUNTIME_VST3`。
 
 ## 10. 双槽切换、实时安全和故障回退
 

@@ -74,3 +74,9 @@ P11 专项不使用 computer use；维护 writer、dirty 合并、scanner poll�
 ```
 
 P11 的静态门禁确认没有旧的 250/500 ms 维护路径、`musician->updateAll()` 或 `snapshot()` 音频副作用；真实宿主证据保留在 `artifacts/`，构建产物和宿主副本不提交。
+
+完整预加载与保留实例回归由 `test-p8-runtime.ps1` 覆盖。真实 UI 可用下面的入口验证三个插件逐一启停和输入监听默认关闭；`Vst3Module` 也支持与 `ClassId` 一一对应的多个模块路径。曲谱和 sidecar 写入测试副本，原始文件不变。
+
+```powershell
+./native/test/test-preload-mcp.ps1 -ScorePath C:/path/to/score.gp -PluginPath .tools/native/preload-final-build3/plugins/imageformats/guitarpro_vst3_autoload.dll -Vst3Module '.tools/native/p8-order-test/P8 Order Fixture.vst3' -ClassId @('41302010605080701122334455667788','42302010605080701122334455667788','43302010605080701122334455667788')
+```
