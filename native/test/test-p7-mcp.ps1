@@ -9,7 +9,8 @@ param(
     [switch]$CheckGain,
     [switch]$CheckCatalogRestart,
     [switch]$EditorOnly,
-    [switch]$KeepHost
+    [switch]$KeepHost,
+    [string]$InitialSidecar = ''
 )
 
 $ErrorActionPreference = 'Stop'
@@ -46,6 +47,10 @@ New-Item -ItemType Directory -Force -Path $run | Out-Null
 . (Join-Path $PSScriptRoot 'p7-window-capture.ps1')
 $before = Get-Gpvst3HostSnapshot $HostDirectory
 $dataDirectory = Join-Path $run 'data'
+if ($InitialSidecar -and (Test-Path -LiteralPath $InitialSidecar -PathType Leaf)) {
+    New-Item -ItemType Directory -Force -Path $dataDirectory | Out-Null
+    Copy-Item -LiteralPath $InitialSidecar -Destination (Join-Path $dataDirectory 'effect-chain.json') -Force
+}
 $fixtureSource = Join-Path $McpRoot 'native/testdata/minimal.gp'
 if (-not (Test-Path -LiteralPath $fixtureSource)) { $fixtureSource = Join-Path $McpRoot 'test/testdata/minimal.gp' }
 if (-not (Test-Path -LiteralPath $fixtureSource)) { throw "P7 MCP fixture not found under $McpRoot." }

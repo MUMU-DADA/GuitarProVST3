@@ -8,7 +8,9 @@ param(
     [string]$ExpectedBindingSource = '',
     [ValidateSet('enabled', 'default')]
     [string]$HookMode = 'default',
-    [switch]$KeepHost
+    [switch]$KeepHost,
+    [string]$InitialSidecar = '',
+    [string]$ExistingScore = ''
 )
 
 $ErrorActionPreference = 'Stop'
@@ -23,6 +25,9 @@ foreach ($path in @((Join-Path $HostDirectory 'GuitarPro.exe'), $PluginPath, $mc
 
 $run = Join-Path $root ('artifacts/mcp-p8-track-' + [guid]::NewGuid().ToString('N'))
 New-Item -ItemType Directory -Force -Path $run | Out-Null
+if ($InitialSidecar -and (Test-Path -LiteralPath $InitialSidecar -PathType Leaf)) {
+    Copy-Item -LiteralPath $InitialSidecar -Destination (Join-Path $run 'effect-chain.json') -Force
+}
 . (Join-Path $PSScriptRoot 'host-session.ps1')
 . $mcpClient
 $before = Get-Gpvst3HostSnapshot $HostDirectory
@@ -157,22 +162,31 @@ try {
     if (-not (Test-Path -LiteralPath $statusPath) -or -not (Test-Path -LiteralPath $sessionPath)) { throw 'P8 startup files were not published.' }
     $result.identity = Get-Gpvst3TestIdentity $process $HostDirectory $PluginPath $statusPath $McpRoot
     $session = New-McpSession -SessionFile $sessionPath
-    $seedSource = Join-Path $McpRoot 'test/testdata/minimal.gp'
-    $seedPath = Join-Path $run 'seed.gp'
-    Copy-Item -LiteralPath $seedSource -Destination $seedPath
-    $seed = Invoke-McpTool $session gp_open @{path=$seedPath}
-    Wait-Operation $seed.request 'opened' | Out-Null
-    $created = Invoke-McpTool $session gp_new @{template='Steel Guitar'}
-    $document = (Wait-Operation $created.request 'created').document
+    if ($ExistingScore) {
+        $scorePath = Join-Path $run ([IO.Path]::GetFileName($ExistingScore))
+        Copy-Item -LiteralPath $ExistingScore -Destination $scorePath -Force
+        $opened = Invoke-McpTool $session gp_open @{path=$scorePath}
+        $document = (Wait-Operation $opened.request 'opened').document
+    } else {
+        $seedSource = Join-Path $McpRoot 'test/testdata/minimal.gp'
+        $seedPath = Join-Path $run 'seed.gp'
+        Copy-Item -LiteralPath $seedSource -Destination $seedPath
+        $seed = Invoke-McpTool $session gp_open @{path=$seedPath}
+        Wait-Operation $seed.request 'opened' | Out-Null
+        $created = Invoke-McpTool $session gp_new @{template='Steel Guitar'}
+        $document = (Wait-Operation $created.request 'created').document
+    }
     $result.document = $document
     Start-Sleep -Milliseconds 700
     Invoke-McpTool $session gp_activate @{document=$document} | Out-Null
-    $inserted = Invoke-McpTool $session gp_insert_track @{document=$document;source_track=0;copy_content=$true}
-    $result.inserted_track = $inserted
-    if ($inserted.inserted_track -ne 1) { throw "Second RSE track was not inserted: $(Json $inserted)" }
-    foreach ($track in @(0,1)) {
-        $riff = Invoke-McpTool $session gp_insert_tab @{document=$document;track=$track;string=0;bar=0;text='0-2-5-7';mode='replace';denominator=4}
-        Wait-Operation $riff.request 'applied' | Out-Null
+    if (-not $ExistingScore) {
+        $inserted = Invoke-McpTool $session gp_insert_track @{document=$document;source_track=0;copy_content=$true}
+        $result.inserted_track = $inserted
+        if ($inserted.inserted_track -ne 1) { throw "Second RSE track was not inserted: $(Json $inserted)" }
+        foreach ($track in @(0,1)) {
+            $riff = Invoke-McpTool $session gp_insert_tab @{document=$document;track=$track;string=0;bar=0;text='0-2-5-7';mode='replace';denominator=4}
+            Wait-Operation $riff.request 'applied' | Out-Null
+        }
     }
     $fixturePath = Join-Path $run 'two-tracks.gp'
     Invoke-McpTool $session gp_activate @{document=$document} | Out-Null

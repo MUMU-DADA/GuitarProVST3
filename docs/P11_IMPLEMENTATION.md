@@ -25,4 +25,13 @@
 
 最近一次证据：`artifacts/p8-runtime-91583ad422634b9694cc157bb730079b`、`artifacts/mcp-p8-track-48b7974f31e34d0cbdde55bf5d51494c` 和 `.tools/native/p11-release-suite-final-host/`。真实流程使用已安装 Guitar Pro 8.1.1.17 与 MCP bridge，没有使用 computer use；宿主安装目录完整性检查通过。
 
+## 2026-09-15 真实 Archetype 音轨复验
+
+复核用户截图对应的默认启动路径后确认：旧实现只在 global request 中执行首次 hook `prepare()`，track request 在 hook 尚未安装时直接进入 worker，最终把 `runtime_vst3_selection_prepare_failed` 写入 track sidecar。现已让首次显式 track selection 在 Qt 控制线程完成同样的 hook 安装，并在失败时保留实际原因。
+
+- 默认启动、已安装 Neural DSP Archetype 插件、MCP 选择 Track 2：`installed=true`、`enabled=true`，目标 track `configured=true`、`configured_effects=1`，sidecar 的 Mateus Asato 错误清除。
+- 新曲谱双音轨真实 Archetype 处理：`artifacts/mcp-p8-track-0c3318d76a694134a77a5aad2dcca434`。
+- 用户曲谱/sidecar 副本复验：`artifacts/mcp-existing-track-dbc482a469274a258b58991f92504bc9`；原始用户数据未写入。
+- 同时修复异步 `status.json` writer 覆盖 `plugin_path` 身份字段的问题，避免测试和诊断读取到不属于当前 DLL 的状态。
+
 宿主边界：未声明跨 Guitar Pro 版本的 ABI 兼容；商业插件自身的 editor/线程合同仍由插件实现决定。计划要求的 120 秒×3 固定设备 CPU A/B 需要宿主设备矩阵，不能由夹具结果代替。

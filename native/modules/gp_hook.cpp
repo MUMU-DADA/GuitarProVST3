@@ -1722,6 +1722,7 @@ void selectionWorkerLoop() {
                         g_runtime.audioGeneration.fetch_add(1, std::memory_order_acq_rel);
                         g_runtime.selectionStatus.store(3, std::memory_order_release);
                     } else {
+                        if (error.empty()) error = prepareError;
                         const auto rejected = error.empty() ?
                             std::string("runtime_vst3_selection_prepare_failed") : error;
                         for (const auto &entry : selection)
@@ -3477,6 +3478,15 @@ bool requestTrackVst3Selection(const std::string &trackKey,
     if (selection.size() > SelectionSlot::kMaxEffects) {
         if (error) *error = "runtime_vst3_chain_full";
         return false;
+    }
+    // Normal startup leaves hooks uninstalled. The first explicit track
+    // selection must enable them on Qt just like the global request path.
+    if (!selection.empty() && !g_runtime.dsp.installed) {
+        const auto prepared = prepare(g_verification, true);
+        if (!prepared.installed) {
+            if (error) *error = prepared.reason;
+            return false;
+        }
     }
     // Track runtimes already have an independent fixed table. Queueing the
     // request through the same worker keeps processor construction off Qt;

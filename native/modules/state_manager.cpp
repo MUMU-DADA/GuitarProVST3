@@ -94,6 +94,7 @@ private:
 
 ObservationWriter g_observationWriter(QStringLiteral("p2-observation.json"));
 ObservationWriter g_statusWriter(QStringLiteral("status.json"));
+QString g_statusPluginPath;
 
 bool writeJson(const QString &path, const QJsonObject &object) {
     const QFileInfo info(path);
@@ -625,6 +626,10 @@ void resetTrackIdentities() {
 
 bool writeStatus(const QJsonObject &input) {
     QJsonObject status = input;
+    if (status.contains(QStringLiteral("plugin_path")))
+        g_statusPluginPath = status.value(QStringLiteral("plugin_path")).toString();
+    else if (!g_statusPluginPath.isEmpty())
+        status.insert(QStringLiteral("plugin_path"), g_statusPluginPath);
     status.insert("pid", QCoreApplication::applicationPid());
     status.insert("executable", QCoreApplication::applicationFilePath());
     status.insert("time", QDateTime::currentDateTimeUtc().toString(Qt::ISODate));
