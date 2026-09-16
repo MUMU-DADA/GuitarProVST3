@@ -5,6 +5,7 @@ param(
     [string]$Vst3Root = 'ParametricOD.vst3;Gateway.vst3',
     [switch]$CheckGain,
     [switch]$CheckLifecycle,
+    [switch]$CheckP12,
     [string]$ExpectedBindingSource = '',
     [ValidateSet('enabled', 'default')]
     [string]$HookMode = 'default',
@@ -15,6 +16,7 @@ param(
 
 $ErrorActionPreference = 'Stop'
 if ($CheckLifecycle) { $CheckGain = $true }
+if ($CheckP12) { $CheckGain = $true }
 $root = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
 if (-not $PluginPath) { $PluginPath = Join-Path $root '.tools/native/p8-track-build/plugins/imageformats/guitarpro_vst3_autoload.dll' }
 $mcpPlugin = Join-Path $McpRoot '.tools/native/plugins/generic/guitarpro_mcp.dll'
@@ -64,16 +66,28 @@ function Get-Observation() {
     if (-not (Test-Path -LiteralPath $path)) { throw 'P8 realtime observation was not written.' }
     Get-Content -LiteralPath $path -Raw | ConvertFrom-Json
 }
+function Wait-Observation([scriptblock]$Predicate, [string]$label = 'observation') {
+    $deadline = [DateTime]::UtcNow.AddSeconds(8); $observation = $null
+    do {
+        $observation = Get-Observation
+        if (& $Predicate $observation) { return $observation }
+        Start-Sleep -Milliseconds 150
+    } while ([DateTime]::UtcNow -lt $deadline)
+    throw "Timed out waiting for ${label}: $(Json $observation)"
+}
 function Read-Gain([int]$track) {
     if ($track -ge 0) { Wait-Track $track | Out-Null }
     $prefix = if ($track -ge 0) {'gpvst3Editor_'} else {'gpvst3GlobalEditor_'}
-    $query = Invoke-McpTool $session gp_objects @{query=($prefix + $candidates[0].class_id);limit=10}
-    Invoke-McpTool $session gp_trigger @{snapshot=$query.snapshot;id=@($query.objects)[0].id} | Out-Null
     $deadline = [DateTime]::UtcNow.AddSeconds(5)
     do {
+        $query = Invoke-McpTool $session gp_objects @{query=($prefix + $candidates[0].class_id);limit=10}
+        $editor = @($query.objects)[0]
+        if ($editor) {
+            try { Invoke-McpTool $session gp_trigger @{snapshot=$query.snapshot;id=$editor.id} | Out-Null } catch { }
+        }
         Start-Sleep -Milliseconds 150
         $query = Invoke-McpTool $session gp_objects @{query='gpvst3TestProcessor';limit=10}
-        $value = @($query.objects)[0].properties.text
+        $value = @($query.objects | Where-Object { $_.properties.text })[0].properties.text
         if ($value) { return $value | ConvertFrom-Json }
     } while ([DateTime]::UtcNow -lt $deadline)
     throw "Track $track processor GUI did not publish state."
@@ -335,7 +349,7 @@ try {
             }
             Invoke-McpTool $session gp_edit_tracks @{operation='duplicate';document=$document;track=0} | Out-Null
             Start-Sleep -Milliseconds 600
-            $duplicated = Get-Observation
+            $duplicated = Wait-Observation { param($o) @($o.gp_hook.track_runtime_evidence).Count -eq 3 } 'duplicated track runtime refresh'
             $result.duplicated = $duplicated.gp_hook.track_runtime_evidence
             if (@($result.duplicated).Count -ne 3 -or @($result.duplicated | Where-Object configured_effects -eq 0).Count -ne 1) {
                 throw 'Inserted track inherited an existing track processor.'
@@ -346,7 +360,7 @@ try {
             Start-Sleep -Milliseconds 400
             Invoke-McpTool $session gp_undo_redo @{operation='undo';document=$document} | Out-Null
             Start-Sleep -Milliseconds 400
-            $result.after_delete_undo = (Get-Observation).gp_hook.track_runtime_evidence
+            $result.after_delete_undo = (Wait-Observation { param($o) @($o.gp_hook.track_runtime_evidence).Count -eq 3 } 'undo track runtime refresh').gp_hook.track_runtime_evidence
             if (@($result.after_delete_undo).Count -ne 3) { throw 'Deleted track did not return after undo.' }
             Invoke-McpTool $session gp_undo_redo @{operation='redo';document=$document} | Out-Null
             Start-Sleep -Milliseconds 400
@@ -368,7 +382,7 @@ try {
             Wait-Track 0 | Out-Null
             Invoke-McpTool $session gp_playback @{operation='play';document=$document} | Out-Null
             Start-Sleep -Seconds 1
-            $result.reopen_before_visiting_track_1 = (Get-Observation).gp_hook.track_runtime_evidence
+            $result.reopen_before_visiting_track_1 = (Wait-Observation { param($o) @($o.gp_hook.track_runtime_evidence).Count -eq 2 -and @($o.gp_hook.track_runtime_evidence | Where-Object { $_.configured_effects -eq 1 -and $_.processed -and $_.error_blocks -eq 0 }).Count -eq 2 } 'reopened track runtime processing').gp_hook.track_runtime_evidence
             if (@($result.reopen_before_visiting_track_1).Count -ne 2 -or
                 @($result.reopen_before_visiting_track_1 | Where-Object { $_.configured_effects -ne 1 -or -not $_.processed -or $_.error_blocks -gt 0 }).Count) {
                 throw 'Reopening did not automatically restore and process both tracks before visiting their UI.'
@@ -408,6 +422,45 @@ try {
             if ($result.restart_gains[0].gain -ne 0.25 -or $result.restart_gains[1].gain -ne 0.5 -or $result.restart_gains[2].gain -ne 0.75) {
                 throw 'Process restart lost an independent processor state.'
             }
+        }
+    }
+    if ($CheckP12) {
+        function Wait-P12Track([int]$index) {
+            Invoke-McpTool $session gp_cursor @{document=$document;axis='track';index=$index} | Out-Null
+            $deadline = [DateTime]::UtcNow.AddSeconds(8)
+            do {
+                Start-Sleep -Milliseconds 100
+                $context = Invoke-McpTool $session gp_objects @{query='gpvst3TrackContext';limit=10}
+                $label = @($context.objects | Where-Object parent_name -eq 'gpvst3P7Panel')[0]
+                if ($label -and $label.properties.text -and $label.properties.text.EndsWith("Track $index")) { return }
+            } while ([DateTime]::UtcNow -lt $deadline)
+            throw "P12 selection scope did not become observable for Track $index."
+        }
+        Wait-P12Track 0
+        # Let the documented document-open settling window drain before
+        # measuring steady-state cursor changes.
+        Start-Sleep -Milliseconds 2300
+        $p12Before = Wait-Observation { param($o) $o.gp_hook.track_context_stable -and @($o.gp_hook.track_runtime_evidence).Count -eq 2 } 'P12 selection baseline'
+        $p12AudioGeneration = [int64]$p12Before.gp_hook.audio_generation
+        $p12BindingGeneration = [int64]$p12Before.gp_hook.binding_generation
+        $p12SelectionGeneration = [int64]$p12Before.gp_hook.selection_generation
+        @{before=$p12SelectionGeneration;audio=$p12AudioGeneration;binding=$p12BindingGeneration;topology=[int64]$p12Before.gp_hook.topology_event_count} |
+            ConvertTo-Json | Set-Content -LiteralPath (Join-Path $run 'p12-before.json') -Encoding UTF8
+        for ($round = 0; $round -lt 10; ++$round) {
+            Wait-P12Track 0
+            Wait-P12Track 1
+        }
+        $p12After = Wait-Observation { param($o)
+            [int64]$o.gp_hook.selection_generation -ge ($p12SelectionGeneration + 10) -and
+            [int64]$o.gp_hook.audio_generation -eq $p12AudioGeneration
+        } 'P12 A-to-B selection generation'
+        $result.p12_selection = [ordered]@{
+            before_selection_generation = $p12SelectionGeneration
+            after_selection_generation = [int64]$p12After.gp_hook.selection_generation
+            audio_generation = [int64]$p12After.gp_hook.audio_generation
+            binding_generation = [int64]$p12After.gp_hook.binding_generation
+            dropped_refresh_count = [int64]$p12After.gp_hook.dropped_refresh_count
+            selection_event_source = $p12After.gp_hook.selection_event_source
         }
     }
     $result | ConvertTo-Json -Depth 40 | Set-Content -LiteralPath (Join-Path $run 'verification.json') -Encoding UTF8

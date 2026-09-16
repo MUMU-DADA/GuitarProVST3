@@ -59,8 +59,18 @@ int main(int argc, char **argv) {
                result.catalog.front().recognitionSource == "factory" && result.catalog.front().recognitionAttempts == 1,
                "recognized catalog replaces candidate")) return 1;
     QFile cache(QDir(data).filePath("vst3-catalog-cache.json"));
+    for (int i = 0; i < 500 && !cache.exists(); ++i) QThread::msleep(10);
     if (!check(cache.open(QIODevice::ReadOnly), "recognition cache written")) return 1;
-    const auto record = QJsonDocument::fromJson(cache.readAll()).object().value("scopes").toObject().begin().value()
+    QJsonObject cachedDocument;
+    for (int i = 0; i < 500; ++i) {
+        cache.seek(0);
+        cachedDocument = QJsonDocument::fromJson(cache.readAll()).object();
+        const auto record = cachedDocument.value("scopes").toObject().begin().value()
+            .toObject().value("modules").toObject().begin().value().toObject();
+        if (record.value("recognition_status").toString() == "ready") break;
+        cache.close(); QThread::msleep(10); cache.open(QIODevice::ReadOnly);
+    }
+    const auto record = cachedDocument.value("scopes").toObject().begin().value()
         .toObject().value("modules").toObject().begin().value().toObject();
     if (!check(record.value("recognition_status").toString() == "ready" &&
                record.value("recognition_source").toString() == "factory" &&

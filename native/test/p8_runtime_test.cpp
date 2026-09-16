@@ -13,6 +13,27 @@ std::vector<gpvst3::gp_audio::Binding> testBindings;
 int testRate = 44100;
 int readRate(const void *) { return testRate; }
 void require(bool value, const char *message) { if (!value) throw std::runtime_error(message); }
+
+bool syncTrackSelection(const std::string &trackKey,
+                        const std::vector<gpvst3::hook::Vst3SelectionEntry> &selection,
+                        std::string *error) {
+    if (!gpvst3::hook::requestTrackVst3Selection(trackKey, selection, error)) return false;
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    while (gpvst3::hook::vst3SelectionPending() && std::chrono::steady_clock::now() < deadline) {
+        QCoreApplication::processEvents(QEventLoop::AllEvents, 5);
+        QThread::msleep(1);
+    }
+    if (gpvst3::hook::vst3SelectionPending()) {
+        if (error) *error = "selection_worker_timeout";
+        return false;
+    }
+    for (const auto &runtime : gpvst3::hook::g_runtime.trackRuntimes)
+        if (runtime.trackKey == trackKey && !runtime.error.empty()) {
+            if (error) *error = runtime.error;
+            return false;
+        }
+    return true;
+}
 }
 namespace gpvst3::gp_audio {
 std::size_t refresh() noexcept { return testBindings.size(); }
@@ -22,11 +43,20 @@ bool currentTrack(Binding &binding) noexcept { if (testBindings.empty()) return 
 const char *bindingSource() noexcept { return "fixture"; }
 void setRefreshNotifier(RefreshNotifier) noexcept {}
 void markDirty() noexcept {}
+void markTopologyDirty() noexcept {}
+void markExplicitTopologyDirty() noexcept {}
+bool consumeTopologyDirty() noexcept { return false; }
+std::uint64_t topologyEventCount() noexcept { return 0; }
 void markSelectionDirty() noexcept {}
 bool refreshNeeded() noexcept { return true; }
 bool refreshIncomplete() noexcept { return false; }
 bool checkStructureChanged() noexcept { return false; }
 bool refreshSelectionContext() noexcept { return false; }
+std::uint64_t selectionGeneration() noexcept { return 1; }
+std::uint64_t bindingGeneration() noexcept { return 1; }
+std::uint64_t contextPublishLatencyNanoseconds() noexcept { return 0; }
+std::uint64_t droppedRefreshCount() noexcept { return 0; }
+bool hasActiveDocument() noexcept { return !testBindings.empty(); }
 }
 namespace gpvst3::ui {
 void resizeNativeEditor(void *, int, int) {}
@@ -103,7 +133,8 @@ void verifyPreloadRetention(const std::vector<gpvst3::hook::Vst3SelectionEntry> 
                      "reordered retained instances process audio in the new order");
     select(entries, entries);
 
-    // Preloading must also cover catalogs larger than the active-chain limit.
+    // P12 keeps catalog metadata separate from the project graph. Adding
+    // unconfigured modules must not instantiate them during preload.
     auto largerCatalog = catalog;
     largerCatalog.insert(1, QJsonObject{{"module", "C:/missing/Preload Missing.vst3"},
         {"class_id", QString::fromStdString(entries[0].classId)}, {"identified", true}});
@@ -126,14 +157,14 @@ void verifyPreloadRetention(const std::vector<gpvst3::hook::Vst3SelectionEntry> 
     preloadSavedSelections();
     require(requestGlobalVst3Selection(entries, &error), "explicit enable during catalog preloading");
     wait();
-    require(g_runtime.selectionPool.effects.size() == 9 && track.pool.effects.size() == 9 &&
-                g_runtime.inputSelectionPool.effects.size() == 9 && g_runtime.preloadFailed == failed + 3,
-            "all nine plugins preload per scope despite an earlier failure and active selection");
+    require(g_runtime.selectionPool.effects.size() == entries.size() && track.pool.effects.size() == entries.size() &&
+                g_runtime.inputSelectionPool.effects.size() == entries.size() && g_runtime.preloadFailed == failed,
+            "catalog refresh does not preload unconfigured or input-routed modules");
     require(g_runtime.selectionSlots[g_runtime.chain.snapshot().activeSlot].effects[0] == retained[0].lock(),
             "background preloading preserves the active chain");
     const auto afterPreload = g_nextInstanceId.load();
     select({largerEntries.back()}, {largerEntries.back()});
-    require(g_nextInstanceId.load() == afterPreload, "plugin beyond chain capacity was already preloaded");
+    require(g_nextInstanceId.load() > afterPreload, "explicit enable creates a previously metadata-only plugin");
     select(entries, entries);
 }
 }
@@ -161,6 +192,7 @@ extern "C" __declspec(dllexport) int gpvst3_run_runtime_tests(const char *fixtur
         binding.scoreKey = "score"; binding.documentId = "document"; binding.trackIndex = 0; binding.selectedTrack = true;
         testBindings.push_back(binding);
         g_initial.hostSupported = true;
+        qputenv("GPVST3_DISABLE_PROJECT_RESTORE", "1");
         // No patch is installed by this fixture; calls enter the production
         // control API after substituting discovery and the rate accessor.
         g_runtime.master.installed = true; g_runtime.dsp.installed = true;
@@ -169,12 +201,14 @@ extern "C" __declspec(dllexport) int gpvst3_run_runtime_tests(const char *fixtur
         require(configuredInputRoute() == input::Route::Disabled, "input monitoring is opt-in");
         refreshTrackContext();
         std::string error;
-        require(state::disableAllEffectsAtStartup(), "preload preserves startup bypass");
         QJsonArray preloadCatalog;
         for (const auto &value : effects) {
             auto effect = value.toObject(); effect.insert("identified", true); preloadCatalog.append(effect);
         }
         setVst3Catalog(preloadCatalog);
+        require(!requestTrackVst3SelectionAtGeneration("track", 2, entries, &error) &&
+                    error == "stale_selection_generation",
+                "stale track selection generation is rejected before enqueue");
         g_runtime.stream.installed = true;
         require(configureInputRouter(), "prepare dormant live input router");
         preloadSavedSelections();
@@ -183,13 +217,23 @@ extern "C" __declspec(dllexport) int gpvst3_run_runtime_tests(const char *fixtur
             QCoreApplication::processEvents(QEventLoop::AllEvents, 5);
             QThread::msleep(1);
         }
+        // The context worker and preload worker are independent queues. A
+        // fixture may observe the first preload before its track runtime slot
+        // is published; replaying the idempotent project-scoped request here
+        // verifies the same retry behavior used after a host rebuild.
+        refreshTrackContext();
+        preloadSavedSelections();
+        while (vst3SelectionPending() && std::chrono::steady_clock::now() < preloadDeadline) {
+            QCoreApplication::processEvents(QEventLoop::AllEvents, 5);
+            QThread::msleep(1);
+        }
         require(!vst3SelectionPending() && g_runtime.globalPreloaded && !g_runtime.inputPreloaded &&
                     g_runtime.trackRuntimes[0].preloaded.load(),
                 "global and track catalog preloads without enabling input monitoring");
-        require(g_runtime.selectionPool.effects.size() == entries.size() &&
-                    g_runtime.trackRuntimes[0].pool.effects.size() == entries.size() &&
+        require(g_runtime.selectionPool.effects.size() == 1 &&
+                    g_runtime.trackRuntimes[0].pool.effects.size() == 1 &&
                     g_runtime.inputSelectionPool.effects.empty(),
-                "all catalog plugins preload including disabled and never-saved entries");
+                "only explicitly enabled project plugins preload; disabled catalog entries stay metadata-only");
         const auto *preloadedGlobal = g_runtime.selectionPool.effects[0].get();
         const auto *preloadedTrack = g_runtime.trackRuntimes[0].pool.effects[0].get();
         require(g_runtime.chain.snapshot().activeSlot < 0 && g_runtime.inputChain.snapshot().activeSlot < 0 &&
@@ -207,14 +251,25 @@ extern "C" __declspec(dllexport) int gpvst3_run_runtime_tests(const char *fixtur
         }
         require(preloadedGlobal != preloadedTrack, "preloaded scopes own independent processors");
         const auto preloadedEvidence = snapshot();
-        require(preloadedEvidence.instances.size() == 6 && std::all_of(
+        require(preloadedEvidence.instances.size() == 2 && std::all_of(
                     preloadedEvidence.instances.begin(), preloadedEvidence.instances.end(), [](const auto &instance) {
                         return !instance.active && instance.preloaded && instance.processedBlocks == 0;
-                    }), "diagnostics expose every dormant instance");
+                    }), "diagnostics expose only configured dormant instances");
         const auto preloadCompleted = g_runtime.preloadCompleted;
         for (int i = 0; i < 20; ++i) preloadSavedSelections();
+        const auto dedupeDeadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+        while (vst3SelectionPending() && std::chrono::steady_clock::now() < dedupeDeadline) {
+            QCoreApplication::processEvents(QEventLoop::AllEvents, 5);
+            QThread::msleep(1);
+        }
         require(!vst3SelectionPending() && g_runtime.preloadCompleted == preloadCompleted,
                 "unchanged preload requests are deduplicated");
+        const auto noScoreInstances = g_nextInstanceId.load();
+        testBindings.clear();
+        preloadSavedSelections();
+        require(g_nextInstanceId.load() == noScoreInstances && !vst3SelectionPending(),
+                "no open score keeps catalog metadata-only and does not enqueue preload");
+        testBindings.push_back(binding);
         require(requestTrackVst3Selection("track", entries, &error), "activate preloaded track selection");
         while (vst3SelectionPending() && std::chrono::steady_clock::now() < preloadDeadline) {
             QCoreApplication::processEvents(QEventLoop::AllEvents, 5);
@@ -235,7 +290,7 @@ extern "C" __declspec(dllexport) int gpvst3_run_runtime_tests(const char *fixtur
                 "global enable does not create or enable a microphone monitor");
         require(!g_runtime.globalPreloaded && !g_runtime.inputPreloaded && !g_runtime.trackRuntimes[0].preloaded.load(),
                 "preload diagnostics distinguish active from prepared slots");
-        require(setTrackVst3Selection("track", entries, &error), "prepare track processors");
+        require(syncTrackSelection("track", entries, &error), "prepare track processors");
         qputenv("GPVST3_TEST_INITIALIZE_DELAY_MS", "150");
         const auto requestStarted = std::chrono::steady_clock::now();
         require(requestGlobalVst3Selection(entries, &error), "queue global processors");
@@ -327,7 +382,7 @@ extern "C" __declspec(dllexport) int gpvst3_run_runtime_tests(const char *fixtur
                 "global actual sample after reconfiguration");
         }
         auto missing = entries; missing[1].module = "C:/missing/P8 Missing.vst3";
-        require(!setTrackVst3Selection("track", missing, &error) && error == "runtime_vst3_not_found", "missing explicit selection rejected");
+        require(!syncTrackSelection("track", missing, &error) && error == "runtime_vst3_not_found", "missing explicit selection rejected");
         reset(); require(track.processBlock(block(testRate)) && std::abs(left[0] - 0.5125F) < 0.000001F,
             "failed selection preserves the previous live track chain");
         QWidget editorHost;
@@ -369,7 +424,7 @@ extern "C" __declspec(dllexport) int gpvst3_run_runtime_tests(const char *fixtur
         reset(); require(g_runtime.chain.process(block(testRate)).completed &&
                          std::abs(left[0] - 0.5125F) < 0.000001F,
                          "failed global selection preserves the previous live chain");
-        require(setTrackVst3Selection("track", entries, &error), "restore explicit track selection");
+        require(syncTrackSelection("track", entries, &error), "restore explicit track selection");
         auto &slot = track.trackSlots[track.chain.snapshot().activeSlot];
         slot.effects[1]->forceError = true;
         reset(); require(!track.processBlock(block(testRate)), "failed process is detected");
@@ -382,6 +437,7 @@ extern "C" __declspec(dllexport) int gpvst3_run_runtime_tests(const char *fixtur
         require(consumeSelectionStateChanges(), "failure publishes UI reload notification");
         g_runtime.master.installed = false; g_runtime.dsp.installed = false;
         shutdown();
+        qunsetenv("GPVST3_DISABLE_PROJECT_RESTORE");
         std::cout << "PASS: P8 real VST3 buffers, async selection, editor open/reopen/close, scope/state preservation and process failure isolation.\n";
         return 0;
     } catch (const std::exception &error) {

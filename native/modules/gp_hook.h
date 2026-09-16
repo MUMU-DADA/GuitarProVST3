@@ -85,6 +85,8 @@ struct State {
     bool globalPreloaded = false;
     bool inputPreloaded = false;
     std::size_t trackPreloaded = 0;
+    std::size_t warmCacheLimit = 0;
+    std::size_t warmCacheEvictions = 0;
     std::uint64_t preloadCompleted = 0, preloadFailed = 0;
     std::string preloadError;
     std::vector<InstanceEvidence> instances;
@@ -101,6 +103,19 @@ struct State {
     std::uint64_t selectionPreparedNanoseconds = 0;
     std::uint64_t selectionCommittedNanoseconds = 0;
     std::uint64_t selectionAppliedGeneration = 0;
+    std::uint64_t selectionGeneration = 0;
+    std::uint64_t bindingGeneration = 0;
+    std::uint64_t contextPublishLatencyNanoseconds = 0;
+    std::uint64_t droppedRefreshCount = 0;
+    bool scoreOpen = false;
+    std::string selectionEventSource;
+    bool selectionHookInstalled = false;
+    bool selectionHookGatePassed = false;
+    bool topologyHookInstalled = false;
+    bool topologyHookGatePassed = false;
+    std::size_t topologyDuplicateCalls = 0;
+    std::size_t topologySwapCalls = 0;
+    std::uint64_t topologyEventCount = 0;
     std::uint64_t audioGeneration = 0;
     std::string selectionStatus;
     std::uint64_t chainActivationNanoseconds = 0;
@@ -146,6 +161,10 @@ struct State {
     std::size_t globalChainProcessBlocks = 0;
     std::size_t trackChainProcessBlocks = 0;
     std::size_t trackChainProcessedBlocks = 0;
+    std::size_t trackDispatchMisses = 0;
+    std::uintptr_t trackLastDspSelf = 0;
+    std::uintptr_t trackDispatchSelf0 = 0;
+    std::uintptr_t trackDispatchSelf1 = 0;
     std::size_t trackBindingsPublished = 0;
     bool trackRuntimeProcessed = false;
     bool trackRuntimeWriteObserved = false;
@@ -239,6 +258,7 @@ bool editorCallbackActive() noexcept;
 // persisted as disabled; the UI reloads the actual accepted selection.
 bool consumeSelectionStateChanges() noexcept;
 bool vst3SelectionPending() noexcept;
+bool consumeTrackTopologyInvalidation() noexcept;
 
 // Thread-safe control used by the Qt panel. It only changes an atomic bypass
 // flag; processor creation and destruction remain on the worker thread.
@@ -255,8 +275,8 @@ std::vector<Vst3SelectionEntry> captureVst3States();
 bool setGlobalVst3Selection(const std::vector<Vst3SelectionEntry> &selection,
                             std::string *error = nullptr) noexcept;
 // Nonblocking UI request path. The request is coalesced and prepared on the
-// runtime control worker; the synchronous API above remains available to
-// fixtures and maintenance callers.
+// runtime control worker. Track set/request APIs both return queue acceptance;
+// tests wait for applied/failed evidence outside the production API.
 bool requestGlobalVst3Selection(const std::vector<Vst3SelectionEntry> &selection,
                                 std::string *error = nullptr) noexcept;
 bool setTrackVst3Selection(const std::string &trackKey,
@@ -265,6 +285,10 @@ bool setTrackVst3Selection(const std::string &trackKey,
 bool requestTrackVst3Selection(const std::string &trackKey,
                                const std::vector<Vst3SelectionEntry> &selection,
                                std::string *error = nullptr) noexcept;
+bool requestTrackVst3SelectionAtGeneration(const std::string &trackKey,
+                                            std::uint64_t selectionGeneration,
+                                            const std::vector<Vst3SelectionEntry> &selection,
+                                            std::string *error = nullptr) noexcept;
 std::vector<Vst3SelectionEntry> captureGlobalVst3States();
 std::vector<Vst3SelectionEntry> captureTrackVst3States(const std::string &trackKey);
 // Open the editor owned by the currently active processing instance. The

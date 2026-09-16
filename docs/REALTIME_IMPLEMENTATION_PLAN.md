@@ -1,6 +1,6 @@
 # GuitarProVST3 实时实现总览
 
-当前目标是在 Windows x64 的 Guitar Pro 8.1.1.17 中提供由 Guitar Pro 加载的实时 VST3 效果器链。P8/P9 的实现记录和当前待办以根目录 `docs/` 下的正式文档为准；editor 打开和首次启停生效的后续工作见 [P10 优化计划](P10_EDITOR_AUDIO_ACTIVATION_PLAN.md)，阶段原始记录保存在 `docs/archive/phase-records/`。
+当前目标是在 Windows x64 的 Guitar Pro 8.1.1.17 中提供由 Guitar Pro 加载的实时 VST3 效果器链。P8/P9 的实现记录和当前待办以根目录 `docs/` 下的正式文档为准；editor 打开和首次启停生效的后续工作见 [P10 优化计划](P10_EDITOR_AUDIO_ACTIVATION_PLAN.md)，事件驱动切轨与按需运行时见 [P12 计划](P12_EVENT_DRIVEN_LAZY_RUNTIME_PLAN.md)，阶段原始记录保存在 `docs/archive/phase-records/`。
 
 ## 目标与架构
 
@@ -30,6 +30,7 @@ GP 继续负责音频设备、输入输出、采样率和流生命周期；插�
 | P9 | 实时切换稳定性、UI 重构、标题工具栏 About 和扫描反馈收敛（夹具/MCP 完成；真实 editor 与首次启停生效问题转入 P10） |
 | P10 | VST3 原生 editor 打开、首次启停音频提交、首个有效处理块诊断和真实宿主回归（已完成） |
 | P11 | 周期音轨/侧栏维护改为合并通知，诊断后台写盘，scanner 按任务活动 poll（代码与专项完成；长时设备矩阵采样边界见实现记录） |
+| P12 | 事件驱动切轨、曲谱生命周期门控、按需实例化和 warm-cache（代码与专项验收完成；宿主受限项见实现记录） |
 
 ## 核心约束
 

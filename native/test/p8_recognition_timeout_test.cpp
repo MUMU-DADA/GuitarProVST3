@@ -79,18 +79,31 @@ int main(int argc, char **argv) {
     if (!check(result.recognitionWorkersDetached == 1, "detached timeout worker is counted")) return 1;
 
     QFile cache(QDir(data).filePath("vst3-catalog-cache.json"));
+    for (int i = 0; i < 500 && !cache.exists(); ++i) QThread::msleep(10);
     if (!check(cache.open(QIODevice::ReadOnly), "timeout cache written")) return 1;
-    const auto scopes = QJsonDocument::fromJson(cache.readAll()).object().value("scopes").toObject();
-    const auto modules = scopes.begin().value().toObject().value("modules").toObject();
+    QJsonObject cacheDocument;
     QJsonObject timeout;
-    for (auto it = modules.begin(); it != modules.end(); ++it)
-        if (QString::fromLatin1(it.key().toUtf8()).compare(first, Qt::CaseInsensitive) == 0)
-            timeout = it.value().toObject();
+    for (int i = 0; i < 500; ++i) {
+        cache.seek(0);
+        cacheDocument = QJsonDocument::fromJson(cache.readAll()).object();
+        const auto scopes = cacheDocument.value("scopes").toObject();
+        const auto modules = scopes.isEmpty() ? QJsonObject{} : scopes.begin().value().toObject().value("modules").toObject();
+        for (auto it = modules.begin(); it != modules.end(); ++it)
+            if (QString::fromLatin1(it.key().toUtf8()).compare(first, Qt::CaseInsensitive) == 0)
+                timeout = it.value().toObject();
+        if (timeout.value("recognition_status").toString() == "timeout") break;
+        cache.close(); QThread::msleep(10); cache.open(QIODevice::ReadOnly);
+    }
+    const auto scopes = cacheDocument.value("scopes").toObject();
+    const auto modules = scopes.begin().value().toObject().value("modules").toObject();
     if (!check(timeout.value("recognition_status").toString() == "timeout" &&
                timeout.value("recognition_error").toString() == "recognition_timeout" &&
                timeout.value("recognition_deadline_at").toDouble() > 0,
                "timeout reason and deadline persist")) return 1;
     cache.close();
+    // The production cache writer is deliberately asynchronous. Settle its
+    // latest slot before editing the fixture to test retry policy.
+    QThread::msleep(500);
     // Expire the static metadata retry without waiting a minute. An unchanged
     // timeout must survive automatic refresh; only an explicit retry requeues it.
     cache.open(QIODevice::ReadOnly);
@@ -111,7 +124,8 @@ int main(int argc, char **argv) {
     const auto settle = [&](bool manual) {
         gpvst3::vst3::beginAsync(true, manual);
         for (int i = 0; i < 5000; ++i) {
-            if (gpvst3::vst3::poll(result) && !result.scanPending && !result.recognitionPending) return true;
+            gpvst3::vst3::poll(result);
+            if (!result.scanPending && !result.recognitionPending && result.ready) return true;
             QThread::msleep(1);
         }
         return false;

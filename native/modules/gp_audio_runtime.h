@@ -28,7 +28,12 @@ void initialize() noexcept;
 void shutdown() noexcept;
 void setRefreshNotifier(RefreshNotifier notifier) noexcept;
 void markDirty() noexcept;
+void markTopologyDirty() noexcept;
+void markExplicitTopologyDirty() noexcept;
+bool consumeTopologyDirty() noexcept;
+std::uint64_t topologyEventCount() noexcept;
 void markSelectionDirty() noexcept;
+void notifyCursorChanged(void *cursor) noexcept;
 bool refreshNeeded() noexcept;
 bool refreshIncomplete() noexcept;
 bool checkStructureChanged() noexcept;
@@ -38,6 +43,16 @@ bool checkStructureChanged() noexcept;
 std::size_t refresh() noexcept;
 std::size_t refreshIfNeeded() noexcept;
 bool refreshSelectionContext() noexcept;
+
+// P12 diagnostics. Binding generation changes only when document/track/chain
+// topology changes; selection generation changes only when the active
+// document or selected track changes. These counters are monotonic for the
+// lifetime of the process and are safe to sample from any thread.
+std::uint64_t selectionGeneration() noexcept;
+std::uint64_t bindingGeneration() noexcept;
+std::uint64_t contextPublishLatencyNanoseconds() noexcept;
+std::uint64_t droppedRefreshCount() noexcept;
+bool hasActiveDocument() noexcept;
 
 // Returns the track selected by the active Guitar Pro document according to
 // the MCP bridge. This is a control-thread snapshot; the audio callback uses

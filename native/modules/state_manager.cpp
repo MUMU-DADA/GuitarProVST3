@@ -32,6 +32,7 @@ struct RuntimeTrackContext {
 };
 
 RuntimeTrackContext g_runtimeTrackContext;
+std::uint64_t g_runtimeSelectionGeneration = 0;
 std::mutex g_runtimeTrackContextMutex;
 struct DocumentTracks {
     QString score;
@@ -347,6 +348,41 @@ bool disableAllEffectsAtStartup() {
     return writeChain(chain);
 }
 
+bool migrateDesiredEnabledIntent() {
+    QJsonObject chain;
+    if (!loadChain(chain)) return false;
+    bool changed = false;
+    const auto migrateScope = [&changed](QJsonObject scope) {
+        auto effects = scope.value("effects").toArray();
+        for (int index = 0; index < effects.size(); ++index) {
+            auto effect = effects.at(index).toObject();
+            if (!effect.value("desired_enabled").toBool()) continue;
+            effect.insert("enabled", true);
+            effect.insert("bypass", false);
+            effect.insert("intent_migrated", "desired_enabled_to_enabled");
+            effect.remove("desired_enabled");
+            effects.replace(index, effect);
+            changed = true;
+        }
+        scope.insert("effects", effects);
+        return scope;
+    };
+    chain.insert("global", migrateScope(chain.value("global").toObject()));
+    auto scores = chain.value("scores").toObject();
+    for (auto score = scores.begin(); score != scores.end(); ++score) {
+        auto scoreObject = score.value().toObject();
+        auto tracks = scoreObject.value("tracks").toObject();
+        for (auto track = tracks.begin(); track != tracks.end(); ++track)
+            track.value() = migrateScope(track.value().toObject());
+        scoreObject.insert("tracks", tracks);
+        score.value() = scoreObject;
+    }
+    chain.insert("scores", scores);
+    if (!changed) return true;
+    chain.insert("effects", chain.value("global").toObject().value("effects"));
+    return writeChain(chain);
+}
+
 bool loadChain(QJsonObject &chain, QString *error) {
     QFile file(sidecarPath());
     if (!file.exists()) { chain = emptyChain(); return true; }
@@ -448,6 +484,9 @@ TrackKey currentTrackKey(const ScoreKey &score) {
 void setRuntimeTrackContext(const ScoreKey &score, const TrackKey &track,
                             int trackIndex, const QString &trackId) {
     std::lock_guard<std::mutex> lock(g_runtimeTrackContextMutex);
+    if (g_runtimeTrackContext.score != score || g_runtimeTrackContext.track != track ||
+        g_runtimeTrackContext.index != trackIndex || g_runtimeTrackContext.trackId != trackId)
+        ++g_runtimeSelectionGeneration;
     g_runtimeTrackContext.score = score;
     g_runtimeTrackContext.track = track;
     g_runtimeTrackContext.trackId = trackId;
@@ -457,6 +496,7 @@ void setRuntimeTrackContext(const ScoreKey &score, const TrackKey &track,
 
 void clearRuntimeTrackContext() {
     std::lock_guard<std::mutex> lock(g_runtimeTrackContextMutex);
+    if (g_runtimeTrackContext.available) ++g_runtimeSelectionGeneration;
     g_runtimeTrackContext = {};
 }
 
@@ -636,6 +676,11 @@ bool writeStatus(const QJsonObject &input) {
     g_statusWriter.start();
     g_statusWriter.submit(status);
     return true;
+}
+
+std::uint64_t runtimeSelectionGeneration() {
+    std::lock_guard<std::mutex> lock(g_runtimeTrackContextMutex);
+    return g_runtimeSelectionGeneration;
 }
 
 bool writeRealtimeObservation(const QJsonObject &hookStatus) {

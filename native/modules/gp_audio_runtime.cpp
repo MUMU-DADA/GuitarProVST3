@@ -10,6 +10,7 @@
 
 #include <QtCore/QCoreApplication>
 #include <QtCore/QEvent>
+#include <QtCore/QDynamicPropertyChangeEvent>
 #include <QtCore/QDir>
 #include <QtCore/QFileInfo>
 #include <QtCore/QPointer>
@@ -23,6 +24,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <mutex>
 
 namespace gpvst3::gp_audio {
@@ -73,7 +75,6 @@ public:
             g_objects.forget(object);
             std::lock_guard<std::mutex> lock(mutex_);
             controllers_.removeAll(object);
-            markDirty();
             return false;
         }
         if (event && event->type() != QEvent::ChildAdded && event->type() != QEvent::ChildRemoved &&
@@ -86,10 +87,32 @@ public:
         if (!relevant) return false;
         if (event && !object->property("gpvst3Owned").toBool()) {
             const auto type = event->type();
-            if (type == QEvent::ChildAdded || type == QEvent::ChildRemoved ||
-                type == QEvent::DynamicPropertyChange) markDirty();
+            if (type == QEvent::ChildAdded || type == QEvent::ChildRemoved) {
+                // Object-tree churn is not a topology contract. Track edits
+                // use the verified Score hooks and the bounded settling check
+                // below; ignoring this noisy event keeps cursor changes from
+                // rebuilding the audio graph.
+            }
+            else if (type == QEvent::DynamicPropertyChange) {
+                const auto className = name.toLower();
+                const auto *dynamic = static_cast<const QDynamicPropertyChangeEvent *>(event);
+                const auto propertyName = dynamic ? dynamic->propertyName().toLower() : QByteArray{};
+                // ScoreCursor and document view implementations differ across
+                // host builds. Dynamic properties carrying cursor/selection
+                // state are a safe, allocation-free event source when they
+                // are exposed; unrelated properties still trigger topology
+                // maintenance as before.
+                if (className.contains("cursor") || className.contains("selection") ||
+                    className.contains("documentview") || propertyName.contains("track") ||
+                    propertyName.contains("cursor") || propertyName.contains("selection"))
+                    markSelectionDirty();
+                // Generic dynamic properties are noisy during playback and
+                // Conductor maintenance. They carry no topology contract;
+                // only explicit child lifetime events or Score hooks mark a
+                // graph rebuild.
+            }
             else if ((type == QEvent::Show || type == QEvent::Hide) &&
-                     name == "gp::gui::IDocumentView") markSelectionDirty();
+                     name == "gp::gui::IDocumentView") { markExplicitTopologyDirty(); markSelectionDirty(); }
         }
         if (name != "gp::rse::ConductorController" && name != "gp::gui::IDocumentsManager") return false;
         std::lock_guard<std::mutex> lock(mutex_);
@@ -125,11 +148,25 @@ Binding g_bindingBuffers[2][kMaxBindings];
 std::atomic<int> g_activeBuffer{0};
 std::atomic<std::size_t> g_bindingCount{0};
 std::atomic<std::uint64_t> g_generation{0};
+std::atomic<std::uint64_t> g_selectionGeneration{0};
+std::atomic<std::uint64_t> g_bindingGeneration{0};
+std::atomic<std::uint64_t> g_selectionEventNanoseconds{0};
+std::atomic<std::uint64_t> g_contextPublishLatencyNanoseconds{0};
+std::atomic<std::uint64_t> g_droppedRefreshCount{0};
+std::atomic<std::uint64_t> g_bridgeGeneration{0};
 std::atomic<RefreshNotifier> g_refreshNotifier{nullptr};
 std::atomic<bool> g_dirty{true};
+std::atomic<bool> g_topologyDirty{false};
+std::atomic<bool> g_forceTopologyRefresh{false};
+std::atomic<std::uint64_t> g_topologyEventCount{0};
 std::atomic<bool> g_selectionDirty{false};
 std::atomic<bool> g_refreshIncomplete{false};
 std::atomic<const char *> g_bindingSource{"unresolved"};
+
+std::uint64_t steadyNanoseconds() noexcept {
+    return static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count());
+}
 
 QString scoreKey() {
     const auto configured = qEnvironmentVariable("GPVST3_SCORE_PATH");
@@ -188,6 +225,7 @@ std::vector<BridgeContext> collectFromMcpBridge(bool *available) {
     BridgeCollector collector;
     McpAudioEnumerateResult result{sizeof(result), 0, 0, 0};
     const auto status = enumerate(1, &collectBridgeBinding, &collector, &result);
+    g_bridgeGeneration.store(result.generation, std::memory_order_release);
     if (status != 0 && collector.result.empty()) return empty;
     return collector.result;
 }
@@ -293,8 +331,11 @@ QObject *nativeActiveDocument(const std::vector<NativeDocument> &documents,
 struct NativeTrack {
     QString document, id;
     std::weak_ptr<gp::core::Track> lifetime;
+    int index = -1;
 };
 std::vector<NativeTrack> g_nativeTracks;
+std::weak_ptr<gp::core::Score> g_activeScore;
+std::string g_activeDocumentId;
 
 std::vector<Binding> collect() {
     static const bool verified = host::verify().supported;
@@ -302,8 +343,12 @@ std::vector<Binding> collect() {
     bool bridgeAvailable = false;
     const auto bridgeContexts = collectFromMcpBridge(&bridgeAvailable);
     std::vector<Binding> result;
+    std::weak_ptr<gp::core::Score> activeScore;
+    std::string activeId;
     const auto finish = [&] {
         mergeBridgeContexts(result, bridgeContexts);
+        g_activeScore = activeScore;
+        g_activeDocumentId = activeId;
         g_bindingSource.store(bridgeAvailable ? "mcp_context_native_registry" : "native_document_registry",
                               std::memory_order_release);
         return result;
@@ -321,6 +366,15 @@ std::vector<Binding> collect() {
     }
     const auto documents = nativeDocuments();
     auto *activeDocument = nativeActiveDocument(documents, controllers);
+    if (!activeDocument) {
+        const auto bridgeActive = std::find_if(bridgeContexts.begin(), bridgeContexts.end(),
+            [](const BridgeContext &context) { return context.activeDocument == 1; });
+        if (bridgeActive != bridgeContexts.end()) {
+            const auto document = std::find_if(documents.begin(), documents.end(),
+                [&](const NativeDocument &candidate) { return candidate.id == bridgeActive->documentId; });
+            if (document != documents.end()) activeDocument = document->object;
+        }
+    }
     g_nativeTracks.erase(std::remove_if(g_nativeTracks.begin(), g_nativeTracks.end(),
         [](const NativeTrack &track) { return track.lifetime.expired(); }), g_nativeTracks.end());
     for (const auto &guard : controllers) {
@@ -332,6 +386,10 @@ std::vector<Binding> collect() {
         const auto document = std::find_if(documents.begin(), documents.end(),
             [&](const NativeDocument &candidate) { return candidate.score == conductor->score().get(); });
         if (document == documents.end()) continue;
+        if (activeDocument == document->object) {
+            activeScore = conductor->score();
+            activeId = document->id.toStdString();
+        }
         const auto &tracks = conductor->score()->tracks();
         if (tracks.size() > 32) continue;
         for (std::size_t trackIndex = 0; trackIndex < tracks.size(); ++trackIndex) {
@@ -342,9 +400,11 @@ std::vector<Binding> collect() {
                 return track.document == document->id && track.lifetime.lock() == coreTrack;
             });
             if (identity == g_nativeTracks.end()) {
-                g_nativeTracks.push_back({document->id, QUuid::createUuid().toString(QUuid::WithoutBraces), coreTrack});
+                g_nativeTracks.push_back({document->id, QUuid::createUuid().toString(QUuid::WithoutBraces), coreTrack,
+                                          static_cast<int>(trackIndex)});
                 identity = g_nativeTracks.end() - 1;
             }
+            identity->index = static_cast<int>(trackIndex);
             const auto &sounds = coreTrack->sounds();
             const bool musicianReady = musician && native::type(reinterpret_cast<quintptr>(musician)) == ".?AVMusician@rse@gp@@" &&
                 musician->coreTrack() && musician->coreTrack().get() == coreTrack.get();
@@ -393,16 +453,51 @@ void setRefreshNotifier(RefreshNotifier notifier) noexcept {
 
 void markDirty() noexcept {
     const bool wasDirty = g_dirty.exchange(true, std::memory_order_acq_rel);
-    if (!wasDirty) {
-        if (const auto notifier = g_refreshNotifier.load(std::memory_order_acquire)) notifier();
-    }
+    if (wasDirty) g_droppedRefreshCount.fetch_add(1, std::memory_order_relaxed);
+    // The notifier itself coalesces queued work. Notify even when the dirty
+    // bit was already set so an event arriving during a failed refresh cannot
+    // be stranded until a later unrelated document change.
+    if (const auto notifier = g_refreshNotifier.load(std::memory_order_acquire)) notifier();
+}
+
+void markTopologyDirty() noexcept {
+    g_topologyEventCount.fetch_add(1, std::memory_order_relaxed);
+    g_topologyDirty.store(true, std::memory_order_release);
+    markDirty();
+}
+
+void markExplicitTopologyDirty() noexcept {
+    g_forceTopologyRefresh.store(true, std::memory_order_release);
+    markTopologyDirty();
+}
+
+bool consumeTopologyDirty() noexcept {
+    return g_topologyDirty.exchange(false, std::memory_order_acq_rel);
+}
+
+std::uint64_t topologyEventCount() noexcept {
+    return g_topologyEventCount.load(std::memory_order_acquire);
 }
 
 void markSelectionDirty() noexcept {
     const bool wasDirty = g_selectionDirty.exchange(true, std::memory_order_acq_rel);
-    if (!wasDirty) {
-        if (const auto notifier = g_refreshNotifier.load(std::memory_order_acquire)) notifier();
-    }
+    // Each verified cursor notification is a distinct selection event. The
+    // control refresh may coalesce several events into one snapshot, but the
+    // monotonic event generation still lets UI requests reject stale scope
+    // mutations deterministically.
+    g_selectionGeneration.fetch_add(1, std::memory_order_acq_rel);
+    g_selectionEventNanoseconds.store(steadyNanoseconds(), std::memory_order_release);
+    if (wasDirty) g_droppedRefreshCount.fetch_add(1, std::memory_order_relaxed);
+    if (const auto notifier = g_refreshNotifier.load(std::memory_order_acquire)) notifier();
+}
+
+void notifyCursorChanged(void *cursor) noexcept {
+    // The cursor detours are deliberately tiny: no native reads, Qt calls or
+    // locks are performed on the host control path. The following queued
+    // refresh observes the completed cursor state and publishes selection
+    // generation separately from topology generation.
+    Q_UNUSED(cursor);
+    markSelectionDirty();
 }
 
 bool refreshNeeded() noexcept { return g_dirty.load(std::memory_order_acquire); }
@@ -411,8 +506,16 @@ bool refreshIncomplete() noexcept { return g_refreshIncomplete.load(std::memory_
 void initialize() noexcept {
     if (g_observer || !qApp) return;
     try {
-        g_dirty.store(true, std::memory_order_release);
+    g_dirty.store(true, std::memory_order_release);
+    g_topologyDirty.store(true, std::memory_order_release);
+    g_forceTopologyRefresh.store(true, std::memory_order_release);
+    g_topologyEventCount.store(0, std::memory_order_release);
         g_selectionDirty.store(false, std::memory_order_release);
+        g_selectionGeneration.store(0, std::memory_order_release);
+        g_bindingGeneration.store(0, std::memory_order_release);
+        g_selectionEventNanoseconds.store(0, std::memory_order_release);
+        g_contextPublishLatencyNanoseconds.store(0, std::memory_order_release);
+        g_droppedRefreshCount.store(0, std::memory_order_release);
         g_observer = new ControllerObserver;
         g_observer->setParent(qApp);
         qApp->installEventFilter(g_observer);
@@ -427,13 +530,24 @@ void initialize() noexcept {
 void shutdown() noexcept {
     g_refreshNotifier.store(nullptr, std::memory_order_release);
     g_dirty.store(false, std::memory_order_release);
+    g_topologyDirty.store(false, std::memory_order_release);
+    g_forceTopologyRefresh.store(false, std::memory_order_release);
     g_selectionDirty.store(false, std::memory_order_release);
     g_refreshIncomplete.store(false, std::memory_order_release);
+    g_selectionGeneration.store(0, std::memory_order_release);
+    g_bindingGeneration.store(0, std::memory_order_release);
+    g_selectionEventNanoseconds.store(0, std::memory_order_release);
+    g_contextPublishLatencyNanoseconds.store(0, std::memory_order_release);
+    g_droppedRefreshCount.store(0, std::memory_order_release);
+    g_bridgeGeneration.store(0, std::memory_order_release);
     g_bindingSource.store("unresolved", std::memory_order_release);
     g_objects.uninstall();
     if (qApp && g_observer) qApp->removeEventFilter(g_observer);
     if (g_observer) g_observer->deleteLater();
     g_observer = nullptr;
+    g_nativeTracks.clear();
+    g_activeScore.reset();
+    g_activeDocumentId.clear();
     g_bindingCount.store(0, std::memory_order_release);
     g_activeBuffer.store(0, std::memory_order_release);
     std::lock_guard<std::mutex> lock(g_snapshotMutex);
@@ -445,6 +559,7 @@ std::size_t refresh() noexcept {
     try {
         g_dirty.exchange(false, std::memory_order_acq_rel);
         auto discovered = collect();
+        g_selectionDirty.store(false, std::memory_order_release);
         std::vector<state::HostTrackIdentity> identities;
         for (const auto &binding : discovered) identities.push_back({
             QString::fromStdString(binding.documentId), QString::fromStdString(binding.scoreKey),
@@ -455,6 +570,26 @@ std::size_t refresh() noexcept {
         std::lock_guard<std::mutex> lock(g_snapshotMutex);
         const auto count = (std::min)(discovered.size(), kMaxBindings);
         const int active = g_activeBuffer.load(std::memory_order_relaxed);
+        const auto oldCount = g_bindingCount.load(std::memory_order_acquire);
+        const auto sameTopologyEntry = [](const Binding &a, const Binding &b) {
+            return a.chain == b.chain && a.trackIndex == b.trackIndex && a.soundIndex == b.soundIndex &&
+                a.trackKey == b.trackKey && a.trackId == b.trackId && a.documentId == b.documentId &&
+                a.scoreKey == b.scoreKey;
+        };
+        const auto sameTopology = count == oldCount && std::all_of(
+            discovered.begin(), discovered.begin() + count, [&](const Binding &candidate) {
+                return std::any_of(g_bindingBuffers[active], g_bindingBuffers[active] + oldCount,
+                    [&](const Binding &previous) { return sameTopologyEntry(candidate, previous); });
+            });
+        const auto sameSelection = sameTopology && std::all_of(
+            discovered.begin(), discovered.begin() + count, [&](const Binding &candidate) {
+                return std::any_of(g_bindingBuffers[active], g_bindingBuffers[active] + oldCount,
+                    [&](const Binding &previous) {
+                        return sameTopologyEntry(candidate, previous) &&
+                            candidate.activeDocument == previous.activeDocument &&
+                            candidate.selectedTrack == previous.selectedTrack;
+                    });
+            });
         g_refreshIncomplete.store(std::any_of(discovered.begin(), discovered.end(),
             [](const Binding &binding) { return binding.chain == nullptr; }), std::memory_order_release);
         const auto equal = [](const Binding &a, const Binding &b) {
@@ -464,16 +599,28 @@ std::size_t refresh() noexcept {
                 a.selectedTrack == b.selectedTrack;
         };
         if (count == g_bindingCount.load(std::memory_order_acquire) &&
-            std::equal(discovered.begin(), discovered.begin() + count, g_bindingBuffers[active], equal))
+            std::equal(discovered.begin(), discovered.begin() + count, g_bindingBuffers[active], equal)) {
+            g_topologyDirty.store(false, std::memory_order_release);
+            g_forceTopologyRefresh.store(false, std::memory_order_release);
             return count;
+        }
         const int target = active == 0 ? 1 : 0;
         for (std::size_t index = 0; index < count; ++index)
             g_bindingBuffers[target][index] = discovered[index];
         for (std::size_t index = count; index < kMaxBindings; ++index)
             g_bindingBuffers[target][index] = {};
         g_generation.fetch_add(1, std::memory_order_relaxed);
+        if (!sameTopology) g_bindingGeneration.fetch_add(1, std::memory_order_acq_rel);
+        if (!sameSelection) {
+            g_selectionGeneration.fetch_add(1, std::memory_order_acq_rel);
+            const auto started = g_selectionEventNanoseconds.exchange(0, std::memory_order_acq_rel);
+            if (started != 0) g_contextPublishLatencyNanoseconds.store(
+                steadyNanoseconds() - started, std::memory_order_release);
+        }
         g_activeBuffer.store(target, std::memory_order_release);
         g_bindingCount.store(count, std::memory_order_release);
+        g_topologyDirty.store(false, std::memory_order_release);
+        g_forceTopologyRefresh.store(false, std::memory_order_release);
         return count;
     } catch (...) {
         return 0;
@@ -481,6 +628,11 @@ std::size_t refresh() noexcept {
 }
 
 std::size_t refreshIfNeeded() noexcept {
+    if (g_bindingCount.load(std::memory_order_acquire) != 0 &&
+        g_dirty.load(std::memory_order_acquire) &&
+        !g_forceTopologyRefresh.load(std::memory_order_acquire) &&
+        !checkStructureChanged())
+        return g_bindingCount.load(std::memory_order_acquire);
     if (!g_dirty.load(std::memory_order_acquire))
         return g_bindingCount.load(std::memory_order_acquire);
     return refresh();
@@ -489,17 +641,59 @@ std::size_t refreshIfNeeded() noexcept {
 bool checkStructureChanged() noexcept {
     // Only test the cached lifetimes here. In particular this fallback does
     // not enumerate the bridge merely to discover its generation.
-    const bool expired = std::any_of(g_nativeTracks.begin(), g_nativeTracks.end(),
-        [](const NativeTrack &track) { return track.lifetime.expired(); });
-    if (expired) markDirty();
-    return expired;
+    bool changed = false;
+    if (!changed) {
+        const auto score = g_activeScore.lock();
+        if (score) {
+            // Score/Track wrappers may be replaced by Guitar Pro during a
+            // cursor move while their logical track count is unchanged. The
+            // count is the stable topology signal here; pointer identity is
+            // refreshed only after an explicit Score edit or document event.
+            const auto count = score->tracks().size();
+            const auto knownCount = static_cast<std::size_t>(std::count_if(g_nativeTracks.begin(), g_nativeTracks.end(),
+                [&](const NativeTrack &known) {
+                    return known.document.toStdString() == g_activeDocumentId && !known.lifetime.expired();
+                }));
+            changed = count != knownCount;
+        }
+    }
+    if (changed) markExplicitTopologyDirty();
+    return changed;
+}
+
+bool bridgeTopologyMatches(const std::vector<BridgeContext> &contexts) noexcept {
+    const auto count = g_bindingCount.load(std::memory_order_acquire);
+    const int active = g_activeBuffer.load(std::memory_order_acquire);
+    for (const auto &context : contexts) {
+        if (context.activeDocument != 1 || context.trackIndex < 0) continue;
+        bool found = false;
+        for (std::size_t i = 0; i < count; ++i) {
+            const auto &binding = g_bindingBuffers[active][i];
+            if (binding.trackIndex == context.trackIndex &&
+                (context.documentId.isEmpty() || context.documentId.toStdString() == binding.documentId)) {
+                found = true;
+                break;
+            }
+        }
+        if (!found) return false;
+    }
+    return true;
 }
 
 bool refreshSelectionContext() noexcept {
     if (!g_selectionDirty.exchange(false, std::memory_order_acq_rel)) return false;
-    bool available = false;
-    const auto contexts = collectFromMcpBridge(&available);
-    if (!available || contexts.empty()) return false;
+    const auto score = g_activeScore.lock();
+    if (!score || g_activeDocumentId.empty()) {
+        g_selectionDirty.store(true, std::memory_order_release);
+        g_dirty.store(true, std::memory_order_release);
+        return false;
+    }
+    const auto selectedIndex = score->cursor().trackIndex();
+    if (selectedIndex < 0) {
+        g_selectionDirty.store(true, std::memory_order_release);
+        g_dirty.store(true, std::memory_order_release);
+        return false;
+    }
     std::lock_guard<std::mutex> lock(g_snapshotMutex);
     const auto count = g_bindingCount.load(std::memory_order_acquire);
     const int active = g_activeBuffer.load(std::memory_order_acquire);
@@ -507,18 +701,48 @@ bool refreshSelectionContext() noexcept {
     bool changed = false;
     for (std::size_t i = 0; i < count; ++i) {
         auto value = g_bindingBuffers[active][i];
-        const auto it = std::find_if(contexts.cbegin(), contexts.cend(), [&](const BridgeContext &ctx) {
-            return ctx.trackIndex == value.trackIndex &&
-                (ctx.documentId.isEmpty() || ctx.documentId.toStdString() == value.documentId);
-        });
         g_bindingBuffers[target][i] = value;
-        if (it == contexts.cend()) continue;
-        if (it->activeDocument <= 1) { const bool v = it->activeDocument == 1; changed |= value.activeDocument != v; value.activeDocument = v; }
-        if (it->selectedTrack <= 1) { const bool v = it->selectedTrack == 1; changed |= value.selectedTrack != v; value.selectedTrack = v; }
+        const bool activeValue = value.documentId == g_activeDocumentId;
+        changed |= value.activeDocument != activeValue ||
+                   value.selectedTrack != (activeValue && value.trackIndex == selectedIndex);
+        value.activeDocument = activeValue;
+        value.selectedTrack = activeValue && value.trackIndex == selectedIndex;
         g_bindingBuffers[target][i] = value;
     }
-    if (changed) { g_activeBuffer.store(target, std::memory_order_release); g_generation.fetch_add(1, std::memory_order_relaxed); }
+    if (changed) {
+        g_activeBuffer.store(target, std::memory_order_release);
+        g_generation.fetch_add(1, std::memory_order_relaxed);
+        const auto started = g_selectionEventNanoseconds.exchange(0, std::memory_order_acq_rel);
+        if (started != 0) g_contextPublishLatencyNanoseconds.store(
+            steadyNanoseconds() - started, std::memory_order_release);
+    }
     return changed;
+}
+
+std::uint64_t selectionGeneration() noexcept {
+    return g_selectionGeneration.load(std::memory_order_acquire);
+}
+
+std::uint64_t bindingGeneration() noexcept {
+    return g_bindingGeneration.load(std::memory_order_acquire);
+}
+
+std::uint64_t contextPublishLatencyNanoseconds() noexcept {
+    return g_contextPublishLatencyNanoseconds.load(std::memory_order_acquire);
+}
+
+std::uint64_t droppedRefreshCount() noexcept {
+    return g_droppedRefreshCount.load(std::memory_order_acquire);
+}
+
+bool hasActiveDocument() noexcept {
+    std::lock_guard<std::mutex> lock(g_snapshotMutex);
+    const auto count = g_bindingCount.load(std::memory_order_acquire);
+    const int active = g_activeBuffer.load(std::memory_order_acquire);
+    for (std::size_t index = 0; index < count; ++index)
+        if (g_bindingBuffers[active][index].activeDocument &&
+            !g_bindingBuffers[active][index].documentId.empty()) return true;
+    return false;
 }
 
 bool currentTrack(Binding &binding) noexcept {

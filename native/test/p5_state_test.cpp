@@ -74,6 +74,12 @@ int main(int argc, char **argv) {
                    !startupTrack.value("enabled").toBool() && startupTrack.value("bypass").toBool() &&
                    startupTrack.value("desired_enabled").toBool(),
                "global and track effects start bypassed with intent preserved")) return 1;
+    if (!check(gpvst3::state::migrateDesiredEnabledIntent(), "migrate legacy activation intent")) return 1;
+    QJsonObject migrated;
+    if (!check(gpvst3::state::loadChain(migrated), "load migrated activation intent")) return 1;
+    const auto migratedGlobal = migrated.value("global").toObject().value("effects").toArray().first().toObject();
+    if (!check(migratedGlobal.value("enabled").toBool() && !migratedGlobal.contains("desired_enabled"),
+               "legacy intent migration preserves explicit enable choice")) return 1;
 
     QFile corrupt(gpvst3::state::sidecarPath());
     if (!check(corrupt.open(QIODevice::WriteOnly | QIODevice::Truncate), "open corrupt sidecar")) return 1;

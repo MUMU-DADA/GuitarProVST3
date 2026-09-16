@@ -55,6 +55,11 @@ QJsonValue stableObservation(const QJsonValue &value) {
 }
 
 void writeObservation() {
+    // A host DSP call can expose a rebuilt EffectsChain before Qt publishes a
+    // document event. The callback only sets an atomic; this control monitor
+    // turns that concrete invalidation into one coalesced topology refresh.
+    if (gpvst3::hook::consumeTrackTopologyInvalidation())
+        gpvst3::gp_audio::markExplicitTopologyDirty();
     const auto hook = gpvst3::bootstrap::hookSnapshot();
     static QByteArray lastStable, lastFull;
     static auto lastSubmit = std::chrono::steady_clock::time_point{};
@@ -99,8 +104,11 @@ private:
 };
 
 ObservationMonitor g_observationMonitor;
+std::atomic<bool> g_observationStopped{false};
 
 void stopObservation() {
+    if (g_observationStopped.exchange(true, std::memory_order_acq_rel)) return;
+    gpvst3::bootstrap::shutdown();
     g_observationMonitor.stop();
     gpvst3::vst3::shutdownScan();
     gpvst3::state::writeRealtimeObservation(gpvst3::bootstrap::hookSnapshot());
@@ -135,6 +143,7 @@ void initializePlugin() {
     QObject::connect(application, &QCoreApplication::aboutToQuit, application, &gpvst3::ui::shutdownEditors);
     QObject::connect(application, &QCoreApplication::aboutToQuit, application, &gpvst3::hook::saveVst3States);
     QObject::connect(application, &QCoreApplication::aboutToQuit, application, &gpvst3::vst3::shutdownScan);
+    QObject::connect(application, &QCoreApplication::aboutToQuit, application, &stopObservation);
     qAddPostRoutine(&stopObservation);
 }
 

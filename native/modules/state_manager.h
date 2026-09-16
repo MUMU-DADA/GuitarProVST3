@@ -4,6 +4,7 @@
 #include <QtCore/QJsonArray>
 #include <QtCore/QString>
 #include <vector>
+#include <cstdint>
 
 namespace gpvst3::state {
 
@@ -22,6 +23,7 @@ bool setPluginEnabled(bool enabled);
 // instances are always opt-in for the current session; plugin state bytes and
 // catalog identities remain intact for the user to re-enable explicitly.
 bool disableAllEffectsAtStartup();
+bool migrateDesiredEnabledIntent();
 bool loadChain(QJsonObject &chain, QString *error = nullptr);
 bool writeChain(const QJsonObject &chain);
 QJsonArray scopeEffects(const QJsonObject &chain, ScopeKind scope,
@@ -38,6 +40,7 @@ void setRuntimeTrackContext(const ScoreKey &score, const TrackKey &track,
                             int trackIndex, const QString &trackId);
 void clearRuntimeTrackContext();
 bool runtimeTrackContextAvailable();
+std::uint64_t runtimeSelectionGeneration();
 int runtimeTrackIndex();
 QString runtimeTrackId();
 struct HostTrackIdentity {

@@ -24,6 +24,8 @@
 - [P10 实现记录](docs/P10_IMPLEMENTATION.md)：P10 当前实现、验证证据和宿主受限项。
 - [P11 UI 性能计划](docs/P11_UI_PERFORMANCE_PLAN.md)：周期扫描、侧栏维护、诊断写盘与扫描轮询的去除/替换方案和验收门槛。
 - [P11 实现记录](docs/P11_IMPLEMENTATION.md)：P11 当前实现、验证证据和宿主受限项。
+- [P12 事件驱动切轨与按需运行时计划](docs/P12_EVENT_DRIVEN_LAZY_RUNTIME_PLAN.md)：曲谱生命周期、切轨 hook、按需实例化、warm-cache 和主界面启动性能。
+- [P12 实现记录](docs/P12_IMPLEMENTATION.md)：P12 当前实现、验证证据和宿主受限项。
 - [测试与验证](docs/TESTING.md)：构建、免安装宿主回归和常用测试命令。
 
 历史阶段记录和完整计划快照见 [docs/archive](docs/archive/README.md)。

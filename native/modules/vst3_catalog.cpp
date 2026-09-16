@@ -27,6 +27,7 @@
 #include <memory>
 #include <thread>
 #include <mutex>
+#include <condition_variable>
 
 namespace gpvst3::vst3 {
 namespace {
@@ -54,6 +55,79 @@ unsigned revision = 0, delivered = 0;
 int generation = 0;
 int recognitionWorkersStarted = 0;
 int recognitionWorkersDetached = 0;
+
+bool writeCacheFile(const QString &path, const QJsonObject &object) {
+    const QFileInfo info(path);
+    if (!QDir().mkpath(info.absolutePath())) return false;
+    QSaveFile file(path);
+    if (!file.open(QIODevice::WriteOnly)) return false;
+    const auto bytes = QJsonDocument(object).toJson(QJsonDocument::Compact);
+    return file.write(bytes) == bytes.size() && file.commit();
+}
+
+class CatalogCacheWriter final {
+public:
+    CatalogCacheWriter() = default;
+    ~CatalogCacheWriter() { stop(); }
+
+    void seed(const QString &path, const QJsonObject &object) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        path_ = path;
+        latest_ = object;
+    }
+
+    void submit(const QString &path, const QJsonObject &object) {
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            path_ = path;
+            latest_ = object;
+            pending_ = true;
+            if (!thread_.joinable()) thread_ = std::thread([this] { run(); });
+        }
+        condition_.notify_one();
+    }
+
+    QJsonObject snapshot() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return latest_;
+    }
+
+    void stop() noexcept {
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            stopping_ = true;
+        }
+        condition_.notify_one();
+        if (thread_.joinable()) thread_.join();
+    }
+
+private:
+    void run() noexcept {
+        for (;;) {
+            QString path;
+            QJsonObject object;
+            {
+                std::unique_lock<std::mutex> lock(mutex_);
+                condition_.wait(lock, [this] { return stopping_ || pending_; });
+                if (stopping_ && !pending_) return;
+                path = path_;
+                object = latest_;
+                pending_ = false;
+            }
+            writeCacheFile(path, object);
+        }
+    }
+
+    mutable std::mutex mutex_;
+    std::condition_variable condition_;
+    std::thread thread_;
+    QString path_;
+    QJsonObject latest_;
+    bool pending_ = false;
+    bool stopping_ = false;
+};
+
+CatalogCacheWriter cacheWriter;
 
 QString normalized(const QString &path) {
     const auto clean = QDir::fromNativeSeparators(path);
@@ -102,6 +176,7 @@ QJsonObject readCache(QString &status) {
         return {};
     }
     status = "hit";
+    cacheWriter.seed(cachePath(), object);
     return object;
 }
 
@@ -280,13 +355,16 @@ void publish(const State &state) {
 
 void persistRecognition(const QString &module, const State &identified) {
     const auto path = cachePath();
-    QFile file(path);
-    if (!file.open(QIODevice::ReadOnly)) return;
-    QJsonParseError parse{};
-    auto document = QJsonDocument::fromJson(file.readAll(), &parse);
-    file.close();
-    if (parse.error != QJsonParseError::NoError || !document.isObject()) return;
-    auto cache = document.object();
+    auto cache = cacheWriter.snapshot();
+    if (cache.isEmpty()) {
+        QFile file(path);
+        if (!file.open(QIODevice::ReadOnly)) return;
+        QJsonParseError parse{};
+        const auto document = QJsonDocument::fromJson(file.readAll(), &parse);
+        file.close();
+        if (parse.error != QJsonParseError::NoError || !document.isObject()) return;
+        cache = document.object();
+    }
     auto scopes = cache.value("scopes").toObject();
     std::vector<CatalogEntry> recognized = identified.catalog;
     if (recognized.empty()) {
@@ -323,11 +401,7 @@ void persistRecognition(const QString &module, const State &identified) {
         scopes.insert(scope.key(), scopeObject);
     }
     cache.insert("scopes", scopes);
-    QSaveFile output(path);
-    if (!output.open(QIODevice::WriteOnly)) return;
-    const auto bytes = QJsonDocument(cache).toJson();
-    if (output.write(bytes) != bytes.size()) return;
-    output.commit();
+    cacheWriter.submit(path, cache);
 }
 
 void startNextRecognition(bool hostSupported) {
@@ -360,13 +434,16 @@ void startNextRecognition(bool hostSupported) {
 
 void persistRecognitionTimeout(const QString &module, long long deadline, const char *reason) {
     const auto path = cachePath();
-    QFile file(path);
-    if (!file.open(QIODevice::ReadOnly)) return;
-    QJsonParseError parse{};
-    auto document = QJsonDocument::fromJson(file.readAll(), &parse);
-    file.close();
-    if (parse.error != QJsonParseError::NoError || !document.isObject()) return;
-    auto cache = document.object();
+    auto cache = cacheWriter.snapshot();
+    if (cache.isEmpty()) {
+        QFile file(path);
+        if (!file.open(QIODevice::ReadOnly)) return;
+        QJsonParseError parse{};
+        const auto document = QJsonDocument::fromJson(file.readAll(), &parse);
+        file.close();
+        if (parse.error != QJsonParseError::NoError || !document.isObject()) return;
+        cache = document.object();
+    }
     auto scopes = cache.value("scopes").toObject();
     for (auto scope = scopes.begin(); scope != scopes.end(); ++scope) {
         auto scopeObject = scope.value().toObject();
@@ -385,10 +462,7 @@ void persistRecognitionTimeout(const QString &module, long long deadline, const 
         scopes.insert(scope.key(), scopeObject);
     }
     cache.insert("scopes", scopes);
-    QSaveFile output(path);
-    if (!output.open(QIODevice::WriteOnly)) return;
-    const auto bytes = QJsonDocument(cache).toJson();
-    if (output.write(bytes) == bytes.size()) output.commit();
+    cacheWriter.submit(path, cache);
 }
 
 State scan(const QStringList &paths, QJsonObject cache, State result, bool retryTimedOut) {
@@ -499,6 +573,7 @@ State scan(const QStringList &paths, QJsonObject cache, State result, bool retry
         result.cacheStatus = "write_failed";
         result.errors.push_back("cache_write_failed");
     }
+    cacheWriter.seed(cachePath(), cache);
     result.scanPending = false;
     result.ready = true;
     result.status = result.errors.empty() ? "catalog_ready" : "partial_failure";
@@ -715,6 +790,7 @@ void shutdownScan() noexcept {
     // The worker can still publish a final progress snapshot; never join it
     // with scanMutex held. It exits before the next module and skips caching.
     if (worker.valid()) worker.wait();
+    cacheWriter.stop();
 }
 
 void setRecognitionControl(RecognitionControl control) noexcept {

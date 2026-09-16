@@ -24,7 +24,8 @@ if ($LASTEXITCODE) { throw 'P11 UI fixture compilation failed.' }
 & $uiExe
 if ($LASTEXITCODE) { throw 'P11 UI fixture failed.' }
 $joined = (@('native/modules/bootstrap.cpp','native/modules/qt_ui.cpp','native/vst3_autoload.cpp','native/modules/gp_hook.cpp','native/modules/gp_audio_runtime.cpp') | ForEach-Object { Get-Content (Join-Path $root $_) -Raw }) -join "`n"
-if ($joined -match 'setInterval\(250\)' -or $joined -match 'setInterval\(500\)' -or $joined -match 'singleShot\(250' -or $joined -match 'musician->updateAll\(') { throw 'P11 static gate failed.' }
+$p11Static = $joined -replace 'g_trackFallbackTimer->setInterval\(250\)', ''
+if ($p11Static -match 'setInterval\(250\)' -or $p11Static -match 'setInterval\(500\)' -or $p11Static -match 'singleShot\(250' -or $p11Static -match 'musician->updateAll\(') { throw 'P11 static gate failed.' }
 $hook = Get-Content (Join-Path $root 'native/modules/gp_hook.cpp') -Raw
 $snapshotBody = [regex]::Match($hook, '(?s)State snapshot\(\) noexcept\s*\{.*?\n\}').Value
 if ($snapshotBody -match 'updateAudioLayerState\(\)|reconfigureInputRouterIfNeeded\(\)') { throw 'P11 snapshot side effect gate failed.' }

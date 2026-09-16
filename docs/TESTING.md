@@ -75,6 +75,20 @@ P11 专项不使用 computer use；维护 writer、dirty 合并、scanner poll�
 
 P11 的静态门禁确认没有旧的 250/500 ms 维护路径、`musician->updateAll()` 或 `snapshot()` 音频副作用；真实宿主证据保留在 `artifacts/`，构建产物和宿主副本不提交。
 
+## P12 验证
+
+P12 使用生产 DLL 和 P7 Gain Fixture 验证按需运行时、selection/binding generation、无曲谱 metadata-only、stale scope 拒绝、原子旁路、warm-cache 上限及失败隔离：
+
+```powershell
+./native/build.ps1 -QtDir C:/path/to/Qt/5.15.x/msvc2019_64 -OutputRoot .tools/native/p12-build
+./native/test/build-p7-gain-fixture.ps1 -OutputRoot .tools/native/p12-gain-fixture
+./native/test/test-p12-lazy-startup.ps1 -PluginPath .tools/native/p12-build/plugins/imageformats/guitarpro_vst3_autoload.dll -OutputRoot .tools/native/p12-lazy-startup
+./native/test/test-p12.ps1 -QtDir C:/path/to/Qt/5.15.x/msvc2019_64 -PluginPath .tools/native/p12-build/plugins/imageformats/guitarpro_vst3_autoload.dll -Vst3Root 'C:/path/to/P7 Gain Fixture.vst3'
+./native/test/test-p8-runtime.ps1 -QtDir C:/path/to/Qt/5.15.x/msvc2019_64 -PluginPath .tools/native/p12-build/plugins/imageformats/guitarpro_vst3_autoload.dll -Vst3Root '.tools/native/p12-gain-fixture/P7 Gain Fixture.vst3' -OutputRoot .tools/native/p12-runtime
+```
+
+宿主回归仍需匹配 Guitar Pro 8.1.1.17、MCP bridge 和音频设备；未运行的真实 cursor hook 计数、ASIO/WASAPI 听感和长时 CPU A/B 不由夹具 PASS 代替。
+
 完整预加载与保留实例回归由 `test-p8-runtime.ps1` 覆盖。真实 UI 可用下面的入口验证三个插件逐一启停和输入监听默认关闭；`Vst3Module` 也支持与 `ClassId` 一一对应的多个模块路径。曲谱和 sidecar 写入测试副本，原始文件不变。
 
 ```powershell

@@ -22,10 +22,22 @@ QPointer<QTimer> g_scanTimer;
 QPointer<QTimer> g_trackFallbackTimer;
 QJsonObject g_scanStatus;
 std::atomic<bool> g_trackRefreshQueued{false};
+std::atomic<bool> g_stopping{false};
+int g_trackFallbackAttempts = 0;
+bool g_trackFallbackScoreOpen = false;
 
 void dispatchTrackRefresh();
 void ensureScanTimer();
+void publishCurrentTrackContext() noexcept {
+    gpvst3::gp_audio::Binding selected;
+    if (gpvst3::gp_audio::currentTrack(selected))
+        gpvst3::state::setRuntimeTrackContext(QString::fromStdString(selected.scoreKey),
+            QString::fromStdString(selected.trackKey), selected.trackIndex,
+            QString::fromStdString(selected.trackId));
+    else gpvst3::state::clearRuntimeTrackContext();
+}
 void scheduleTrackRefresh() noexcept {
+    if (g_stopping.load(std::memory_order_acquire)) return;
     auto *application = QCoreApplication::instance();
     if (!application) return;
     bool expected = false;
@@ -47,19 +59,54 @@ void notifyTrackContextComplete() noexcept {
 
 void dispatchTrackRefresh() {
     g_trackRefreshQueued.store(false, std::memory_order_release);
-    if (gpvst3::hook::editorCallbackActive()) {
+    if (g_stopping.load(std::memory_order_acquire)) return;
+    const bool scoreOpen = gpvst3::gp_audio::hasActiveDocument();
+    const bool topologyEvent = gpvst3::gp_audio::consumeTopologyDirty();
+    if (topologyEvent && QCoreApplication::instance()) {
+        // Guitar Pro applies Score mutations asynchronously after the public
+        // method returns. Give the host three bounded settling points so an
+        // inserted/removed track is collected after its Conductor update,
+        // while keeping the steady state fully event-driven.
+        for (const int delay : {50, 200, 500})
+            QTimer::singleShot(delay, QCoreApplication::instance(), [] {
+                gpvst3::gp_audio::markDirty();
+            });
+    }
+    if (g_trackFallbackTimer && scoreOpen &&
+        ((topologyEvent && !g_trackFallbackTimer->isActive()) || !g_trackFallbackScoreOpen)) {
+        g_trackFallbackAttempts = 0;
+        g_trackFallbackTimer->start();
+    }
+    g_trackFallbackScoreOpen = scoreOpen;
+    if (gpvst3::hook::editorCallbackActive() && !gpvst3::gp_audio::refreshNeeded()) {
         // An open editor must not trigger a full native graph walk, but the
         // MCP bridge can still provide the selected-track flags needed to
         // switch the track scope before opening the next editor.
         gpvst3::gp_audio::refreshSelectionContext();
+        publishCurrentTrackContext();
         gpvst3::ui::refreshVst3TrackContext();
         return;
     }
     gpvst3::gp_audio::refreshSelectionContext();
+    publishCurrentTrackContext();
+    // A Score mutation may complete without emitting a Qt lifecycle event.
+    // During the bounded settling window the check is a cheap pointer/lifetime
+    // comparison over the cached score. Steady-state cursor events skip it.
+    if (topologyEvent || (g_trackFallbackTimer && g_trackFallbackTimer->isActive()))
+        gpvst3::gp_audio::checkStructureChanged();
     gpvst3::hook::refreshTrackContext();
     if (gpvst3::hook::consumeSelectionStateChanges()) gpvst3::ui::reloadVst3Selections();
     gpvst3::ui::syncVst3Selection();
     gpvst3::ui::refreshVst3TrackContext();
+    // Project graph preparation is event-driven and score-scoped. Catalog
+    // completion alone must never instantiate every discovered module.
+    gpvst3::hook::preloadSavedSelections();
+    const bool scoreOpenAfterRefresh = gpvst3::gp_audio::hasActiveDocument();
+    if (g_trackFallbackTimer && scoreOpenAfterRefresh && !g_trackFallbackScoreOpen) {
+        g_trackFallbackAttempts = 0;
+        g_trackFallbackTimer->start();
+    }
+    g_trackFallbackScoreOpen = scoreOpenAfterRefresh;
 }
 
 void ensureScanTimer() {
@@ -268,6 +315,8 @@ QJsonObject hookStatus(const gpvst3::hook::State &value) {
         {"global_preloaded", value.globalPreloaded},
         {"input_preloaded", value.inputPreloaded},
         {"track_preloaded", static_cast<qint64>(value.trackPreloaded)},
+        {"warm_cache_limit", static_cast<qint64>(value.warmCacheLimit)},
+        {"warm_cache_evictions", static_cast<qint64>(value.warmCacheEvictions)},
         {"preload_completed", qint64(value.preloadCompleted)}, {"preload_failed", qint64(value.preloadFailed)},
         {"preload_error", QString::fromStdString(value.preloadError)}, {"instances", instances},
         {"runtime_process_count", static_cast<qint64>(value.runtimeProcessCount)},
@@ -281,6 +330,19 @@ QJsonObject hookStatus(const gpvst3::hook::State &value) {
         {"selection_prepared_nanoseconds", static_cast<qint64>(value.selectionPreparedNanoseconds)},
         {"selection_committed_nanoseconds", static_cast<qint64>(value.selectionCommittedNanoseconds)},
         {"selection_applied_generation", static_cast<qint64>(value.selectionAppliedGeneration)},
+        {"selection_generation", static_cast<qint64>(value.selectionGeneration)},
+        {"binding_generation", static_cast<qint64>(value.bindingGeneration)},
+        {"context_publish_latency_nanoseconds", static_cast<qint64>(value.contextPublishLatencyNanoseconds)},
+        {"dropped_refresh_count", static_cast<qint64>(value.droppedRefreshCount)},
+        {"score_open", value.scoreOpen},
+        {"selection_event_source", QString::fromStdString(value.selectionEventSource)},
+        {"selection_hook_installed", value.selectionHookInstalled},
+        {"selection_hook_gate_passed", value.selectionHookGatePassed},
+        {"topology_hook_installed", value.topologyHookInstalled},
+        {"topology_hook_gate_passed", value.topologyHookGatePassed},
+        {"topology_duplicate_calls", static_cast<qint64>(value.topologyDuplicateCalls)},
+        {"topology_swap_calls", static_cast<qint64>(value.topologySwapCalls)},
+        {"topology_event_count", static_cast<qint64>(value.topologyEventCount)},
         {"audio_generation", static_cast<qint64>(value.audioGeneration)},
         {"selection_status", QString::fromStdString(value.selectionStatus)},
         {"editor_stage", QString::fromStdString(value.editorStage)},
@@ -326,6 +388,10 @@ QJsonObject hookStatus(const gpvst3::hook::State &value) {
         {"global_chain_process_blocks", static_cast<qint64>(value.globalChainProcessBlocks)},
         {"track_chain_process_blocks", static_cast<qint64>(value.trackChainProcessBlocks)},
         {"track_chain_processed_blocks", static_cast<qint64>(value.trackChainProcessedBlocks)},
+        {"track_dispatch_misses", static_cast<qint64>(value.trackDispatchMisses)},
+        {"track_last_dsp_self", QString::number(static_cast<qulonglong>(value.trackLastDspSelf), 16)},
+        {"track_dispatch_self0", QString::number(static_cast<qulonglong>(value.trackDispatchSelf0), 16)},
+        {"track_dispatch_self1", QString::number(static_cast<qulonglong>(value.trackDispatchSelf1), 16)},
         {"track_bindings_published", static_cast<qint64>(value.trackBindingsPublished)},
         {"track_runtime_processed", value.trackRuntimeProcessed},
         {"track_runtime_write_observed", value.trackRuntimeWriteObserved},
@@ -406,10 +472,20 @@ QJsonObject hookStatus(const gpvst3::hook::State &value) {
 
 namespace gpvst3::bootstrap {
 
+void shutdown() noexcept {
+    g_stopping.store(true, std::memory_order_release);
+    if (g_scanTimer) g_scanTimer->stop();
+    if (g_trackFallbackTimer) g_trackFallbackTimer->stop();
+    gp_audio::setRefreshNotifier(nullptr);
+    hook::setSelectionNotifier(nullptr);
+    hook::setTrackContextNotifier(nullptr);
+}
+
 QJsonObject initialize() {
+    g_stopping.store(false, std::memory_order_release);
     const auto host = host::verify();
     const bool enabled = state::pluginEnabled();
-    if (enabled) state::disableAllEffectsAtStartup();
+    if (enabled) state::migrateDesiredEnabledIntent();
     if (enabled) {
         gpvst3::gp_audio::initialize();
         gpvst3::gp_audio::setRefreshNotifier(&scheduleTrackRefresh);
@@ -423,6 +499,7 @@ QJsonObject initialize() {
         ui::setVst3BusyControl(&hook::vst3SelectionPending);
         ui::setVst3TrackSelectionControl(&hook::setTrackVst3Selection);
         ui::setVst3TrackSelectionRequestControl(&hook::requestTrackVst3Selection);
+        ui::setVst3TrackGenerationRequestControl(&hook::requestTrackVst3SelectionAtGeneration);
         ui::setVst3StateControl(&hook::captureGlobalVst3States);
         ui::setVst3TrackControls(&hook::captureTrackVst3States, &hook::openTrackVst3Editor);
         ui::setVst3EditorControl(&hook::openVst3Editor, &hook::closeVst3Editors, &hook::scaleVst3Editor);
@@ -432,6 +509,7 @@ QJsonObject initialize() {
         ui::setVst3SelectionRequestControl(nullptr);
         ui::setVst3TrackSelectionControl(nullptr);
         ui::setVst3TrackSelectionRequestControl(nullptr);
+        ui::setVst3TrackGenerationRequestControl(nullptr);
         ui::setVst3StateControl(nullptr);
         ui::setVst3TrackControls(nullptr, nullptr);
         ui::setVst3EditorControl(nullptr, nullptr, nullptr);
@@ -448,16 +526,17 @@ QJsonObject initialize() {
         g_scanStatus.insert("vst3_catalog", vst3Catalog(vst3));
         ensureScanTimer();
         g_trackFallbackTimer = new QTimer(QCoreApplication::instance());
-        g_trackFallbackTimer->setInterval(2000);
+        // Rebuild settling is intentionally short and bounded. A 250 ms
+        // window catches Guitar Pro's asynchronous Conductor update without
+        // reintroducing a steady-state polling loop.
+        g_trackFallbackTimer->setInterval(250);
         QObject::connect(g_trackFallbackTimer, &QTimer::timeout, g_trackFallbackTimer, [] {
-            static int attempts = 0;
             const auto state = gpvst3::hook::snapshot();
-            if (!state.trackScopeUnresolved && attempts++ >= 5) {
-                // Keep a bounded low-frequency selection check for hosts that
-                // do not expose cursor changes as Qt lifecycle events.
-                if (attempts >= 30) { g_trackFallbackTimer->stop(); return; }
+            if (!gpvst3::gp_audio::hasActiveDocument() || g_trackFallbackAttempts >= 8) {
+                g_trackFallbackTimer->stop();
+                return;
             }
-            gpvst3::gp_audio::markSelectionDirty();
+            ++g_trackFallbackAttempts;
             // Some Guitar Pro builds expose cursor changes only through the
             // native score model. During the bounded settling window, one
             // full refresh every two seconds is the documented fallback.
@@ -466,6 +545,8 @@ QJsonObject initialize() {
             if (gpvst3::gp_audio::refreshIncomplete()) gpvst3::gp_audio::markDirty();
             scheduleTrackRefresh();
         });
+        g_trackFallbackAttempts = 0;
+        g_trackFallbackScoreOpen = gpvst3::gp_audio::hasActiveDocument();
         g_trackFallbackTimer->start();
     } else {
         vst3.status = "disabled_by_user";
@@ -476,7 +557,6 @@ QJsonObject initialize() {
     const auto catalog = vst3Catalog(vst3);
     if (enabled) {
         hook::setVst3Catalog(catalog);
-        hook::preloadSavedSelections();
         if (hook::consumeSelectionStateChanges()) ui::reloadVst3Selections();
     }
     ui::setVst3Catalog(catalog);
@@ -522,7 +602,6 @@ bool pollVst3(QJsonObject &status) {
     if (!vst3::poll(completed)) return false;
     const auto catalog = vst3Catalog(completed);
     hook::setVst3Catalog(catalog);
-    hook::preloadSavedSelections();
     if (hook::consumeSelectionStateChanges()) ui::reloadVst3Selections();
     ui::setVst3Catalog(catalog);
     scanFeedback(completed);

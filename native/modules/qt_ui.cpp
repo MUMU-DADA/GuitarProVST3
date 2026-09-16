@@ -56,6 +56,7 @@ bool (*g_vst3BusyControl)() noexcept = nullptr;
 QString g_pendingEditorKey;
 Vst3TrackSelectionControl g_vst3TrackSelectionControl = nullptr;
 Vst3TrackSelectionRequestControl g_vst3TrackSelectionRequestControl = nullptr;
+Vst3TrackGenerationRequestControl g_vst3TrackGenerationRequestControl = nullptr;
 Vst3StateControl g_vst3StateControl = nullptr;
 Vst3TrackStateControl g_vst3TrackStateControl = nullptr;
 Vst3TrackEditorControl g_vst3TrackEditorControl = nullptr;
@@ -708,7 +709,7 @@ public:
     void refreshCatalog() {
         saveRuntimeState();
         loadChain();
-        if (scope_ == state::ScopeKind::Global || contextReady_) restoreSelection();
+        if (!g_vst3TrackGenerationRequestControl && (scope_ == state::ScopeKind::Global || contextReady_)) restoreSelection();
     }
 
     void reloadSavedSelection() {
@@ -735,7 +736,7 @@ public:
         saveRuntimeState();
         if (scope_ == state::ScopeKind::Track) {
             loadChain();
-            if (contextReady_) restoreSelection();
+            if (contextReady_ && !g_vst3TrackGenerationRequestControl) restoreSelection();
         } else {
             bindTrackContext();
         }
@@ -808,6 +809,12 @@ private:
     }
 
     bool publishSelection() {
+        if (scope_ == state::ScopeKind::Track &&
+            selectionGeneration_ != state::runtimeSelectionGeneration()) {
+            setProperty("gpvst3SelectionState", "stale_scope");
+            QTimer::singleShot(0, this, [this] { loadChain(); });
+            return false;
+        }
         if (!g_vst3SelectionControl && !g_vst3TrackSelectionControl) return true; // isolated UI fixture
         std::vector<Vst3SelectionEntry> selection;
         for (const auto &value : effects_) {
@@ -825,7 +832,9 @@ private:
         const bool accepted = scope_ == state::ScopeKind::Global
             ? (g_vst3SelectionRequestControl ? g_vst3SelectionRequestControl(selection, &error)
                : (g_vst3SelectionControl ? g_vst3SelectionControl(selection, &error) : true))
-            : (g_vst3TrackSelectionRequestControl ? g_vst3TrackSelectionRequestControl(
+            : (g_vst3TrackGenerationRequestControl ? g_vst3TrackGenerationRequestControl(
+                  trackKey_.toStdString(), selectionGeneration_, selection, &error)
+               : g_vst3TrackSelectionRequestControl ? g_vst3TrackSelectionRequestControl(
                   trackKey_.toStdString(), selection, &error)
                : (g_vst3TrackSelectionControl ? g_vst3TrackSelectionControl(
                   trackKey_.toStdString(), selection, &error) : true));
@@ -857,6 +866,7 @@ private:
 
     void saveRuntimeState(bool capture = true) {
         if (scope_ == state::ScopeKind::Track && !contextReady_) return;
+        if (scope_ == state::ScopeKind::Track && !effectsScopeKey_.isEmpty() && effectsScopeKey_ != trackKey_) return;
         const auto runtimeStates = !capture ? std::vector<Vst3SelectionEntry>{} : scope_ == state::ScopeKind::Track
             ? (g_vst3TrackStateControl ? g_vst3TrackStateControl(trackKey_.toStdString()) : std::vector<Vst3SelectionEntry>{})
             : (g_vst3StateControl ? g_vst3StateControl() : std::vector<Vst3SelectionEntry>{});
@@ -910,6 +920,7 @@ private:
         if (!state::loadChain(sidecar_, &error))
             status_->setText(QStringLiteral("状态恢复失败：%1").arg(error));
         auto saved = state::scopeEffects(sidecar_, scope_, scoreKey_, trackKey_);
+        effectsScopeKey_ = scope_ == state::ScopeKind::Track ? trackKey_ : QStringLiteral("global");
         QHash<QString, int> savedRows;
         for (int index = 0; index < saved.size(); ++index) {
             const auto effect = saved.at(index).toObject();
@@ -997,7 +1008,9 @@ private:
         const auto rowHeight = qMax(32, qRound(32 * devicePixelRatioF()));
         list_->setFixedHeight(qMin(150, qMax(1, list_->count()) * rowHeight + 4));
         availableList_->setFixedHeight(qMin(120, qMax(1, availableList_->count()) * rowHeight + 4));
-        state::setScopeEffects(sidecar_, scope_, effects_, scoreKey_, trackKey_, trackIndex_);
+        // Scope loading is read-only. Writing this in-memory list here can
+        // copy the previous selected track onto a newly inserted track while
+        // Guitar Pro is still applying its asynchronous Score mutation.
         scanFeedback();
     }
 
@@ -1113,6 +1126,10 @@ private:
     }
 
     void openEditor(int index) {
+        if (scope_ == state::ScopeKind::Track && selectionGeneration_ != state::runtimeSelectionGeneration()) {
+            loadChain();
+            return;
+        }
         const auto effect = effects_.at(index).toObject();
         if (!effect.value("enabled").toBool()) {
             status_->setText(QStringLiteral("请先勾选启用插件，再打开其 GUI。"));
@@ -1215,7 +1232,9 @@ private:
     const state::ScopeKind scope_;
     bool selectionDirty_ = false;
     QString scoreKey_, trackKey_;
+    QString effectsScopeKey_;
     int trackIndex_ = -1;
+    std::uint64_t selectionGeneration_ = 0;
     bool contextReady_ = false;
 
     void bindTrackContext() {
@@ -1224,9 +1243,19 @@ private:
         trackKey_ = state::currentTrackKey();
         trackIndex_ = configuredTrackIndex();
         contextReady_ = trackContextAvailable();
+        selectionGeneration_ = state::runtimeSelectionGeneration();
         if (scope_ == state::ScopeKind::Track && previousTrackKey != trackKey_ &&
-            !previousTrackKey.isEmpty() && g_pendingEditorKey.startsWith(previousTrackKey + '\n'))
-            g_pendingEditorKey.clear();
+            !previousTrackKey.isEmpty()) {
+            if (g_pendingEditorKey.startsWith(previousTrackKey + '\n')) g_pendingEditorKey.clear();
+            // The host bridge may ask for the next inspector while the old
+            // editor is still visible. Close it synchronously on Qt so a
+            // subsequent gp_objects query cannot select the stale scope.
+            if (g_editorWindow && g_editorWindow->openedKey.startsWith(previousTrackKey + '\n')) {
+                g_editorWindow->close();
+                g_editorWindow->openedKey.clear();
+            }
+            if (g_vst3EditorCloseControl) g_vst3EditorCloseControl();
+        }
     }
 };
 
@@ -1527,7 +1556,13 @@ void syncVst3Selection() {
 }
 
 void refreshVst3TrackContext() {
+    if (!g_p7Panel && state::runtimeTrackContextAvailable() && g_panelAttach)
+        g_panelAttach();
     if (g_p7Panel) g_p7Panel->refreshTrackContext();
+}
+
+void setVst3TrackGenerationRequestControl(Vst3TrackGenerationRequestControl control) noexcept {
+    g_vst3TrackGenerationRequestControl = control;
 }
 
 void reloadVst3Selections() {
@@ -1561,8 +1596,14 @@ void showEffectChainPanel(bool show) {
     }
     const auto attachPanel = [timer] {
         ensureAboutEntry();
+        const bool scoreOpen = state::runtimeTrackContextAvailable() ||
+            (!qEnvironmentVariable("GPVST3_SCORE_PATH").isEmpty() &&
+             !qEnvironmentVariable("GPVST3_TRACK").isEmpty());
         QWidget *panel = qApp->property("gpvst3P5Panel").value<QWidget *>();
-        if (!panel) {
+        // Keep the track selector out of the host UI until a verified score
+        // context exists. Catalog scanning and the About entry remain usable
+        // while the main window is on its no-document page.
+        if (!panel && (!g_panelUsesP7 || scoreOpen)) {
             panel = g_panelUsesP7 ? static_cast<QWidget *>(new P7Panel)
                                   : static_cast<QWidget *>(new ChainPanel);
             qApp->setProperty("gpvst3P5Panel", QVariant::fromValue(panel));
@@ -1571,7 +1612,7 @@ void showEffectChainPanel(bool show) {
             });
         }
         const bool useP7Panel = g_panelUsesP7;
-        if (useP7Panel && !g_globalPanel) {
+        if (useP7Panel && scoreOpen && !g_globalPanel) {
             auto *global = new P7Panel(state::ScopeKind::Global);
             qApp->setProperty("gpvst3GlobalPanel", QVariant::fromValue(static_cast<QWidget *>(global)));
             QObject::connect(global, &QObject::destroyed, qApp, [] {
@@ -1626,7 +1667,7 @@ void showEffectChainPanel(bool show) {
                 content->setVisible(expanded);
                 section->show();
             };
-            mount(panel, trackSection, g_trackExpanded);
+            mount(panel, scoreOpen ? trackSection : nullptr, g_trackExpanded);
             mount(g_globalPanel, globalSection, g_globalExpanded);
         }
         bool dockReady = timer->property("dockReady").toBool();
