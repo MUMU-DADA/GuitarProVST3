@@ -106,8 +106,18 @@ bool trackEditor(const std::string &track, const gpvst3::ui::Vst3SelectionEntry 
 }
 std::unique_ptr<QWidget> host() {
     auto result = std::make_unique<QWidget>();
-    result->setObjectName("soundsContainer");
+    // Mirror the real GP hierarchy: soundsContainer is a host-owned native
+    // soft-source slot inside SoundRack.  The VST3 entry must be mounted on
+    // the rack so adding it cannot replace the slot's native child.
+    result->setObjectName("soundRack");
     auto *layout = new QVBoxLayout(result.get());
+    auto *nativeContainer = new QWidget(result.get());
+    nativeContainer->setObjectName("soundsContainer");
+    auto *nativeLayout = new QVBoxLayout(nativeContainer);
+    auto *nativeSource = new QLabel(QStringLiteral("Native soft source"), nativeContainer);
+    nativeSource->setObjectName("nativeSoftSource");
+    nativeLayout->addWidget(nativeSource);
+    layout->addWidget(nativeContainer);
     for (const auto &name : {"gpNativeInstrumentEffects", "gpMasterPostProcessing"}) {
         auto *anchor = new QLabel(name, result.get());
         anchor->setObjectName(name);
@@ -157,9 +167,14 @@ int main(int argc, char **argv) {
     auto *global = soundHost->findChild<QListWidget *>("gpvst3GlobalChainList");
     auto *trackSection = soundHost->findChild<QWidget *>("gpvst3TrackVst3Section");
     auto *globalSection = soundHost->findChild<QWidget *>("gpvst3GlobalVst3Section");
+    auto *nativeSource = soundHost->findChild<QLabel *>("nativeSoftSource");
+    auto *entry = soundHost->findChild<QPushButton *>("gpvst3SoundEffectChainButton");
     if (!check(track && global && trackSection && globalSection && trackSection->isAncestorOf(track) &&
                globalSection->isAncestorOf(global) && track->isVisible() && global->isVisible(),
                "actual lists are visible inside their separate native sections")) return 1;
+    if (!check(nativeSource && entry && nativeSource->parentWidget()->objectName() == "soundsContainer" &&
+               entry->parentWidget() == soundHost.get(),
+               "native soft-source slot remains intact while the VST3 entry is mounted on SoundRack")) return 1;
     auto *layout = soundHost->layout();
     if (!check(layout->indexOf(trackSection) == layout->indexOf(soundHost->findChild<QWidget *>("gpNativeInstrumentEffects")) + 1 &&
                layout->indexOf(globalSection) == layout->indexOf(soundHost->findChild<QWidget *>("gpMasterPostProcessing")) + 1 &&

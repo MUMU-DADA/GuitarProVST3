@@ -449,7 +449,7 @@ QDialog *aboutDialog() {
     title->setFont(titleFont);
     layout->addWidget(title);
     auto *details = new QLabel(
-        QStringLiteral("版本：0.9.17\n"
+        QStringLiteral("版本：0.9.18\n"
                        "已验证宿主：Guitar Pro 8.1.1.17（Windows x64）\n"
                        "许可证：MIT License\n"
                        "第三方声明：VST3 SDK 及插件各自遵循其许可证。\n"
@@ -1532,7 +1532,22 @@ QWidget *findSoundHost() {
             break;
         }
     }
-    if (named) return named;
+    if (named) {
+        // `soundsContainer` is the host-owned slot that GP repopulates with
+        // the current RSE/MIDI soft-source controls.  Adding our button to
+        // that layout makes GP treat the foreign child as the slot content
+        // during a track rebuild, which hides the native source UI.  Mount
+        // the entry on the surrounding SoundRack instead; the rack keeps
+        // the native slot intact and remains in the same sidebar section.
+        for (QWidget *parent = named->parentWidget(); parent;
+             parent = parent->parentWidget()) {
+            if (parent->objectName() == QStringLiteral("soundRack") && parent->layout())
+                return parent;
+        }
+        // Keep the lightweight/offscreen host fixtures and older GP builds
+        // working when soundsContainer is itself the only exposed host.
+        return named;
+    }
 
     // Some GP builds do not keep the old objectName. The visible RSE/MIDI
     // controls are more stable and identify the same audio section.
