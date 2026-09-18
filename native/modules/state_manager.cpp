@@ -600,8 +600,13 @@ bool reconcileTrackIdentities(std::vector<HostTrackIdentity> &bindings) {
             const auto scoreKey = first->scoreKey;
             if (!session.score.isEmpty() && session.score != scoreKey) {
                 // Save As keeps the live identity and copies state to the new
-                // score. The previous saved file retains its own record.
-                scores.insert(scoreKey, scores.value(session.score));
+                // file. gp_new, however, can reuse the same IDocument while
+                // changing its score key to a transient UUID; that is a new
+                // score and must start with no track plug-in intent. Copying
+                // the old record there made a fresh score appear enabled
+                // before the user selected anything.
+                const bool transientScore = !QUuid(scoreKey).isNull();
+                if (!transientScore) scores.insert(scoreKey, scores.value(session.score));
             }
             session.score = scoreKey;
             auto score = scores.value(scoreKey).toObject();

@@ -96,6 +96,24 @@ int main(int argc, char **argv) {
                gpvst3::state::scopeEffects(chain, ScopeKind::Track, {}, bindings[2].runtimeKey).first().toObject().value("class_id") == "T1",
                "reopen restores every track by the last saved index mapping")) return 1;
 
+    // gp_new may reuse an IDocument object while replacing its persisted score
+    // key with a transient UUID. That transition is a new score, so the old
+    // score's enabled track effect must not be copied into it.
+    gpvst3::state::resetTrackIdentities();
+    std::vector<HostTrackIdentity> transient{{"document-new", "C:/scores/p8.gp", "native-new", 0}};
+    if (!check(gpvst3::state::reconcileTrackIdentities(transient), "bind score before gp_new")) return 1;
+    const auto transientKey = transient.front().runtimeKey;
+    gpvst3::state::loadChain(chain);
+    gpvst3::state::setScopeEffects(chain, ScopeKind::Track, track1, "C:/scores/p8.gp", transientKey, 0);
+    if (!check(gpvst3::state::writeChain(chain), "write old score state before gp_new")) return 1;
+    if (!check(!gpvst3::state::scopeEffects(chain, ScopeKind::Track, {}, transientKey).isEmpty(),
+               "old score has configured track state before gp_new")) return 1;
+    transient.front().scoreKey = "d51d43c4-caac-44ba-8fae-8006dc84ed71";
+    if (!check(gpvst3::state::reconcileTrackIdentities(transient), "rebind transient new score")) return 1;
+    gpvst3::state::loadChain(chain);
+    if (!check(gpvst3::state::scopeEffects(chain, ScopeKind::Track, {}, transientKey).isEmpty(),
+               "new transient score does not inherit old track effect")) return 1;
+
     // Unconfigured topology must remain in memory only. Repeated document
     // discovery must not create one empty JSON record per score/track.
     const auto bounded = dir.path() + "/bounded";

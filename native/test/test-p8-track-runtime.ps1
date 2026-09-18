@@ -5,6 +5,7 @@ param(
     [string]$Vst3Root = 'ParametricOD.vst3;Gateway.vst3',
     [switch]$CheckGain,
     [switch]$CheckLifecycle,
+    [switch]$CheckTrackSelection,
     [switch]$CheckP12,
     [string]$ExpectedBindingSource = '',
     [ValidateSet('enabled', 'default')]
@@ -15,6 +16,9 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+if ($CheckTrackSelection -and ($CheckGain -or $CheckLifecycle -or $CheckP12)) {
+    throw '-CheckTrackSelection is a separate track-only check; do not combine it with gain/lifecycle/P12 modes.'
+}
 if ($CheckLifecycle) { $CheckGain = $true }
 if ($CheckP12) { $CheckGain = $true }
 $root = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
@@ -51,23 +55,29 @@ function Wait-Operation([string]$request, [string]$expected) {
 function Wait-Track([int]$index) {
     $cursor = Invoke-McpTool $session gp_cursor @{document=$document;axis='track';index=$index}
     $deadline = [DateTime]::UtcNow.AddSeconds(12)
+    $expectedDocumentPrefix = [string]$document + '#'
+    $observation = $null
     do {
         Start-Sleep -Milliseconds 250
         $state = Invoke-McpTool $session gp_audio_abi @{document=$document;operation='state'}
         $selected = @($state.tracks | Where-Object track_index -eq $index)
         $context = Invoke-McpTool $session gp_objects @{query='gpvst3TrackContext';limit=10}
         $label = @($context.objects | Where-Object parent_name -eq 'gpvst3P7Panel')[0]
-        if ($selected.Count -gt 0 -and $label -and $label.properties.text -and $label.properties.text.EndsWith("Track $index")) { return $state }
+        try { $observation = Get-Observation } catch { $observation = $null }
+        $runtimeContextKey = if ($observation) { [string]$observation.gp_hook.track_context_key } else { '' }
+        $contextMatchesDocument = $runtimeContextKey.StartsWith($expectedDocumentPrefix, [StringComparison]::OrdinalIgnoreCase)
+        if ($selected.Count -gt 0 -and $label -and $label.properties.text -and
+            $label.properties.text.EndsWith("Track $index") -and $contextMatchesDocument) { return $state }
     } while ([DateTime]::UtcNow -lt $deadline)
-    throw "Track $index did not become observable: $(Json $state)"
+    throw "Track $index did not become observable: $(Json @{mapping=$state;cursor=$cursor;contexts=$context;observation=$observation;expected_document=$document})"
 }
 function Get-Observation() {
     $path = Join-Path $dataDirectory 'p2-observation.json'
     if (-not (Test-Path -LiteralPath $path)) { throw 'P8 realtime observation was not written.' }
     Get-Content -LiteralPath $path -Raw | ConvertFrom-Json
 }
-function Wait-Observation([scriptblock]$Predicate, [string]$label = 'observation') {
-    $deadline = [DateTime]::UtcNow.AddSeconds(8); $observation = $null
+function Wait-Observation([scriptblock]$Predicate, [string]$label = 'observation', [int]$TimeoutSeconds = 8) {
+    $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds); $observation = $null
     do {
         $observation = Get-Observation
         if (& $Predicate $observation) { return $observation }
@@ -121,14 +131,7 @@ function Assert-NativeLayout() {
     $result.native_layout = $layouts
 }
 function Set-TrackEffect([int]$index, $candidate) {
-    Wait-Track $index | Out-Null
-    $panelEntry = Invoke-McpTool $session gp_objects @{query='gpvst3SoundEffectChainButton';limit=10}
-    if (@($panelEntry.objects).Count -eq 0) { throw 'VST3 sound-section entry was not found.' }
-    Invoke-McpTool $session gp_trigger @{snapshot=$panelEntry.snapshot;id=@($panelEntry.objects)[0].id} | Out-Null
-    $panelQuery = Invoke-McpTool $session gp_objects @{query='gpvst3P7Panel';limit=10}
-    $panel = @($panelQuery.objects | Where-Object object_name -eq 'gpvst3P7Panel')[0]
-    if (-not $panel -or $panel.parent_name -ne 'gpvst3TrackVst3Section') { throw 'Track content is not mounted in its native section.' }
-    Start-Sleep -Milliseconds 250
+    Open-TrackSelector $index
     $query = Invoke-McpTool $session gp_objects @{query=('gpvst3Enabled_' + $candidate.class_id);limit=20}
     $checkbox = @($query.objects | Where-Object { $_.object_name -eq ('gpvst3Enabled_' + $candidate.class_id) })[0]
     if (-not $checkbox) { throw "Track $index checkbox was not found for $($candidate.class_id)." }
@@ -154,6 +157,219 @@ function Assert-NativeEffects() {
     $after = Invoke-McpTool $session gp_audio_track @{document=$document;track=0;operation='state'}
     if ((Json $before.sounds) -ne (Json $after.sounds)) { throw 'Native chain changed after restoring its bypass and parameter.' }
     $result.native_effect_operations = @{before=$before;bypass=$bypass;edited=$edited;after=$after}
+}
+
+# The runtime evidence table is keyed by the plugin's track key.  Keep the
+# selection assertions on that table instead of inferring activation from the
+# sidecar or from a Qt checkbox: a saved `enabled` bit is only user intent and
+# must not be treated as a live processor until the worker has committed a
+# slot.
+function Get-TrackRuntimeEvidence([int]$index, $observation = $null) {
+    if (-not $observation) { $observation = Get-Observation }
+    $trackKey = [string]$runtimeTrackKeys[$index]
+    $evidence = @($observation.gp_hook.track_runtime_evidence |
+        Where-Object { [string]$_.track_key -eq $trackKey })[0]
+    if (-not $evidence) {
+        throw "Track $index has no native runtime evidence for track_key=${trackKey}: $(Json $observation.gp_hook)"
+    }
+    $evidence
+}
+function Wait-TrackRuntimeEvidence([int]$index, [scriptblock]$RuntimePredicate,
+                                    [string]$label = 'track runtime evidence') {
+    Wait-Observation {
+        param($observation)
+        $evidence = Get-TrackRuntimeEvidence $index $observation
+        & $RuntimePredicate $evidence $observation
+    } $label
+}
+function Get-TrackActiveInstances([int]$index, $observation = $null) {
+    if (-not $observation) { $observation = Get-Observation }
+    $evidence = Get-TrackRuntimeEvidence $index $observation
+    @($observation.gp_hook.instances | Where-Object {
+        $_.scope -eq 'track' -and $_.track_key -eq $evidence.track_key -and $_.active
+    })
+}
+function Set-TrackCheckbox([int]$index, $candidate, [bool]$enabled) {
+    Wait-Track $index | Out-Null
+    $name = 'gpvst3Enabled_' + $candidate.class_id
+    $deadline = [DateTime]::UtcNow.AddSeconds(12)
+    $last = $null
+    do {
+        $query = Invoke-McpTool $session gp_objects @{query=$name;limit=20}
+        $last = @($query.objects | Where-Object object_name -eq $name)[0]
+        $properties = if ($last) { $last.properties } else { $null }
+        $available = if ($properties -and $null -ne $properties.enabled) {
+            [bool]$properties.enabled
+        } elseif ($last -and $null -ne $last.enabled) {
+            [bool]$last.enabled
+        } else { $false }
+        $checked = if ($properties -and $null -ne $properties.checked) {
+            [bool]$properties.checked
+        } elseif ($last -and $null -ne $last.checked) {
+            [bool]$last.checked
+        } else { $false }
+        if ($last -and -not $available) {
+            throw "Track $index checkbox is disabled: $(Json $last)"
+        }
+        if ($last -and $checked -eq $enabled) { return $last }
+        if ($last) {
+            Invoke-McpTool $session gp_set_property @{snapshot=$query.snapshot;id=$last.id;
+                property='checked';value=$enabled} | Out-Null
+        }
+        Start-Sleep -Milliseconds 120
+    } while ([DateTime]::UtcNow -lt $deadline)
+    throw "Track $index checkbox did not settle to checked=$enabled ($name): $(Json $last)"
+}
+function Open-TrackSelector([int]$index) {
+    Wait-Track $index | Out-Null
+    $panelEntry = Invoke-McpTool $session gp_objects @{query='gpvst3SoundEffectChainButton';limit=10}
+    if (@($panelEntry.objects).Count -eq 0) { throw 'VST3 sound-section entry was not found.' }
+    Invoke-McpTool $session gp_trigger @{snapshot=$panelEntry.snapshot;id=@($panelEntry.objects)[0].id} | Out-Null
+    $panelQuery = Invoke-McpTool $session gp_objects @{query='gpvst3P7Panel';limit=10}
+    $panel = @($panelQuery.objects | Where-Object object_name -eq 'gpvst3P7Panel')[0]
+    if (-not $panel -or $panel.parent_name -ne 'gpvst3TrackVst3Section') { throw 'Track content is not mounted in its native section.' }
+    Start-Sleep -Milliseconds 250
+}
+function Assert-TrackSelectionBaseline([int]$index) {
+    Open-TrackSelector $index
+    $observation = Get-Observation
+    $activeTrackInstances = @($observation.gp_hook.instances | Where-Object {
+        $_.scope -eq 'track' -and $_.active
+    })
+    if ($activeTrackInstances.Count) {
+        throw "New score has active track instances before the first selection request: $(Json $activeTrackInstances)"
+    }
+    $query = Invoke-McpTool $session gp_objects @{query='gpvst3Enabled_';limit=500}
+    $checkboxes = @($query.objects | Where-Object { $_.object_name -like 'gpvst3Enabled_*' })
+    if (-not $checkboxes.Count) { throw "Track selection baseline has no checkboxes: $(Json $query)" }
+    $checked = @($checkboxes | Where-Object {
+        $properties = $_.properties
+        if ($properties -and $null -ne $properties.checked) { [bool]$properties.checked }
+        elseif ($null -ne $_.checked) { [bool]$_.checked }
+        else { $false }
+    })
+    if ($checked.Count) {
+        throw "Track selection baseline contains checked rows before the first request: $(Json $checked)"
+    }
+    $result.track_selection_baseline = [ordered]@{
+        document = $document
+        track_index = $index
+        track_context_key = $observation.gp_hook.track_context_key
+        active_track_instances = $activeTrackInstances
+        checkboxes = $checkboxes
+    }
+}
+function Get-SavedTrackEffects([int]$index) {
+    $path = Join-Path $dataDirectory 'effect-chain.json'
+    if (-not (Test-Path -LiteralPath $path)) { return @() }
+    $chain = Get-Content -LiteralPath $path -Raw | ConvertFrom-Json
+    $effects = @()
+    foreach ($score in $chain.scores.PSObject.Properties) {
+        if ([IO.Path]::GetFullPath($score.Name) -ine [IO.Path]::GetFullPath($fixturePath)) { continue }
+        foreach ($track in $score.Value.tracks.PSObject.Properties) {
+            if ([int]$track.Value.track_index -eq $index) { $effects += @($track.Value.effects) }
+        }
+    }
+    $effects
+}
+function Assert-TrackSelectionLifecycle() {
+    if ($candidates.Count -lt 2) {
+        throw "-CheckTrackSelection requires at least two identified classes in Vst3Root; found $($candidates.Count)."
+    }
+    $trackIndex = 0
+    $first = $candidates[0]
+    $second = $candidates[1]
+    # MCP and the plugin allocate independent native track IDs.  We enabled A
+    # only on Track 0 above, so its unique active instance supplies the runtime
+    # key without assuming those two registries share IDs.
+    $initialInstances = @((Get-Observation).gp_hook.instances | Where-Object {
+        $_.scope -eq 'track' -and $_.active -and $_.class_id -eq $first.class_id
+    })
+    if ($initialInstances.Count -ne 1) { throw "Track A has no unique active instance: $(Json $initialInstances)" }
+    $runtimeTrackKeys = @{$trackIndex=$initialInstances[0].track_key}
+    $initial = Wait-TrackRuntimeEvidence $trackIndex {
+        param($evidence, $observation)
+        $active = @(Get-TrackActiveInstances $trackIndex $observation)
+        $evidence.configured_effects -eq 1 -and $evidence.processed -and
+            @($active | Where-Object class_id -eq $first.class_id).Count -eq 1
+    } 'track A active runtime slot'
+    $initialActive = @(Get-TrackActiveInstances $trackIndex $initial)
+    $beforeBypass = [int64](Get-TrackRuntimeEvidence $trackIndex $initial).bypass_blocks
+    $beforeSelectionRequest = [int64]$initial.gp_hook.selection_request_id
+
+    # A -> empty must retire the real slot.  A checked sidecar row or a stale
+    # checkbox is not accepted as evidence; count=0 plus observed bypass blocks
+    # proves that the audio callback is bypassing this track after cancellation.
+    Set-TrackCheckbox $trackIndex $first $false | Out-Null
+    $off = Wait-TrackRuntimeEvidence $trackIndex {
+        param($evidence, $observation)
+        @((Get-TrackActiveInstances $trackIndex $observation)).Count -eq 0 -and
+            [int]$evidence.configured_effects -eq 0 -and
+            -not $evidence.configured -and
+            [int64]$evidence.bypass_blocks -gt $beforeBypass
+    } 'track A disabled and bypassed'
+    $offEvidence = Get-TrackRuntimeEvidence $trackIndex $off
+    $offSettled = Wait-TrackRuntimeEvidence $trackIndex {
+        param($evidence, $observation)
+        [int64]$evidence.bypass_blocks -gt ([int64]$offEvidence.bypass_blocks + 4)
+    } 'track A remains bypassed during playback'
+    if ((Get-TrackRuntimeEvidence $trackIndex $offSettled).processed_blocks -ne $offEvidence.processed_blocks) {
+        throw 'Track A continued processing after its runtime slot was disabled.'
+    }
+    $savedOff = @(Get-SavedTrackEffects $trackIndex |
+        Where-Object { $_.class_id -eq $first.class_id })[0]
+    if ($savedOff -and $savedOff.enabled) {
+        throw "Disabling track A left enabled sidecar intent: $(Json $savedOff)"
+    }
+
+    # The same track must accept a different class after A has retired.  This
+    # catches the stale pending-selection bug where B was rejected forever.
+    Set-TrackCheckbox $trackIndex $second $true | Out-Null
+    $on = Wait-TrackRuntimeEvidence $trackIndex {
+        param($evidence, $observation)
+        $active = @(Get-TrackActiveInstances $trackIndex $observation)
+        $evidence.configured_effects -eq 1 -and $evidence.processed -and
+            @($active | Where-Object { $_.class_id -eq $second.class_id -and $_.processed_blocks -gt 0 }).Count -eq 1 -and
+            @($active | Where-Object class_id -eq $first.class_id).Count -eq 0
+    } 'track B active after A cancellation'
+    $onProcessedBlocks = [int64](Get-TrackRuntimeEvidence $trackIndex $on).processed_blocks
+    $onInstance = @(Get-TrackActiveInstances $trackIndex $on | Where-Object class_id -eq $second.class_id)[0]
+    $onInstanceProcessedBlocks = [int64]$onInstance.processed_blocks
+    $onSettled = Wait-TrackRuntimeEvidence $trackIndex {
+        param($evidence, $observation)
+        $active = @(Get-TrackActiveInstances $trackIndex $observation)
+        [int64]$evidence.processed_blocks -gt $onProcessedBlocks -and
+            @($active | Where-Object {
+                $_.class_id -eq $second.class_id -and
+                $_.instance_id -eq $onInstance.instance_id -and
+                [int64]$_.processed_blocks -gt $onInstanceProcessedBlocks
+            }).Count -eq 1 -and
+            @($active | Where-Object class_id -eq $first.class_id).Count -eq 0
+    } 'track B continues processing after activation'
+    $savedOn = @(Get-SavedTrackEffects $trackIndex |
+        Where-Object { $_.class_id -eq $second.class_id })[0]
+    if (-not $savedOn -or -not $savedOn.enabled) {
+        throw "Enabling track B did not persist its user intent: $(Json $savedOn)"
+    }
+    $result.track_selection = [ordered]@{
+        track_index = $trackIndex
+        first_class_id = $first.class_id
+        second_class_id = $second.class_id
+        selection_request_id_before = $beforeSelectionRequest
+        selection_request_id_after = [int64]$on.gp_hook.selection_request_id
+        initial_active = $initialActive
+        disabled = Get-TrackRuntimeEvidence $trackIndex $off
+        disabled_playback = Get-TrackRuntimeEvidence $trackIndex $offSettled
+        enabled = Get-TrackRuntimeEvidence $trackIndex $on
+        enabled_playback = Get-TrackRuntimeEvidence $trackIndex $onSettled
+        enabled_processed_blocks_before_growth = $onProcessedBlocks
+        enabled_processed_blocks_after_growth = [int64](Get-TrackRuntimeEvidence $trackIndex $onSettled).processed_blocks
+        enabled_instance_before_growth = $onInstance
+        enabled_instances_after_growth = @(Get-TrackActiveInstances $trackIndex $onSettled)
+    }
+    if ([int64]$on.gp_hook.selection_request_id -le $beforeSelectionRequest) {
+        throw "Track B did not enqueue a new selection request: $(Json $result.track_selection)"
+    }
 }
 
 try {
@@ -222,8 +438,19 @@ try {
     $vst3Paths = @($environment.GPVST3_VST3_ROOT -split ';')
     $candidates = @()
     foreach ($path in $vst3Paths) {
-        $candidate = @($startup.vst3_catalog | Where-Object { [IO.Path]::GetFullPath($_.module) -ieq [IO.Path]::GetFullPath($path) })[0]
+        $matching = @($startup.vst3_catalog | Where-Object {
+            [IO.Path]::GetFullPath($_.module) -ieq [IO.Path]::GetFullPath($path)
+        })
+        $candidate = $matching[0]
         if (-not $candidate) { throw "P8 static candidate missing: $path" }
+        # A module may expose several VST3 classes (the P8 order fixture does
+        # exactly that).  The normal two-track test keeps its historical
+        # single candidate per module; the explicit selection check needs two
+        # distinct class IDs so it can exercise A -> empty -> B on one track.
+        if ($CheckTrackSelection -and @($matching | Where-Object class_id).Count -gt 1) {
+            $candidates += @($matching | Where-Object class_id)
+            continue
+        }
         if (-not $candidate.class_id) {
             $sha = [Security.Cryptography.SHA256]::Create(); try { $token = ([BitConverter]::ToString($sha.ComputeHash([Text.Encoding]::UTF8.GetBytes($candidate.module)))).Replace('-','').ToLower().Substring(0,16) } finally { $sha.Dispose() }
             $identify = Invoke-McpTool $session gp_objects @{query=('gpvst3Identify_' + $token);limit=10}
@@ -238,9 +465,20 @@ try {
         $candidates += $candidate
     }
     $result.candidates = $candidates
+    if ($CheckTrackSelection -and @($candidates.class_id | Sort-Object -Unique).Count -lt 2) {
+        throw '-CheckTrackSelection needs two distinct class IDs; use the P8 Order Fixture or two modules.'
+    }
     $result.native_audio_before = @(0,1 | ForEach-Object { Invoke-McpTool $session gp_audio_track @{document=$document;track=$_;operation='state'} })
+    # Always verify the newly opened score starts with no live track effect,
+    # including when the process received a sidecar from another score.  A
+    # saved enabled bit is scoped by score/track identity and must not become
+    # an active processor merely because the catalog contains the same class.
+    if ($CheckTrackSelection) { Assert-TrackSelectionBaseline 0 }
     Set-TrackEffect 0 $candidates[0] | Out-Null
-    Set-TrackEffect 1 $candidates[$candidates.Count - 1] | Out-Null
+    $trackOneCandidate = if ($CheckTrackSelection -and $candidates.Count -gt 1) {
+        $candidates[1]
+    } else { $candidates[$candidates.Count - 1] }
+    Set-TrackEffect 1 $trackOneCandidate | Out-Null
     if ($CheckGain) { $result.untitled_instances = @(Read-Gain 0; Read-Gain 1) }
     $save = Invoke-McpTool $session gp_save_as @{document=$document;path=$fixturePath}
     Wait-Operation $save.request 'saved' | Out-Null
@@ -264,7 +502,17 @@ try {
     $play = Invoke-McpTool $session gp_playback @{operation='play';document=$document}
     Start-Sleep -Seconds 3
     $result.play = $play
-    $result.observation = Get-Observation
+    # Observation JSON is published by a coalescing writer.  Neural DSP can
+    # spend several seconds constructing both track instances, so do not
+    # mistake a stale pre-selection snapshot for a failed request.
+    $result.observation = if ($CheckTrackSelection) {
+        Wait-Observation {
+            param($observation)
+            $evidence = @($observation.gp_hook.track_runtime_evidence)
+            $observation.gp_hook.track_context_stable -and $evidence.Count -ge 2 -and
+                @($evidence | Where-Object { $_.configured_effects -eq 1 }).Count -ge 2
+        } 'track runtime preparation' 30
+    } else { Get-Observation }
     $hook = $result.observation.gp_hook
     if ($ExpectedBindingSource -and $hook.track_binding_source -ne $ExpectedBindingSource) {
         throw "Unexpected native binding provider: $($hook.track_binding_source)"
@@ -279,6 +527,7 @@ try {
             throw "Track runtime did not process/write back: $(Json $evidence)"
         }
     }
+    if ($CheckTrackSelection) { Assert-TrackSelectionLifecycle }
     if ($CheckGain) {
         $beforeGain = @(Read-Gain 0; Read-Gain 1)
         foreach ($track in @(0,1)) {

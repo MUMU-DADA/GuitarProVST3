@@ -10,6 +10,7 @@ namespace gpvst3::host {
 
 struct Verification {
     bool supported = false;
+    bool qtCoreSupported = false;
     QHash<QString, bool> files;
 };
 

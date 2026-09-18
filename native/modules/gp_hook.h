@@ -291,6 +291,8 @@ bool requestTrackVst3SelectionAtGeneration(const std::string &trackKey,
                                             std::string *error = nullptr) noexcept;
 std::vector<Vst3SelectionEntry> captureGlobalVst3States();
 std::vector<Vst3SelectionEntry> captureTrackVst3States(const std::string &trackKey);
+bool activeTrackVst3States(const std::string &trackKey,
+                           std::vector<Vst3SelectionEntry> &result) noexcept;
 // Open the editor owned by the currently active processing instance. The
 // caller supplies a native Windows child HWND created on the Qt UI thread.
 bool openVst3Editor(const Vst3SelectionEntry &entry, void *parentWindow) noexcept;

@@ -6,7 +6,7 @@
 
 - 删除固定 250 ms 音轨刷新和永久 500 ms 侧栏维护；音轨/选择变化通过 dirty 位和合并通知触发，必要时使用有界 2 秒恢复窗口。
 - `gp_audio` 使用值快照和 generation 比较，缺失音色不再调用 `musician->updateAll()`；对象树读取保留在宿主 Qt 线程。
-- selection worker 承接 track runtime 维护、故障隔离、状态保存和采样率重配；VST3 初始化/编辑器生命周期调用按线程合同回到 Qt 线程。
+- selection worker 承接 track runtime 维护、故障隔离、状态保存和采样率重配。勾选启用时，VST3 component/controller 初始化、状态恢复及首次 processing setup 在 worker 执行；factory 对象创建和编辑器挂载保留在 Qt，以兼容 Neural DSP 的 GUI 对象线程归属。勾选响应性证据见 P12 实现记录。
 - `hook::snapshot()` 仅读取已发布状态，不再更新音频层或重配输入路由。
 - About/侧栏使用共享 pending 调度和有限启动重试，稳定后停止调度。
 - `p2-observation.json` 和 `status.json` 使用 latest-slot 后台 writer；正常诊断按状态变化合并写入，详细模式才允许高频采样，退出时先 drain writer 再清理 runtime。
@@ -28,7 +28,7 @@
 
 ## 2026-09-15 真实 Archetype 音轨复验
 
-复核用户截图对应的默认启动路径后确认：旧实现只在 global request 中执行首次 hook `prepare()`，track request 在 hook 尚未安装时直接进入 worker，最终把 `runtime_vst3_selection_prepare_failed` 写入 track sidecar。现已让首次显式 track selection 在 Qt 控制线程完成同样的 hook 安装，并在失败时保留实际原因。
+复核用户截图对应的默认启动路径后确认：旧实现只在 global request 中执行首次 hook `prepare()`，track request 在 hook 尚未安装时直接进入 worker，最终把 `runtime_vst3_selection_prepare_failed` 写入 track sidecar。首次显式 selection 现在统一排入 selection worker，由 worker 完成 hook 安装和实例准备；Qt 回调只提交请求并立即返回，失败原因仍保留在状态和 sidecar 中。
 
 - 默认启动、已安装 Neural DSP Archetype 插件、MCP 选择 Track 2：`installed=true`、`enabled=true`，目标 track `configured=true`、`configured_effects=1`，sidecar 的 Mateus Asato 错误清除。
 - 新曲谱双音轨真实 Archetype 处理：`artifacts/mcp-p8-track-0c3318d76a694134a77a5aad2dcca434`。

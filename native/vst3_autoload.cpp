@@ -3,6 +3,8 @@
 #include <QtCore/QTimer>
 #include <QtGui/QImageIOPlugin>
 #include <QtCore/QJsonDocument>
+#include <QtCore/QPointer>
+#include <QtCore/QDir>
 
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
@@ -121,30 +123,53 @@ void stopObservation() {
 
 void initializePlugin() {
     auto *application = QCoreApplication::instance();
-    auto status = gpvst3::bootstrap::initialize();
-    status.insert("plugin_path", pluginPath());
-    gpvst3::state::writeStatus(status);
-    gpvst3::state::startStatusWriter();
-    gpvst3::ui::showEffectChainPanel(false);
-    if (!gpvst3::state::pluginEnabled()) {
-        // The About dialog remains available so the user can re-enable the
-        // plugin for the next Guitar Pro launch, but no scanner, observer or
-        // audio hook is started while disabled.
-        return;
-    }
-    // A new Guitar Pro session starts with every VST3 effect bypassed. The
-    // persisted chain is shown in the selector, but processors are created
-    // only after an explicit user enable action.
-    // bootstrap owns a single 100 ms poll timer and starts it only while a
-    // static scan or recognition job is active.
-    // A P7 selection can start the hook after bootstrap. Keep its
-    // observation and shutdown lifecycle available in default launches.
-    g_observationMonitor.start();
-    QObject::connect(application, &QCoreApplication::aboutToQuit, application, &gpvst3::ui::shutdownEditors);
-    QObject::connect(application, &QCoreApplication::aboutToQuit, application, &gpvst3::hook::saveVst3States);
-    QObject::connect(application, &QCoreApplication::aboutToQuit, application, &gpvst3::vst3::shutdownScan);
-    QObject::connect(application, &QCoreApplication::aboutToQuit, application, &stopObservation);
-    qAddPostRoutine(&stopObservation);
+    if (!application) return;
+    gpvst3::ui::setStartupProgress(-1, QStringLiteral("正在启动 VST3…"));
+    const auto applicationDirectory = QCoreApplication::applicationDirPath();
+    // Hashing the host binaries is intentionally read-only, but doing it on
+    // Guitar Pro's Qt thread blocks repaint/input for several hundred ms (or
+    // longer on a cold disk). Keep the gate off the UI thread, then continue
+    // the ABI-sensitive setup on the host thread in separate event turns.
+    QPointer<QCoreApplication> target = application;
+    std::thread([target, applicationDirectory] {
+        const auto verification = gpvst3::host::verifyDirectory(applicationDirectory);
+        auto preparedVerification = verification;
+        preparedVerification.qtCoreSupported = gpvst3::host::sha256(
+            QDir(applicationDirectory).filePath(QStringLiteral("Qt5Core.dll"))) ==
+            "C2F85BD55C31E5380DD99F0D517EE183A54C3852480BC497DC30A5483FD70FF2";
+        if (!target) return;
+        QMetaObject::invokeMethod(target.data(), [target, preparedVerification] {
+            if (!target || target->property("gpvst3P0Finished").toBool()) return;
+            gpvst3::ui::setStartupProgress(28, QStringLiteral("正在连接宿主…"));
+            QTimer::singleShot(0, target.data(), [target, preparedVerification] {
+                if (!target || target->property("gpvst3P0Finished").toBool()) return;
+                gpvst3::ui::setStartupProgress(42, QStringLiteral("正在准备音频链…"));
+                auto status = gpvst3::bootstrap::initialize(preparedVerification);
+                status.insert("plugin_path", pluginPath());
+                gpvst3::state::writeStatus(status);
+                gpvst3::state::startStatusWriter();
+                gpvst3::ui::showEffectChainPanel(false);
+                if (!gpvst3::state::pluginEnabled()) {
+                    gpvst3::ui::setStartupProgress(100, QStringLiteral("插件已停用"), false);
+                    target->setProperty("gpvst3P0Finished", true);
+                    return;
+                }
+                if (!target->property("gpvst3P0CleanupConnected").toBool()) {
+                    QObject::connect(target.data(), &QCoreApplication::aboutToQuit, target.data(), &gpvst3::ui::shutdownEditors);
+                    QObject::connect(target.data(), &QCoreApplication::aboutToQuit, target.data(), &gpvst3::hook::saveVst3States);
+                    QObject::connect(target.data(), &QCoreApplication::aboutToQuit, target.data(), &gpvst3::vst3::shutdownScan);
+                    QObject::connect(target.data(), &QCoreApplication::aboutToQuit, target.data(), &stopObservation);
+                    qAddPostRoutine(&stopObservation);
+                    target->setProperty("gpvst3P0CleanupConnected", true);
+                }
+                QTimer::singleShot(0, target.data(), [target] {
+                    if (!target || target->property("gpvst3P0Finished").toBool()) return;
+                    g_observationMonitor.start();
+                    target->setProperty("gpvst3P0Finished", true);
+                });
+            });
+        }, Qt::QueuedConnection);
+    }).detach();
 }
 
 }
@@ -159,6 +184,7 @@ public:
             return;
         if (qApp->property("gpvst3P0Scheduled").toBool()) return;
         qApp->setProperty("gpvst3P0Scheduled", true);
+        gpvst3::gp_audio::observeHostObjects();
         auto *application = qApp;
         QTimer::singleShot(0, application, &initializePlugin);
     }

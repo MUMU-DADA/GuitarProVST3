@@ -9,6 +9,7 @@ param(
     [switch]$CheckGain,
     [switch]$CheckCatalogRestart,
     [switch]$EditorOnly,
+    [switch]$CheckSelectionResponsive,
     [switch]$KeepHost,
     [string]$InitialSidecar = ''
 )
@@ -144,7 +145,8 @@ try {
     if ($scan.vst3_host.scan_pending -or $scan.vst3_host.status -eq 'scanning') {
         throw 'P7 MCP catalog scan did not complete within 90 seconds.'
     }
-    if ($HookMode -ne 'enabled' -and ($scan.gp_hook.installed -or -not $scan.gp_hook.total_bypass)) {
+    $startupHook = (Get-Content -LiteralPath (Join-Path $dataDirectory 'p2-observation.json') -Raw | ConvertFrom-Json).gp_hook
+    if ($HookMode -ne 'enabled' -and ($startupHook.installed -or -not $startupHook.total_bypass)) {
         throw 'Default/disabled startup must remain unpatched and bypassed before a selection.'
     }
     Start-Sleep -Milliseconds 500
@@ -212,20 +214,57 @@ try {
     $result.checkbox_before = @($checkbox,$secondCheckbox)
     $observationPath = Join-Path $dataDirectory 'p2-observation.json'
     $freshFirst = Invoke-McpTool $session gp_objects @{query=$checkbox.object_name;limit=10}
+    $selectionWatch = [Diagnostics.Stopwatch]::StartNew()
     $setFirst = Invoke-McpTool $session gp_set_property @{
         snapshot=$freshFirst.snapshot
         id=@($freshFirst.objects)[0].id
         property='checked'
         value=$true
     }
+    $result.checkbox_request_ms = $selectionWatch.Elapsed.TotalMilliseconds
+    $loadingRowName = ([string]$checkbox.object_name) -replace '^gpvst3GlobalEnabled_', 'gpvst3GlobalEffectRow_'
+    $selectionSamples = @()
     $selectionReadyDeadline = [DateTime]::UtcNow.AddSeconds(120)
     do {
-        Start-Sleep -Milliseconds 250
+        if ($CheckSelectionResponsive) {
+            # gp_objects executes on Qt, so this measures the actual event loop
+            # throughout initialization, including after setChecked returns.
+            $queryWatch = [Diagnostics.Stopwatch]::StartNew()
+            $progressQuery = Invoke-McpTool $session gp_objects @{query='gpvst3RowLoading';limit=200}
+            $queryWatch.Stop()
+            $progress = @($progressQuery.objects | Where-Object {
+                $_.object_name -eq 'gpvst3RowLoading' -and $_.parent_name -eq $loadingRowName
+            })[0]
+            $selectionSamples += @{elapsed_ms=$selectionWatch.Elapsed.TotalMilliseconds; query_ms=$queryWatch.Elapsed.TotalMilliseconds; progress_visible=[bool]$progress.visible}
+            $selectionSamples | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath (Join-Path $run 'checkbox-responsiveness.json') -Encoding UTF8
+        }
+        Start-Sleep -Milliseconds 100
         $selectionObservation = Get-Content -LiteralPath $observationPath -Raw | ConvertFrom-Json
         if ($selectionObservation.gp_hook.runtime_processor_ready -or
             ((-not $EditorOnly -or $HookMode -eq 'disabled') -and
              $selectionObservation.gp_hook.selection_status -eq 'failed')) { break }
     } while ([DateTime]::UtcNow -lt $selectionReadyDeadline)
+    if ($CheckSelectionResponsive) {
+        $result.selection_ui_samples = $selectionSamples
+        $maximumQueryMs = ($selectionSamples | Measure-Object -Property query_ms -Maximum).Maximum
+        if ($result.checkbox_request_ms -ge 500 -or $maximumQueryMs -ge 500) {
+            throw "Checkbox blocked Qt: request=$($result.checkbox_request_ms) ms, max UI query=$maximumQueryMs ms."
+        }
+        if (@($selectionSamples | Where-Object progress_visible).Count -lt 2) {
+            throw 'Cold selection did not show the busy indicator during initialization.'
+        }
+        $progressDeadline = [DateTime]::UtcNow.AddSeconds(5)
+        do {
+            $progressQuery = Invoke-McpTool $session gp_objects @{query='gpvst3RowLoading';limit=200}
+            $visible = @($progressQuery.objects | Where-Object {
+                $_.object_name -eq 'gpvst3RowLoading' -and $_.parent_name -eq $loadingRowName -and $_.visible
+            }).Count -gt 0
+            if (-not $visible) { break }
+            Start-Sleep -Milliseconds 100
+        } while ([DateTime]::UtcNow -lt $progressDeadline)
+        if ($visible) { throw 'Selection completed but the busy indicator remained visible.' }
+        $result.selection_progress_hidden = $true
+    }
     if ($HookMode -eq 'disabled') {
         $after = Invoke-McpTool $session gp_objects @{query=$checkbox.object_name;limit=10}
         $notice = Invoke-McpTool $session gp_objects @{query='gpvst3GlobalStatus';limit=10}
@@ -311,8 +350,40 @@ try {
         if (-not $result.editor_reopen.visible) { throw 'Editor-only repeated open did not keep the window visible.' }
         $closeQuery = Invoke-McpTool $session gp_objects @{query='gpvst3NativeEditorWindow';limit=10}
         Invoke-McpTool $session gp_close_window @{snapshot=$closeQuery.snapshot;id=@($closeQuery.objects | Where-Object object_name -EQ 'gpvst3NativeEditorWindow')[0].id} | Out-Null
-        Start-Sleep -Milliseconds 500
-        $result.after_editor_close = (Get-Content -LiteralPath $observationPath -Raw | ConvertFrom-Json).gp_hook
+        # A returned close request alone does not prove removed() finished.
+        # Query Qt again and require removal before opening a fresh view.
+        $closeDeadline = [DateTime]::UtcNow.AddSeconds(5)
+        do {
+            $closedWindows = Invoke-McpTool $session gp_windows @{include_hidden=$true}
+            $result.after_editor_close = (Get-Content -LiteralPath $observationPath -Raw | ConvertFrom-Json).gp_hook
+            if ($result.after_editor_close.editor_stage -eq 'removed') { break }
+            Start-Sleep -Milliseconds 100
+        } while ([DateTime]::UtcNow -lt $closeDeadline)
+        if ($result.after_editor_close.editor_stage -ne 'removed' -or
+            @($closedWindows.windows | Where-Object { $_.object_name -eq 'gpvst3NativeEditorWindow' -and $_.visible }).Count) {
+            throw 'Native editor did not finish removal.'
+        }
+        $editorAgain = Invoke-McpTool $session gp_objects @{query=("gpvst3GlobalEditor_$classId");limit=10}
+        Invoke-McpTool $session gp_trigger @{snapshot=$editorAgain.snapshot;id=@($editorAgain.objects)[0].id} | Out-Null
+        $editorDeadline = [DateTime]::UtcNow.AddSeconds(30)
+        do {
+            $reopened = Invoke-McpTool $session gp_windows @{include_hidden=$true}
+            $result.editor_reopen = @($reopened.windows | Where-Object object_name -EQ 'gpvst3NativeEditorWindow')[0]
+            $stage = (Get-Content -LiteralPath $observationPath -Raw | ConvertFrom-Json).gp_hook.editor_stage
+            if ($result.editor_reopen.visible -and $stage -eq 'visible') { break }
+            Start-Sleep -Milliseconds 100
+        } while ([DateTime]::UtcNow -lt $editorDeadline)
+        if (-not $result.editor_reopen.visible -or $stage -ne 'visible') { throw 'Editor did not reopen after removal.' }
+        $closeQuery = Invoke-McpTool $session gp_objects @{query='gpvst3NativeEditorWindow';limit=10}
+        Invoke-McpTool $session gp_close_window @{snapshot=$closeQuery.snapshot;id=@($closeQuery.objects | Where-Object object_name -EQ 'gpvst3NativeEditorWindow')[0].id} | Out-Null
+        $closeDeadline = [DateTime]::UtcNow.AddSeconds(5)
+        do {
+            Invoke-McpTool $session gp_windows @{include_hidden=$true} | Out-Null
+            $result.after_editor_reclose = (Get-Content -LiteralPath $observationPath -Raw | ConvertFrom-Json).gp_hook
+            if ($result.after_editor_reclose.editor_stage -eq 'removed') { break }
+            Start-Sleep -Milliseconds 100
+        } while ([DateTime]::UtcNow -lt $closeDeadline)
+        if ($result.after_editor_reclose.editor_stage -ne 'removed') { throw 'Reopened editor did not finish removal.' }
         $result | ConvertTo-Json -Depth 30 | Set-Content -LiteralPath (Join-Path $run 'verification.json') -Encoding UTF8
         Write-Output "PASS: P10 real Guitar Pro editor open/reopen/close and native capture. Evidence: $run"
         return

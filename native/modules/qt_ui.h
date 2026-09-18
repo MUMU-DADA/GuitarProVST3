@@ -18,6 +18,10 @@ using Vst3TrackSelectionRequestControl = bool (*)(const std::string &, const std
 using Vst3TrackGenerationRequestControl = bool (*)(const std::string &, std::uint64_t, const std::vector<Vst3SelectionEntry> &, std::string *) noexcept;
 using Vst3StateControl = std::vector<Vst3SelectionEntry> (*)();
 using Vst3TrackStateControl = std::vector<Vst3SelectionEntry> (*)(const std::string &);
+// Returns true when the runtime snapshot is reliable.  A false result means
+// the control could not obtain its non-blocking locks yet; the output vector
+// must then be ignored and the UI should retain its last known state.
+using Vst3TrackActiveControl = bool (*)(const std::string &, std::vector<Vst3SelectionEntry> &) noexcept;
 using Vst3TrackEditorControl = bool (*)(const std::string &, const Vst3SelectionEntry &, void *) noexcept;
 using Vst3EditorControl = bool (*)(const Vst3SelectionEntry &, void *) noexcept;
 using Vst3EditorCloseControl = void (*)() noexcept;
@@ -36,7 +40,8 @@ void setVst3TrackSelectionControl(Vst3TrackSelectionControl control) noexcept;
 void setVst3TrackSelectionRequestControl(Vst3TrackSelectionRequestControl control) noexcept;
 void setVst3TrackGenerationRequestControl(Vst3TrackGenerationRequestControl control) noexcept;
 void setVst3StateControl(Vst3StateControl control) noexcept;
-void setVst3TrackControls(Vst3TrackStateControl state, Vst3TrackEditorControl editor) noexcept;
+void setVst3TrackControls(Vst3TrackStateControl state, Vst3TrackEditorControl editor,
+                          Vst3TrackActiveControl active = nullptr) noexcept;
 void setVst3EditorControl(Vst3EditorControl open, Vst3EditorCloseControl close,
                          Vst3EditorScaleControl scale = nullptr) noexcept;
 void setVst3DiscoveryControl(Vst3RefreshControl refresh, Vst3IdentifyControl identify) noexcept;
@@ -46,6 +51,9 @@ void reloadVst3Selections();
 void setVst3Catalog(const QJsonArray &catalog);
 void setVst3ScanState(const QString &state, int checked = 0, int total = 0,
                      bool cached = false, const QString &detail = {});
+// A small non-modal indicator mounted in the host title toolbar. percent < 0
+// uses Qt's busy animation while the startup worker is still running.
+void setStartupProgress(int percent, const QString &message, bool active = true) noexcept;
 void resizeNativeEditor(void *host, int width, int height);
 double nativeEditorScale(void *host);
 void shutdownEditors();

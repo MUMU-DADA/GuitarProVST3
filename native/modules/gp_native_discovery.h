@@ -3,6 +3,7 @@
 // The same bounded MSVC RTTI checks used by GuitarProMCP/native/discovery.h.
 // Only called for known Qt roots after the complete host hash lock passes.
 #include <QtCore/QString>
+#include <QtCore/QByteArray>
 #include <QtCore/QObject>
 #include <windows.h>
 #include <array>
@@ -46,4 +47,5 @@ inline QObject *asQObject(quintptr object) {
     }
     return nullptr;
 }
+
 }

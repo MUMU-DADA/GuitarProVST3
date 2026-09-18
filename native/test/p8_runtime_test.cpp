@@ -2,17 +2,125 @@
 // buffers. Only host discovery and editor window placement are substituted.
 #include "../modules/gp_hook.cpp"
 #include <chrono>
+#include <filesystem>
 #include <iostream>
 #include <stdexcept>
 #include <QtCore/QCoreApplication>
+#include <QtCore/QElapsedTimer>
+#include <QtCore/QFile>
+#include <QtCore/QJsonDocument>
 #include <QtCore/QThread>
+#include <QtCore/QTimer>
 #include <QtWidgets/QWidget>
 
 namespace {
 std::vector<gpvst3::gp_audio::Binding> testBindings;
 int testRate = 44100;
+std::atomic<int> selectionNotifications{0};
+void notifySelection() noexcept { selectionNotifications.fetch_add(1, std::memory_order_relaxed); }
 int readRate(const void *) { return testRate; }
 void require(bool value, const char *message) { if (!value) throw std::runtime_error(message); }
+
+void verifyDormantContext() {
+    using namespace gpvst3::hook;
+    const auto createdBefore = g_nextInstanceId.load();
+    std::atomic<bool> completed{false};
+    std::thread worker([&] {
+        refreshTrackContextWorkerImpl(testBindings, testBindings.size());
+        completed.store(true, std::memory_order_release);
+    });
+    QElapsedTimer clock;
+    clock.start();
+    // Simulate Qt being occupied by the first enable request. A dormant
+    // context refresh must release editorMutex without requesting Qt work.
+    while (!completed.load(std::memory_order_acquire) && clock.elapsed() < 500)
+        QThread::msleep(1);
+    const bool completedWithoutQt = completed.load(std::memory_order_acquire);
+    // Drain a regressed implementation before joining, so the assertion can
+    // report the lock dependency instead of leaving a blocked test worker.
+    while (!completed.load(std::memory_order_acquire)) {
+        QCoreApplication::processEvents(QEventLoop::AllEvents, 5);
+        QThread::msleep(1);
+    }
+    worker.join();
+    require(completedWithoutQt, "dormant context completes without Qt dispatch before first enable");
+    require(g_nextInstanceId.load() == createdBefore && g_runtime.selectionPool.effects.empty() &&
+                g_runtime.trackRuntimes[0].pool.effects.empty() && !g_runtime.projectGlobalRestored,
+            "uninstalled hooks defer both global and track plugin restoration");
+    require(g_runtime.trackRuntimes[0].trackKey == "track" &&
+                g_runtime.trackBindingsPublished.load() == 1,
+            "dormant context still publishes the track scope needed by first enable");
+    std::vector<Vst3SelectionEntry> live;
+    require(activeTrackVst3States("track", live) && live.empty() &&
+                captureTrackVst3States("track").empty(),
+            "saved enabled intent is not an active track before preparation");
+    std::unique_lock<std::recursive_mutex> prepareLock(g_runtime.editorMutex, std::try_to_lock);
+    require(prepareLock.owns_lock(), "Qt prepare can acquire runtime ownership after dormant context");
+    g_runtime.requestedTrackSelections.clear();
+    g_runtime.publishedBindings.clear();
+}
+
+void verifyColdSelection(const std::string &trackKey,
+                         const std::vector<gpvst3::hook::Vst3SelectionEntry> &entries) {
+    using namespace gpvst3::hook;
+    QElapsedTimer clock;
+    clock.start();
+    qint64 lastTick = 0, maximumGap = 0;
+    QJsonArray longGaps;
+    qint64 maximumEvents = 0, maximumPending = 0;
+    int ticks = 0;
+    QTimer heartbeat;
+    heartbeat.setTimerType(Qt::PreciseTimer);
+    QObject::connect(&heartbeat, &QTimer::timeout, [&] {
+        const auto now = clock.elapsed();
+        if (now - lastTick >= 80)
+            longGaps.append(QJsonObject{{"at_ms", now}, {"gap_ms", now - lastTick}});
+        maximumGap = std::max(maximumGap, now - lastTick);
+        lastTick = now;
+        ++ticks;
+    });
+    heartbeat.start(10);
+    // Only the first class is warm. Two new instances must initialize here.
+    const auto createdBefore = g_nextInstanceId.load();
+    qputenv("GPVST3_TEST_INITIALIZE_DELAY_MS", "150");
+    qputenv("GPVST3_TEST_STATE_DELAY_MS", "150");
+    // Cover both VST3 controller layouts: track uses a combined component;
+    // global creates independent controllers with slow initialize/state calls.
+    if (trackKey.empty()) qputenv("GPVST3_TEST_SEPARATE_CONTROLLER", "1");
+    std::string error;
+    const bool accepted = trackKey.empty() ? requestGlobalVst3Selection(entries, &error)
+        : requestTrackVst3Selection(trackKey, entries, &error);
+    const auto requestElapsed = clock.elapsed();
+    while (clock.elapsed() < 5000) {
+        auto start = clock.elapsed();
+        const bool pending = vst3SelectionPending();
+        maximumPending = std::max(maximumPending, clock.elapsed() - start);
+        if (!pending) break;
+        start = clock.elapsed();
+        QCoreApplication::processEvents(QEventLoop::AllEvents, 5);
+        maximumEvents = std::max(maximumEvents, clock.elapsed() - start);
+        QThread::msleep(1);
+    }
+    maximumGap = std::max(maximumGap, clock.elapsed() - lastTick);
+    heartbeat.stop();
+    qunsetenv("GPVST3_TEST_INITIALIZE_DELAY_MS");
+    qunsetenv("GPVST3_TEST_STATE_DELAY_MS");
+    qunsetenv("GPVST3_TEST_SEPARATE_CONTROLLER");
+    const auto instancesCreated = g_nextInstanceId.load() - createdBefore;
+    const auto scope = trackKey.empty() ? QStringLiteral("global") : QStringLiteral("track");
+    QFile evidence(gpvst3::state::dataDirectory() + "/cold-selection-" + scope + ".json");
+    require(evidence.open(QIODevice::WriteOnly), "write cold selection evidence");
+    evidence.write(QJsonDocument(QJsonObject{{"scope", scope}, {"request_ms", requestElapsed},
+        {"total_ms", clock.elapsed()}, {"max_qt_gap_ms", maximumGap}, {"qt_ticks", ticks},
+        {"instances_created", qint64(instancesCreated)}, {"long_gaps", longGaps},
+        {"max_process_events_ms", maximumEvents}, {"max_pending_ms", maximumPending}}).toJson());
+    evidence.close();
+    require(accepted && !vst3SelectionPending(), "cold selection completes");
+    require(instancesCreated == 2 && clock.elapsed() >= 1800,
+            "cold selection executes both delayed initializers and saved-state restores");
+    require(requestElapsed < 100, "cold selection request returns immediately");
+    require(ticks >= 10 && maximumGap < 100, "Qt remains responsive throughout cold initialization");
+}
 
 bool syncTrackSelection(const std::string &trackKey,
                         const std::vector<gpvst3::hook::Vst3SelectionEntry> &selection,
@@ -33,6 +141,169 @@ bool syncTrackSelection(const std::string &trackKey,
             return false;
         }
     return true;
+}
+
+void verifyTrackCancellationDuringPrepare(
+    const std::vector<gpvst3::hook::Vst3SelectionEntry> &sourceEntries) {
+    using namespace gpvst3;
+    using namespace gpvst3::hook;
+    require(sourceEntries.size() >= 2, "cancellation regression needs two fixture classes");
+    QJsonArray cases;
+    for (const bool replaceWhilePreparing : {false, true}) {
+        // Each case uses a cold path; a warm A would miss the cancellation window.
+        const auto source = std::filesystem::u8path(sourceEntries[0].module);
+        const auto copyPath = std::filesystem::u8path(state::dataDirectory().toStdString()) /
+            (replaceWhilePreparing ? "cancel-replace-fixture" : "cancel-only-fixture") / source.filename();
+        std::error_code copyError;
+        std::filesystem::create_directories(copyPath.parent_path(), copyError);
+        require(!copyError, "create cancellation fixture directory");
+        std::filesystem::copy(source, copyPath,
+            std::filesystem::copy_options::recursive | std::filesystem::copy_options::overwrite_existing,
+            copyError);
+        require(!copyError, "copy cold cancellation fixture");
+
+        auto requestA = sourceEntries[0];
+        auto requestB = sourceEntries[1];
+        requestA.module = copyPath.u8string();
+        requestB.module = copyPath.u8string();
+        std::string error;
+        require(syncTrackSelection("track", {}, &error),
+                "clear track before cancellation race");
+        std::vector<Vst3SelectionEntry> disabled;
+        require(activeTrackVst3States("track", disabled) && disabled.empty(),
+                "track is bypassed before cancellation race");
+
+        struct DelayCleanup {
+            ~DelayCleanup() {
+                qunsetenv("GPVST3_TEST_INITIALIZE_DELAY_MS");
+                qunsetenv("GPVST3_TEST_STATE_DELAY_MS");
+            }
+        } cleanup;
+        qputenv("GPVST3_TEST_INITIALIZE_DELAY_MS", "150");
+        qputenv("GPVST3_TEST_STATE_DELAY_MS", "150");
+        QElapsedTimer clock;
+        clock.start();
+        qint64 lastTick = 0;
+        qint64 maximumGap = 0;
+        int ticks = 0;
+        QTimer heartbeat;
+        heartbeat.setTimerType(Qt::PreciseTimer);
+        QObject::connect(&heartbeat, &QTimer::timeout, [&] {
+            const auto now = clock.elapsed();
+            maximumGap = std::max(maximumGap, now - lastTick);
+            lastTick = now;
+            ++ticks;
+        });
+        heartbeat.start(10);
+
+        const auto instancesBefore = g_nextInstanceId.load(std::memory_order_acquire);
+        const auto generationBefore = g_runtime.audioGeneration.load(std::memory_order_acquire);
+        const auto workerStartBefore = g_runtime.selectionWorkerStartedNanoseconds.load(
+            std::memory_order_acquire);
+        require(requestTrackVst3Selection("track", {requestA}, &error),
+                "queue slow A selection");
+
+        // RuntimeEffect construction occurs inside prepare(), after the worker's
+        // initial generation check. This catches cancellation during preparation,
+        // including a worker waiting to create the Qt-affine component.
+        bool aPreparing = false;
+        const auto overlapDeadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+        while (std::chrono::steady_clock::now() < overlapDeadline) {
+            QCoreApplication::processEvents(QEventLoop::AllEvents, 5);
+            if (g_runtime.selectionWorkerBusy.load(std::memory_order_acquire) &&
+                g_runtime.selectionStatus.load(std::memory_order_acquire) == 2 &&
+                g_runtime.selectionWorkerStartedNanoseconds.load(std::memory_order_acquire) > workerStartBefore &&
+                g_nextInstanceId.load(std::memory_order_acquire) > instancesBefore) {
+                aPreparing = true;
+                break;
+            }
+            QThread::msleep(1);
+        }
+        require(aPreparing, "slow A selection entered production prepare");
+        require(g_runtime.audioGeneration.load(std::memory_order_acquire) == generationBefore,
+                "cancellation overlaps A before it can commit");
+
+        // The empty request marks the runtime bypassed immediately. In the second
+        // case B supersedes that pending entry while A still owns prepare().
+        require(requestTrackVst3Selection("track", {}, &error),
+                "queue cancellation during slow A selection");
+        require(g_runtime.trackRuntimes[0].bypassRequested.load(std::memory_order_acquire),
+                "cancellation immediately requests audio bypass");
+        if (replaceWhilePreparing)
+            require(requestTrackVst3Selection("track", {requestB}, &error),
+                    "queue B selection after cancellation");
+
+        const auto drainDeadline = std::chrono::steady_clock::now() + std::chrono::seconds(8);
+        while (vst3SelectionPending() && std::chrono::steady_clock::now() < drainDeadline) {
+            QCoreApplication::processEvents(QEventLoop::AllEvents, 5);
+            QThread::msleep(1);
+        }
+        maximumGap = std::max(maximumGap, clock.elapsed() - lastTick);
+        heartbeat.stop();
+        qunsetenv("GPVST3_TEST_INITIALIZE_DELAY_MS");
+        qunsetenv("GPVST3_TEST_STATE_DELAY_MS");
+        require(!vst3SelectionPending(), "cancellation race worker drains");
+        require(ticks >= 10 && maximumGap < 100,
+                "Qt remains responsive during cancellation race preparation");
+
+        const auto generationDelta = g_runtime.audioGeneration.load(std::memory_order_acquire) -
+            generationBefore;
+        cases.append(QJsonObject{{"replace_while_preparing", replaceWhilePreparing},
+            {"total_ms", clock.elapsed()}, {"max_qt_gap_ms", maximumGap}, {"qt_ticks", ticks},
+            {"instances_created", qint64(g_nextInstanceId.load() - instancesBefore)},
+            {"audio_generations_committed", qint64(generationDelta)}});
+        require(generationDelta == 1,
+                "stale A prepare does not publish an extra audio generation");
+        auto &runtime = g_runtime.trackRuntimes[0];
+        if (!replaceWhilePreparing) {
+            require(runtime.chain.snapshot().activeSlot == -1 &&
+                        runtime.count.load(std::memory_order_acquire) == 0 &&
+                        runtime.bypassRequested.load(std::memory_order_acquire) &&
+                        !runtime.configured.load(std::memory_order_acquire) &&
+                        activeTrackVst3States("track", disabled) && disabled.empty() &&
+                        runtime.requested.empty(),
+                    "cancelled cold A remains disabled after preparation completes");
+            require(syncTrackSelection("track", {requestB}, &error),
+                    "B can be enabled after cold A cancellation completes");
+            require(g_runtime.audioGeneration.load(std::memory_order_acquire) == generationBefore + 2,
+                    "B commits once after completed cancellation");
+        }
+        const auto active = runtime.chain.snapshot().activeSlot;
+        require(active >= 0 && runtime.count.load(std::memory_order_acquire) == 1 &&
+                    !runtime.bypassRequested.load(std::memory_order_acquire) &&
+                    runtime.trackSlots[active].count == 1 &&
+                    runtime.trackSlots[active].effects[0] &&
+                    runtime.trackSlots[active].effects[0]->identity.module == requestB.module &&
+                    runtime.trackSlots[active].effects[0]->identity.classId == requestB.classId &&
+                    sameSelection(runtime.requested, {requestB}),
+                "latest B selection is the only active track runtime");
+        std::vector<Vst3SelectionEntry> applied;
+        require(activeTrackVst3States("track", applied) && applied.size() == 1 &&
+                    applied[0].classId == requestB.classId && applied[0].classId != requestA.classId,
+                "B is the final applied track identity after A cancellation");
+        const auto evidence = snapshot();
+        const auto trackEvidence = std::find_if(evidence.trackRuntimeEvidence.begin(), evidence.trackRuntimeEvidence.end(),
+            [](const auto &value) { return value.trackKey == "track"; });
+        require(trackEvidence != evidence.trackRuntimeEvidence.end() && trackEvidence->configuredEffects == 1,
+                "runtime evidence reports exactly one configured track effect after cancellation");
+        float left[256], right[256];
+        std::fill_n(left, 256, 0.4F);
+        std::fill_n(right, 256, 0.4F);
+        float *channels[]{left, right};
+        const audio::BlockView block{nullptr, nullptr, nullptr, channels, 2, 256, double(testRate), 256};
+        bool processed = false;
+        require(runtime.processBlock(block, &processed) && processed &&
+                    std::abs(left[200] - 0.2F) < 0.000001F &&
+                    runtime.trackSlots[active].effects[0]->processedBlocks.load() > 0,
+                "only B processes the post-cancellation audio block");
+    }
+    QFile evidence(state::dataDirectory() + "/cancel-selection-track.json");
+    require(evidence.open(QIODevice::WriteOnly), "write cancellation selection evidence");
+    evidence.write(QJsonDocument(cases).toJson());
+    evidence.close();
+    std::string error;
+    require(syncTrackSelection("track", sourceEntries, &error),
+            "restore track selection after cancellation regression");
 }
 }
 namespace gpvst3::gp_audio {
@@ -104,6 +375,10 @@ void verifyPreloadRetention(const std::vector<gpvst3::hook::Vst3SelectionEntry> 
     const auto created = g_nextInstanceId.load();
     for (const auto index : {1U, 2U, 0U, 2U, 1U, 0U}) {
         select({}, {});
+        std::vector<Vst3SelectionEntry> disabled;
+        require(track.chain.snapshot().activeSlot == -1 && track.bypassRequested.load() &&
+                    track.count.load() == 0 && activeTrackVst3States("track", disabled) && disabled.empty(),
+                "disabled track has no active slot or enabled UI identity");
         const auto globalBlocks = retained[0].lock()->processedBlocks.load();
         const auto trackBlocks = retained[3].lock()->processedBlocks.load();
         reset(); require(g_runtime.chain.process(block).bypassed && left[0] == 0.4F,
@@ -116,6 +391,10 @@ void verifyPreloadRetention(const std::vector<gpvst3::hook::Vst3SelectionEntry> 
                 "disabled processors retain DSP state without processing blocks");
         select(index == 0 ? globalSaved : std::vector<Vst3SelectionEntry>{entries[index]},
                index == 0 ? trackSaved : std::vector<Vst3SelectionEntry>{entries[index]});
+        std::vector<Vst3SelectionEntry> applied;
+        require(activeTrackVst3States("track", applied) && applied.size() == 1 &&
+                    applied[0].classId == entries[index].classId,
+                "enabling another track plugin publishes its actual identity");
         require(g_runtime.selectionSlots[g_runtime.chain.snapshot().activeSlot].effects[0] == retained[index].lock() &&
                     track.trackSlots[track.chain.snapshot().activeSlot].effects[0] == retained[3 + index].lock() &&
                     g_runtime.inputSelectionSlots[g_runtime.inputChain.snapshot().activeSlot].effects[0] == retained[6 + index].lock(),
@@ -174,9 +453,22 @@ extern "C" __declspec(dllexport) int gpvst3_run_runtime_tests(const char *fixtur
     using namespace gpvst3::hook;
     try {
         require(fixture && *fixture && qApp, "test VST3 path and real Qt host required");
+        // The driver loads us during Guitar Pro startup. Let the host finish
+        // its initial widget/layout work before measuring a checkbox request.
+        QEventLoop hostSettling;
+        QTimer::singleShot(2000, &hostSettling, &QEventLoop::quit);
+        hostSettling.exec();
         std::vector<Vst3SelectionEntry> entries;
         for (const auto &id : {"41302010605080701122334455667788", "42302010605080701122334455667788", "43302010605080701122334455667788"})
             entries.push_back({fixture, id});
+        // Keep default sound values, but force cold enable through both state
+        // restoration paths, not only initialize(). The first class stays warm.
+        for (std::size_t index = 1; index < entries.size(); ++index) {
+            const double value = index == 1 ? 0.5 : 0.25;
+            entries[index].componentState.resize(sizeof(value));
+            std::memcpy(entries[index].componentState.data(), &value, sizeof(value));
+            entries[index].controllerState = entries[index].componentState;
+        }
         QJsonArray effects;
         for (const auto &entry : entries) effects.append(QJsonObject{{"module", fixture}, {"class_id", QString::fromStdString(entry.classId)}, {"enabled", true}});
         QJsonObject saved;
@@ -192,6 +484,8 @@ extern "C" __declspec(dllexport) int gpvst3_run_runtime_tests(const char *fixtur
         binding.scoreKey = "score"; binding.documentId = "document"; binding.trackIndex = 0; binding.selectedTrack = true;
         testBindings.push_back(binding);
         g_initial.hostSupported = true;
+        qunsetenv("GPVST3_DISABLE_PROJECT_RESTORE");
+        verifyDormantContext();
         qputenv("GPVST3_DISABLE_PROJECT_RESTORE", "1");
         // No patch is installed by this fixture; calls enter the production
         // control API after substituting discovery and the rate accessor.
@@ -209,8 +503,28 @@ extern "C" __declspec(dllexport) int gpvst3_run_runtime_tests(const char *fixtur
         require(!requestTrackVst3SelectionAtGeneration("track", 2, entries, &error) &&
                     error == "stale_selection_generation",
                 "stale track selection generation is rejected before enqueue");
+        auto newBinding = binding;
+        newBinding.chain = reinterpret_cast<void *>(2);
+        newBinding.trackKey = "new-track";
+        newBinding.trackId = "new-track";
+        newBinding.trackIndex = 1;
+        newBinding.selectedTrack = false;
+        testBindings.push_back(newBinding);
+        require(syncTrackSelection("new-track", {entries[0]}, &error),
+                "first selection prepares a track before its runtime table was published");
+        std::vector<Vst3SelectionEntry> newLive;
+        require(activeTrackVst3States("new-track", newLive) && newLive.size() == 1 &&
+                    newLive[0].classId == entries[0].classId,
+                "first selection is applied rather than silently dropped");
+        require(syncTrackSelection("new-track", {}, &error) &&
+                    activeTrackVst3States("new-track", newLive) && newLive.empty(),
+                "new track selection can be disabled");
+        testBindings.pop_back();
+        refreshTrackContext();
         g_runtime.stream.installed = true;
         require(configureInputRouter(), "prepare dormant live input router");
+        setSelectionNotifier(&notifySelection);
+        const auto notificationsBeforePreload = selectionNotifications.load();
         preloadSavedSelections();
         const auto preloadDeadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
         while (vst3SelectionPending() && std::chrono::steady_clock::now() < preloadDeadline) {
@@ -230,6 +544,8 @@ extern "C" __declspec(dllexport) int gpvst3_run_runtime_tests(const char *fixtur
         require(!vst3SelectionPending() && g_runtime.globalPreloaded && !g_runtime.inputPreloaded &&
                     g_runtime.trackRuntimes[0].preloaded.load(),
                 "global and track catalog preloads without enabling input monitoring");
+        require(selectionNotifications.load() > notificationsBeforePreload,
+                "preload completion wakes a UI indicator deferred by pending work");
         require(g_runtime.selectionPool.effects.size() == 1 &&
                     g_runtime.trackRuntimes[0].pool.effects.size() == 1 &&
                     g_runtime.inputSelectionPool.effects.empty(),
@@ -270,7 +586,7 @@ extern "C" __declspec(dllexport) int gpvst3_run_runtime_tests(const char *fixtur
         require(g_nextInstanceId.load() == noScoreInstances && !vst3SelectionPending(),
                 "no open score keeps catalog metadata-only and does not enqueue preload");
         testBindings.push_back(binding);
-        require(requestTrackVst3Selection("track", entries, &error), "activate preloaded track selection");
+        verifyColdSelection("track", entries);
         while (vst3SelectionPending() && std::chrono::steady_clock::now() < preloadDeadline) {
             QCoreApplication::processEvents(QEventLoop::AllEvents, 5);
             QThread::msleep(1);
@@ -278,7 +594,7 @@ extern "C" __declspec(dllexport) int gpvst3_run_runtime_tests(const char *fixtur
         require(g_runtime.trackRuntimes[0].chain.snapshot().activeSlot >= 0 &&
                     g_runtime.trackRuntimes[0].trackSlots[g_runtime.trackRuntimes[0].chain.snapshot().activeSlot].effects[0].get() == preloadedTrack,
                 "track enable reuses the preloaded processor");
-        require(requestGlobalVst3Selection(entries, &error), "activate preloaded global selection");
+        verifyColdSelection({}, entries);
         while (vst3SelectionPending() && std::chrono::steady_clock::now() < preloadDeadline) {
             QCoreApplication::processEvents(QEventLoop::AllEvents, 5);
             QThread::msleep(1);
@@ -291,20 +607,6 @@ extern "C" __declspec(dllexport) int gpvst3_run_runtime_tests(const char *fixtur
         require(!g_runtime.globalPreloaded && !g_runtime.inputPreloaded && !g_runtime.trackRuntimes[0].preloaded.load(),
                 "preload diagnostics distinguish active from prepared slots");
         require(syncTrackSelection("track", entries, &error), "prepare track processors");
-        qputenv("GPVST3_TEST_INITIALIZE_DELAY_MS", "150");
-        const auto requestStarted = std::chrono::steady_clock::now();
-        require(requestGlobalVst3Selection(entries, &error), "queue global processors");
-        const auto requestElapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
-            std::chrono::steady_clock::now() - requestStarted).count();
-        require(requestElapsed < 100, "global VST3 request returned without waiting for initialization");
-        const auto requestDeadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
-        while (vst3SelectionPending() && std::chrono::steady_clock::now() < requestDeadline) {
-            QCoreApplication::processEvents(QEventLoop::AllEvents, 10);
-            QThread::msleep(1);
-        }
-        qunsetenv("GPVST3_TEST_INITIALIZE_DELAY_MS");
-        require(!vst3SelectionPending(),
-                "VST3 processors finish asynchronous initialization");
         auto &track = g_runtime.trackRuntimes[0];
         auto *trackProcessor = track.trackSlots[track.chain.snapshot().activeSlot].effects[0].get();
         auto *globalProcessor = g_runtime.selectionSlots[g_runtime.chain.snapshot().activeSlot].effects[0].get();
@@ -360,6 +662,7 @@ extern "C" __declspec(dllexport) int gpvst3_run_runtime_tests(const char *fixtur
             require(!vst3SelectionPending(), "track maintenance worker completes");
         };
         verifyPreloadRetention(entries, preloadCatalog);
+        verifyTrackCancellationDuringPrepare(entries);
         for (const int rate : {44100, 48000, 96000, 44100}) {
             testRate = rate;
             if (track.configuredRate.load() != rate) {
@@ -437,6 +740,7 @@ extern "C" __declspec(dllexport) int gpvst3_run_runtime_tests(const char *fixtur
         require(consumeSelectionStateChanges(), "failure publishes UI reload notification");
         g_runtime.master.installed = false; g_runtime.dsp.installed = false;
         shutdown();
+        setSelectionNotifier(nullptr);
         qunsetenv("GPVST3_DISABLE_PROJECT_RESTORE");
         std::cout << "PASS: P8 real VST3 buffers, async selection, editor open/reopen/close, scope/state preservation and process failure isolation.\n";
         return 0;

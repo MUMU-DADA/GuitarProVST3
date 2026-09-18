@@ -9,6 +9,7 @@
 #include "pluginterfaces/vst/ivsteditcontroller.h"
 #include "pluginterfaces/vst/ivstparameterchanges.h"
 #include <QtCore/QJsonDocument>
+#include <QtCore/QCoreApplication>
 #include <QtCore/QJsonObject>
 #include <QtCore/QPointer>
 #include <QtCore/QThread>
@@ -27,6 +28,7 @@ using namespace Steinberg;
 using namespace Steinberg::Vst;
 namespace {
 const FUID cid(0x10203040, 0x50607080, 0x11223344, 0x55667788);
+const FUID controllerId(0x10203044, 0x50607080, 0x11223344, 0x55667788);
 #ifdef P8_ORDER_FIXTURE
 const FUID orderIds[]{FUID(0x10203041, 0x50607080, 0x11223344, 0x55667788),
                       FUID(0x10203042, 0x50607080, 0x11223344, 0x55667788),
@@ -48,11 +50,17 @@ public:
     std::atomic<double> firstInput{0}, firstOutput{0}, sampleRate{0};
     tresult PLUGIN_API initialize(FUnknown *) override {
         const int delay = qEnvironmentVariableIntValue("GPVST3_TEST_INITIALIZE_DELAY_MS");
+        if (delay > 0 && QThread::currentThread() == QCoreApplication::instance()->thread())
+            qWarning("Delayed VST3 initialize reached the Qt thread");
         if (delay > 0 && delay <= 2000) QThread::msleep(static_cast<unsigned long>(delay));
         return kResultOk;
     }
     tresult PLUGIN_API terminate() override { handler = nullptr; return kResultOk; }
-    tresult PLUGIN_API getControllerClassId(TUID) override { return kNoInterface; }
+    tresult PLUGIN_API getControllerClassId(TUID result) override {
+        if (!qEnvironmentVariableIsSet("GPVST3_TEST_SEPARATE_CONTROLLER")) return kNoInterface;
+        controllerId.toTUID(result);
+        return kResultOk;
+    }
     tresult PLUGIN_API setIoMode(IoMode) override { return kResultOk; }
     int32 PLUGIN_API getBusCount(MediaType type, BusDirection) override { return type == kAudio ? 1 : 0; }
     tresult PLUGIN_API getBusInfo(MediaType type, BusDirection direction, int32 index, BusInfo &info) override {
@@ -65,6 +73,10 @@ public:
     tresult PLUGIN_API activateBus(MediaType, BusDirection, int32, TBool) override { return kResultOk; }
     tresult PLUGIN_API setActive(TBool) override { return kResultOk; }
     tresult PLUGIN_API setState(IBStream *stream) override {
+        const int delay = qEnvironmentVariableIntValue("GPVST3_TEST_STATE_DELAY_MS");
+        if (delay > 0 && QThread::currentThread() == QCoreApplication::instance()->thread())
+            qWarning("Delayed VST3 setState reached the Qt thread");
+        if (delay > 0 && delay <= 2000) QThread::msleep(static_cast<unsigned long>(delay));
         double value = 1; int32 bytes = 0;
         if (!stream || stream->read(&value, sizeof(value), &bytes) != kResultOk || bytes != sizeof(value)) return kResultFalse;
         if (!std::isfinite(value) || value < 0 || value > 1) return kInvalidArgument;
@@ -223,6 +235,10 @@ public:
 #endif
     }
     tresult PLUGIN_API createInstance(FIDString classId, FIDString iid, void **object) override {
+        if (FUnknownPrivate::iidEqual(classId, controllerId)) {
+            auto effect = Steinberg::owned(new Gain);
+            return effect->queryInterface(iid, object);
+        }
 #ifdef P8_ORDER_FIXTURE
         for (int index = 0; index < 3; ++index) if (FUnknownPrivate::iidEqual(classId, orderIds[index])) {
             auto effect = Steinberg::owned(new Gain(index));

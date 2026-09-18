@@ -77,10 +77,28 @@ public:
             controllers_.removeAll(object);
             return false;
         }
+        const auto name = QByteArray(object->metaObject()->className());
+        // These services may already exist before the asynchronous host gate
+        // finishes. Their next queued call is sufficient to discover them;
+        // waiting for another ChildAdded/Show can leave every chain unresolved.
+        if (name.startsWith("gp::rse::") || name == "gp::gui::IDocumentsManager") {
+            bool added = false;
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                if (!controllers_.contains(object) && controllers_.size() < 128) {
+                    controllers_.append(QPointer<QObject>(object));
+                    QObject::connect(object, &QObject::destroyed, this, [this, object] {
+                        std::lock_guard<std::mutex> guard(mutex_);
+                        controllers_.removeAll(object);
+                    });
+                    added = true;
+                }
+            }
+            if (added) markExplicitTopologyDirty();
+        }
         if (event && event->type() != QEvent::ChildAdded && event->type() != QEvent::ChildRemoved &&
             event->type() != QEvent::Show && event->type() != QEvent::Hide &&
             event->type() != QEvent::DynamicPropertyChange) return false;
-        const auto name = QByteArray(object->metaObject()->className());
         const bool relevant = name == "gp::rse::ConductorController" ||
             name == "gp::gui::IDocumentsManager" || name == "gp::gui::IDocument" ||
             name == "gp::gui::IDocumentView";
@@ -114,17 +132,6 @@ public:
             else if ((type == QEvent::Show || type == QEvent::Hide) &&
                      name == "gp::gui::IDocumentView") { markExplicitTopologyDirty(); markSelectionDirty(); }
         }
-        if (name != "gp::rse::ConductorController" && name != "gp::gui::IDocumentsManager") return false;
-        std::lock_guard<std::mutex> lock(mutex_);
-        for (const auto &known : controllers_)
-            if (known == object) return false;
-        if (controllers_.size() < 128) {
-            controllers_.append(QPointer<QObject>(object));
-            QObject::connect(object, &QObject::destroyed, this, [this, object] {
-                std::lock_guard<std::mutex> guard(mutex_);
-                controllers_.removeAll(object);
-            });
-        }
         return false;
     }
 
@@ -142,6 +149,7 @@ private:
 };
 
 ControllerObserver *g_observer = nullptr;
+bool g_initialized = false;
 std::mutex g_snapshotMutex;
 Binding g_bindings[kMaxBindings];
 Binding g_bindingBuffers[2][kMaxBindings];
@@ -335,19 +343,24 @@ struct NativeTrack {
 };
 std::vector<NativeTrack> g_nativeTracks;
 std::weak_ptr<gp::core::Score> g_activeScore;
+QPointer<QWidget> g_activeDocumentView;
 std::string g_activeDocumentId;
+std::atomic<bool> g_hostVerified{false};
+std::atomic<bool> g_qtCoreVerified{false};
 
 std::vector<Binding> collect() {
-    static const bool verified = host::verify().supported;
-    if (!verified) return {};
+    if (!g_hostVerified.load(std::memory_order_acquire) ||
+        !g_qtCoreVerified.load(std::memory_order_acquire)) return {};
     bool bridgeAvailable = false;
     const auto bridgeContexts = collectFromMcpBridge(&bridgeAvailable);
     std::vector<Binding> result;
     std::weak_ptr<gp::core::Score> activeScore;
+    QPointer<QWidget> activeView;
     std::string activeId;
     const auto finish = [&] {
         mergeBridgeContexts(result, bridgeContexts);
         g_activeScore = activeScore;
+        g_activeDocumentView = activeView;
         g_activeDocumentId = activeId;
         g_bindingSource.store(bridgeAvailable ? "mcp_context_native_registry" : "native_document_registry",
                               std::memory_order_release);
@@ -388,6 +401,7 @@ std::vector<Binding> collect() {
         if (document == documents.end()) continue;
         if (activeDocument == document->object) {
             activeScore = conductor->score();
+            activeView = document->view;
             activeId = document->id.toStdString();
         }
         const auto &tracks = conductor->score()->tracks();
@@ -503,9 +517,37 @@ void notifyCursorChanged(void *cursor) noexcept {
 bool refreshNeeded() noexcept { return g_dirty.load(std::memory_order_acquire); }
 bool refreshIncomplete() noexcept { return g_refreshIncomplete.load(std::memory_order_acquire); }
 
-void initialize() noexcept {
+void observeHostObjects() noexcept {
     if (g_observer || !qApp) return;
     try {
+        g_observer = new ControllerObserver;
+        g_observer->setParent(qApp);
+        qApp->installEventFilter(g_observer);
+        // The Qt hook validates its own layout/version.  Installing it early
+        // only records future QObject lifetimes; native ABI reads remain gated
+        // by the exact host and Qt hashes in initialize().
+        g_objects.install();
+    } catch (...) {
+        g_observer = nullptr;
+    }
+}
+
+void initialize() noexcept {
+    const auto verification = host::verify();
+    const auto qtCore = QDir(QCoreApplication::applicationDirPath()).filePath("Qt5Core.dll");
+    initialize(verification.supported,
+               host::sha256(qtCore) ==
+                   "C2F85BD55C31E5380DD99F0D517EE183A54C3852480BC497DC30A5483FD70FF2");
+}
+
+void initialize(bool hostSupported, bool qtCoreSupported) noexcept {
+    if (g_initialized || !qApp) return;
+    try {
+    observeHostObjects();
+    if (!g_observer) return;
+    g_initialized = true;
+    g_hostVerified.store(hostSupported, std::memory_order_release);
+    g_qtCoreVerified.store(qtCoreSupported, std::memory_order_release);
     g_dirty.store(true, std::memory_order_release);
     g_topologyDirty.store(true, std::memory_order_release);
     g_forceTopologyRefresh.store(true, std::memory_order_release);
@@ -516,18 +558,19 @@ void initialize() noexcept {
         g_selectionEventNanoseconds.store(0, std::memory_order_release);
         g_contextPublishLatencyNanoseconds.store(0, std::memory_order_release);
         g_droppedRefreshCount.store(0, std::memory_order_release);
-        g_observer = new ControllerObserver;
-        g_observer->setParent(qApp);
-        qApp->installEventFilter(g_observer);
-        const auto qtCore = QDir(QCoreApplication::applicationDirPath()).filePath("Qt5Core.dll");
-        if (host::verify().supported && host::sha256(qtCore) ==
-            "C2F85BD55C31E5380DD99F0D517EE183A54C3852480BC497DC30A5483FD70FF2") g_objects.install();
+        // The constructor normally installs the hook before this gate is
+        // evaluated. Retry here when Qt finished loading between those turns;
+        // the registry performs only its own hook-layout validation.
+        if (hostSupported && qtCoreSupported) g_objects.install();
     } catch (...) {
         g_observer = nullptr;
     }
 }
 
 void shutdown() noexcept {
+    g_initialized = false;
+    g_hostVerified.store(false, std::memory_order_release);
+    g_qtCoreVerified.store(false, std::memory_order_release);
     g_refreshNotifier.store(nullptr, std::memory_order_release);
     g_dirty.store(false, std::memory_order_release);
     g_topologyDirty.store(false, std::memory_order_release);
@@ -547,6 +590,7 @@ void shutdown() noexcept {
     g_observer = nullptr;
     g_nativeTracks.clear();
     g_activeScore.reset();
+    g_activeDocumentView = nullptr;
     g_activeDocumentId.clear();
     g_bindingCount.store(0, std::memory_order_release);
     g_activeBuffer.store(0, std::memory_order_release);
@@ -628,10 +672,13 @@ std::size_t refresh() noexcept {
 }
 
 std::size_t refreshIfNeeded() noexcept {
+    const bool structureChanged = checkStructureChanged();
     if (g_bindingCount.load(std::memory_order_acquire) != 0 &&
         g_dirty.load(std::memory_order_acquire) &&
+        !g_refreshIncomplete.load(std::memory_order_acquire) &&
+        !g_activeScore.expired() &&
         !g_forceTopologyRefresh.load(std::memory_order_acquire) &&
-        !checkStructureChanged())
+        !structureChanged)
         return g_bindingCount.load(std::memory_order_acquire);
     if (!g_dirty.load(std::memory_order_acquire))
         return g_bindingCount.load(std::memory_order_acquire);
@@ -642,6 +689,15 @@ bool checkStructureChanged() noexcept {
     // Only test the cached lifetimes here. In particular this fallback does
     // not enumerate the bridge merely to discover its generation.
     bool changed = false;
+    if (g_activeDocumentView) {
+        const auto *pages = qobject_cast<QStackedWidget *>(g_activeDocumentView->parentWidget());
+        // New/open/activate can switch the document page while the previous
+        // Score remains alive. A track-count comparison of that old Score
+        // cannot detect this: refresh the native bindings for the new page.
+        changed = pages && pages->currentWidget() != g_activeDocumentView;
+    } else if (!g_activeDocumentId.empty()) {
+        changed = true;
+    }
     if (!changed) {
         const auto score = g_activeScore.lock();
         if (score) {
@@ -682,6 +738,25 @@ bool bridgeTopologyMatches(const std::vector<BridgeContext> &contexts) noexcept 
 
 bool refreshSelectionContext() noexcept {
     if (!g_selectionDirty.exchange(false, std::memory_order_acq_rel)) return false;
+    if (checkStructureChanged()) {
+        g_selectionDirty.store(true, std::memory_order_release);
+        return false;
+    }
+    bool bridgeAvailable = false;
+    const auto bridgeContexts = collectFromMcpBridge(&bridgeAvailable);
+    const auto bridgeActive = std::find_if(bridgeContexts.begin(), bridgeContexts.end(),
+        [](const BridgeContext &context) { return context.activeDocument == 1; });
+    // The optional MCP provider can receive a cursor request before Guitar
+    // Pro's native Score cursor is updated. Use its copied metadata for this
+    // selection tick, but never retain a provider pointer across callbacks.
+    // A different active document still requires the full native recollection
+    // above so an old score cannot remain bound to the new panel.
+    if (bridgeAvailable && bridgeActive != bridgeContexts.end() &&
+        bridgeActive->documentId.toStdString() != g_activeDocumentId) {
+        g_selectionDirty.store(true, std::memory_order_release);
+        markExplicitTopologyDirty();
+        return false;
+    }
     const auto score = g_activeScore.lock();
     if (!score || g_activeDocumentId.empty()) {
         g_selectionDirty.store(true, std::memory_order_release);
@@ -702,11 +777,19 @@ bool refreshSelectionContext() noexcept {
     for (std::size_t i = 0; i < count; ++i) {
         auto value = g_bindingBuffers[active][i];
         g_bindingBuffers[target][i] = value;
-        const bool activeValue = value.documentId == g_activeDocumentId;
+        const auto bridge = std::find_if(bridgeContexts.begin(), bridgeContexts.end(),
+            [&](const BridgeContext &context) {
+                return context.documentId.toStdString() == value.documentId &&
+                       context.trackIndex == value.trackIndex;
+            });
+        const bool activeValue = bridge != bridgeContexts.end() && bridge->activeDocument != 2
+            ? bridge->activeDocument == 1 : value.documentId == g_activeDocumentId;
+        const bool selectedValue = bridge != bridgeContexts.end() && bridge->selectedTrack != 2
+            ? bridge->selectedTrack == 1 : (activeValue && value.trackIndex == selectedIndex);
         changed |= value.activeDocument != activeValue ||
-                   value.selectedTrack != (activeValue && value.trackIndex == selectedIndex);
+                   value.selectedTrack != selectedValue;
         value.activeDocument = activeValue;
-        value.selectedTrack = activeValue && value.trackIndex == selectedIndex;
+        value.selectedTrack = selectedValue;
         g_bindingBuffers[target][i] = value;
     }
     if (changed) {

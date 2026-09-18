@@ -94,9 +94,11 @@ void dispatchTrackRefresh() {
     // comparison over the cached score. Steady-state cursor events skip it.
     if (topologyEvent || (g_trackFallbackTimer && g_trackFallbackTimer->isActive()))
         gpvst3::gp_audio::checkStructureChanged();
-    gpvst3::hook::refreshTrackContext();
+    // Publish completion before enqueueing another context refresh; otherwise
+    // syncSelection can keep seeing our newly queued work as still busy.
     if (gpvst3::hook::consumeSelectionStateChanges()) gpvst3::ui::reloadVst3Selections();
     gpvst3::ui::syncVst3Selection();
+    gpvst3::hook::refreshTrackContext();
     gpvst3::ui::refreshVst3TrackContext();
     // Project graph preparation is event-driven and score-scoped. Catalog
     // completion alone must never instantiate every discovered module.
@@ -482,17 +484,27 @@ void shutdown() noexcept {
 }
 
 QJsonObject initialize() {
+    return initialize(host::verify());
+}
+
+QJsonObject initialize(const host::Verification &verification) {
     g_stopping.store(false, std::memory_order_release);
-    const auto host = host::verify();
+    const auto host = verification;
     const bool enabled = state::pluginEnabled();
     if (enabled) state::migrateDesiredEnabledIntent();
     if (enabled) {
-        gpvst3::gp_audio::initialize();
+        gpvst3::gp_audio::initialize(host.supported, host.qtCoreSupported);
         gpvst3::gp_audio::setRefreshNotifier(&scheduleTrackRefresh);
         hook::prepare(host);
         hook::setSelectionNotifier(&scheduleTrackRefresh);
         hook::setTrackContextNotifier(&notifyTrackContextComplete);
-        hook::refreshTrackContext();
+        // Native score discovery can walk Guitar Pro's object graph. Defer
+        // the first walk until the startup callback has returned to Qt so the
+        // host can paint and accept input before that control-thread work.
+        if (auto *application = QCoreApplication::instance())
+            QTimer::singleShot(75, application, [] {
+                if (!g_stopping.load(std::memory_order_acquire)) hook::refreshTrackContext();
+            });
         ui::setRealtimeBypassControl(&hook::setTotalBypass);
         ui::setVst3SelectionControl(&hook::setGlobalVst3Selection);
         ui::setVst3SelectionRequestControl(&hook::requestGlobalVst3Selection);
@@ -501,7 +513,8 @@ QJsonObject initialize() {
         ui::setVst3TrackSelectionRequestControl(&hook::requestTrackVst3Selection);
         ui::setVst3TrackGenerationRequestControl(&hook::requestTrackVst3SelectionAtGeneration);
         ui::setVst3StateControl(&hook::captureGlobalVst3States);
-        ui::setVst3TrackControls(&hook::captureTrackVst3States, &hook::openTrackVst3Editor);
+        ui::setVst3TrackControls(&hook::captureTrackVst3States, &hook::openTrackVst3Editor,
+                                 &hook::activeTrackVst3States);
         ui::setVst3EditorControl(&hook::openVst3Editor, &hook::closeVst3Editors, &hook::scaleVst3Editor);
     } else {
         ui::setRealtimeBypassControl(nullptr);

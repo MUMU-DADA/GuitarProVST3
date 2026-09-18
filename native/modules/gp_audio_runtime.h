@@ -24,7 +24,11 @@ struct Binding {
 // Installs a lightweight Qt event observer so native ConductorController
 // objects created outside the QWidget tree become available to the control
 // thread.  No native model calls are made from the audio callback.
+// Register only a Qt event observer before asynchronous host verification so
+// unparented services created during startup are not lost. No native ABI calls.
+void observeHostObjects() noexcept;
 void initialize() noexcept;
+void initialize(bool hostSupported, bool qtCoreSupported) noexcept;
 void shutdown() noexcept;
 void setRefreshNotifier(RefreshNotifier notifier) noexcept;
 void markDirty() noexcept;

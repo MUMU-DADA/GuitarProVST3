@@ -64,6 +64,12 @@ P10 激活夹具验证下一 callback 旁路、warm/cold slot 首个处理块和
 
 状态文件中的 `selection_*`、`audio_generation`、`chain_*first_processed*` 和 `editor_stage/editor_result_code` 是 P10 的结构化证据入口。
 
+勾选冷加载的响应性专项可使用下面的命令。`-CheckSelectionResponsive` 在初始化期间持续查询 Qt，保留每次查询耗时和目标插件行背景进度带的可见状态；要求加载期间可见、完成后隐藏。查询按进度控件的父行名称匹配，避免把其他插件或启动扫描动画误认为本次加载。`-EditorOnly` 同时检查 editor 实际关闭后重开，避免只凭 close 请求返回判定成功。快速插件的加载可能不足以采到两次进度，因此本项使用冷加载较慢的 Neural DSP。
+
+```powershell
+./native/test/test-p7-mcp.ps1 -EditorOnly -CheckSelectionResponsive -HookMode default -PluginPath .tools/native/checkbox-release2/plugins/imageformats/guitarpro_vst3_autoload.dll -Vst3Root 'Neural DSP/Archetype Mateus Asato.vst3;Gateway.vst3'
+```
+
 ## P11 验证
 
 P11 专项不使用 computer use；维护 writer、dirty 合并、scanner poll、P9 UI 和 P10 activation 由 `test-p11.ps1` 串联。真实宿主使用已安装 MCP bridge 与 `test-p8-track-runtime.ps1`：

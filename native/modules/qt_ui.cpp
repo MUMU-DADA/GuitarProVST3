@@ -10,6 +10,8 @@
 #include <QtCore/QJsonObject>
 #include <QtCore/QVariant>
 #include <QtCore/QPointer>
+#include <QtCore/QHash>
+#include <QtCore/QSet>
 #include <QtCore/QTimer>
 #include <QtCore/QSignalBlocker>
 #include <functional>
@@ -22,6 +24,8 @@
 #include <QtGui/QFontMetrics>
 #include <QtGui/QMouseEvent>
 #include <QtGui/QDesktopServices>
+#include <QtGui/QPainter>
+#include <QtGui/QPaintEvent>
 #include <QtCore/QUrl>
 #include <QtGui/QResizeEvent>
 #include <QtWidgets/QAction>
@@ -38,7 +42,9 @@
 #include <QtWidgets/QMainWindow>
 #include <QtWidgets/QMenuBar>
 #include <QtWidgets/QPushButton>
+#include <QtWidgets/QProgressBar>
 #include <QtWidgets/QSpinBox>
+#include <QtWidgets/QStatusBar>
 #include <QtWidgets/QTableWidget>
 #include <QtWidgets/QVBoxLayout>
 #include <QtWidgets/QWidget>
@@ -59,6 +65,7 @@ Vst3TrackSelectionRequestControl g_vst3TrackSelectionRequestControl = nullptr;
 Vst3TrackGenerationRequestControl g_vst3TrackGenerationRequestControl = nullptr;
 Vst3StateControl g_vst3StateControl = nullptr;
 Vst3TrackStateControl g_vst3TrackStateControl = nullptr;
+Vst3TrackActiveControl g_vst3TrackActiveControl = nullptr;
 Vst3TrackEditorControl g_vst3TrackEditorControl = nullptr;
 Vst3EditorControl g_vst3EditorControl = nullptr;
 Vst3EditorCloseControl g_vst3EditorCloseControl = nullptr;
@@ -78,6 +85,9 @@ QPointer<QTimer> g_panelAttachTimer;
 std::function<void()> g_panelAttach;
 bool g_panelAttachPending = false;
 QPointer<QDialog> g_aboutDialog;
+QPointer<QProgressBar> g_startupProgress;
+QPointer<QAction> g_startupProgressAction;
+bool g_startupProgressActive = false;
 QPointer<QObject> g_aboutObserver;
 QPointer<QMainWindow> g_aboutObservedWindow;
 bool g_panelUsesP7 = true;
@@ -439,7 +449,7 @@ QDialog *aboutDialog() {
     title->setFont(titleFont);
     layout->addWidget(title);
     auto *details = new QLabel(
-        QStringLiteral("版本：0.9.13\n"
+        QStringLiteral("版本：0.9.17\n"
                        "已验证宿主：Guitar Pro 8.1.1.17（Windows x64）\n"
                        "许可证：MIT License\n"
                        "第三方声明：VST3 SDK 及插件各自遵循其许可证。\n"
@@ -589,6 +599,88 @@ void ensureAboutEntry() {
     window->setProperty("gpvst3AboutMount", "menu_fallback");
 }
 
+class SelectionCheckBox final : public QCheckBox {
+public:
+    explicit SelectionCheckBox(QWidget *parent) : QCheckBox(parent) {}
+protected:
+    void nextCheckState() override {
+        // A partially checked row is a cancellable request, not another
+        // enabled state in Qt's normal three-state checkbox cycle.
+        setCheckState(checkState() == Qt::Unchecked ? Qt::Checked : Qt::Unchecked);
+    }
+};
+
+// A pending selection is shown on the row that owns the request.  Keeping
+// this as a transparent, mouse-through child means the checkbox and name
+// button remain usable while the host prepares the chain.  The animation is
+// deliberately tiny and self-contained; it never starts a timer for a settled
+// row.
+class RowLoadingBackground final : public QWidget {
+public:
+    explicit RowLoadingBackground(QWidget *parent) : QWidget(parent) {
+        setAttribute(Qt::WA_TransparentForMouseEvents);
+        setAttribute(Qt::WA_NoSystemBackground);
+        setObjectName(QStringLiteral("gpvst3RowLoading"));
+        timer_.setInterval(70);
+        QObject::connect(&timer_, &QTimer::timeout, this, [this] {
+            // One sweep takes about 1.75 seconds at the 70 ms tick.
+            phase_ = (phase_ + 40) % 1000;
+            update();
+        });
+        hide();
+    }
+
+    void setActive(bool active) {
+        if (active == active_) return;
+        active_ = active;
+        if (active_) {
+            phase_ = 0;
+            show();
+            timer_.start();
+        } else {
+            timer_.stop();
+            hide();
+        }
+        update();
+    }
+
+protected:
+    void paintEvent(QPaintEvent *) override {
+        if (!active_ || width() <= 0 || height() <= 0) return;
+        QPainter painter(this);
+        painter.setRenderHint(QPainter::Antialiasing, false);
+        painter.fillRect(rect(), QColor(79, 156, 249, 16));
+        const int span = width() + qMax(16, width() / 3);
+        const int band = qMax(16, width() / 4);
+        const int x = (phase_ * span / 1000) - band;
+        painter.fillRect(QRect(x, height() - 3, band, 3), QColor(79, 156, 249, 125));
+    }
+
+private:
+    QTimer timer_;
+    int phase_ = 0;
+    bool active_ = false;
+};
+
+class EffectRow final : public QWidget {
+public:
+    explicit EffectRow(QWidget *parent) : QWidget(parent), loading_(new RowLoadingBackground(this)) {
+        loading_->lower();
+    }
+
+    void setLoading(bool active) { loading_->setActive(active); }
+
+protected:
+    void resizeEvent(QResizeEvent *event) override {
+        QWidget::resizeEvent(event);
+        loading_->setGeometry(rect());
+        loading_->lower();
+    }
+
+private:
+    RowLoadingBackground *loading_;
+};
+
 class ElidedButton final : public QPushButton {
 public:
     explicit ElidedButton(QWidget *parent = nullptr) : QPushButton(parent) {
@@ -717,20 +809,24 @@ public:
         bool failed = false, anyEnabled = false;
         for (const auto &value : effects_) {
             const auto effect = value.toObject();
-            anyEnabled |= effect.value("enabled").toBool();
+            anyEnabled |= checkStateFor(effect) == Qt::Checked;
             failed |= !effect.value("last_error").toString().isEmpty();
         }
-        setProperty("gpvst3SelectionState", failed ? "failed_reverted" : "applied");
+        setProperty("gpvst3SelectionState", pendingTrackSelection_ ? "request_pending" :
+                    failed ? "failed_reverted" : "applied");
         if (status_) {
-            if (failed) status_->setText(QStringLiteral("启用失败，已恢复到实际状态；可重新勾选重试。"));
+            if (pendingTrackSelection_) status_->setText(QStringLiteral("正在准备插件，点击勾选框可取消。"));
+            else if (failed) status_->setText(QStringLiteral("启用失败，已恢复到实际状态；可重新勾选重试。"));
             else if (anyEnabled) status_->setText(QStringLiteral("已生效。"));
         }
+        refreshRowLoading();
     }
 
     void refreshTrackContext() {
         if (scope_ == state::ScopeKind::Global) return;
         const auto nextKey = state::currentTrackKey();
-        const auto changed = nextKey != trackKey_ || trackContextAvailable() != contextReady_;
+        const auto changed = nextKey != trackKey_ || trackContextAvailable() != contextReady_ ||
+            state::runtimeSelectionGeneration() != selectionGeneration_;
         if (trackContext_) trackContext_->setText(configuredTrackLabel());
         if (!changed) return;
         saveRuntimeState();
@@ -758,6 +854,17 @@ public:
         // (the same tick that reloads failed entries). This avoids a 50 ms
         // UI polling loop while still retrying exactly once after the worker
         // has published the prepared slot.
+        const bool busy = g_vst3BusyControl && g_vst3BusyControl();
+        if (!busy) {
+            // The worker can finish before the host exposes a reliable active
+            // snapshot.  Keep retrying the track snapshot while pending so a
+            // transient try-lock failure cannot strand the row in PartiallyChecked.
+            if (selectionRequestPending_) {
+                selectionRequestPending_ = false;
+                pendingAnimationEffects_.clear();
+            }
+            if (pendingTrackSelection_) reloadSavedSelection();
+        }
         if (!g_pendingEditorKey.isEmpty() && (!g_vst3BusyControl || !g_vst3BusyControl())) {
             bool matched = false;
             for (int index = 0; index < effects_.size(); ++index) {
@@ -776,9 +883,65 @@ public:
                 if (g_pendingEditorKey.startsWith(scopePrefix)) g_pendingEditorKey.clear();
             }
         }
+        refreshRowLoading();
     }
 
 private:
+    bool rowLoading(const QJsonObject &effect) const {
+        const auto identity = key(effect);
+        if (scope_ == state::ScopeKind::Track)
+            return trackSelectionIsPending() && pendingAnimationEffects_.contains(identity);
+        return selectionRequestPending_ && pendingAnimationEffects_.contains(identity);
+    }
+
+    void refreshRowLoading() {
+        for (auto *list : {list_, availableList_}) {
+            if (!list) continue;
+            for (int row = 0; row < list->count(); ++row) {
+                auto *widget = static_cast<EffectRow *>(list->itemWidget(list->item(row)));
+                if (!widget) continue;
+                const auto identity = widget->property("gpvst3EntryId").toString();
+                const auto index = indexFor(identity);
+                if (index >= 0) widget->setLoading(rowLoading(effects_.at(index).toObject()));
+            }
+        }
+    }
+
+    bool trackSelectionIsPending() const {
+        return scope_ == state::ScopeKind::Track && pendingTrackSelection_ &&
+               pendingTrackGeneration_ == selectionGeneration_;
+    }
+
+    bool displayedSelection(const QJsonObject &effect) const {
+        if (scope_ != state::ScopeKind::Track || !g_vst3TrackActiveControl)
+            return effect.value("enabled").toBool();
+        return (trackSelectionIsPending() ? pendingTrackEffects_ : activeTrackEffects_).contains(key(effect));
+    }
+
+    Qt::CheckState checkStateFor(const QJsonObject &effect) const {
+        if (!displayedSelection(effect)) return Qt::Unchecked;
+        if (scope_ == state::ScopeKind::Track && g_vst3TrackActiveControl &&
+            !activeTrackEffects_.contains(key(effect))) return Qt::PartiallyChecked;
+        return Qt::Checked;
+    }
+
+    void refreshActiveTrackState() {
+        if (scope_ != state::ScopeKind::Track) return;
+        if (!g_vst3TrackActiveControl || trackKey_.isEmpty()) {
+            if (pendingTrackSelection_ && (!g_vst3BusyControl || !g_vst3BusyControl()))
+                pendingTrackSelection_ = false;
+            return;
+        }
+        std::vector<Vst3SelectionEntry> live;
+        if (!g_vst3TrackActiveControl(trackKey_.toStdString(), live)) return;
+        activeTrackEffects_.clear();
+        for (const auto &entry : live)
+            activeTrackEffects_.insert(QString::fromStdString(entry.module) + '\n' +
+                                       QString::fromStdString(entry.classId));
+        if (trackSelectionIsPending() && (!g_vst3BusyControl || !g_vst3BusyControl()))
+            pendingTrackSelection_ = false;
+    }
+
     void restoreSelection() {
         if (publishSelection()) return;
         const auto error = status_->toolTip();
@@ -808,14 +971,16 @@ private:
         return {bytes.begin(), bytes.end()};
     }
 
-    bool publishSelection() {
+    bool publishSelection(const QString &requestIdentity = QString()) {
         if (scope_ == state::ScopeKind::Track &&
             selectionGeneration_ != state::runtimeSelectionGeneration()) {
             setProperty("gpvst3SelectionState", "stale_scope");
             QTimer::singleShot(0, this, [this] { loadChain(); });
             return false;
         }
-        if (!g_vst3SelectionControl && !g_vst3TrackSelectionControl) return true; // isolated UI fixture
+        if (!g_vst3SelectionControl && !g_vst3SelectionRequestControl && !g_vst3TrackSelectionControl &&
+            !g_vst3TrackSelectionRequestControl && !g_vst3TrackGenerationRequestControl)
+            return true; // isolated UI fixture
         std::vector<Vst3SelectionEntry> selection;
         for (const auto &value : effects_) {
             const auto effect = value.toObject();
@@ -828,6 +993,12 @@ private:
         }
         selectionDirty_ = false;
         setProperty("gpvst3SelectionState", "requesting");
+        const bool asynchronous = scope_ == state::ScopeKind::Global
+            ? static_cast<bool>(g_vst3SelectionRequestControl)
+            : static_cast<bool>(g_vst3TrackGenerationRequestControl ||
+                                g_vst3TrackSelectionRequestControl);
+        const bool previousSelectionRequestPending = selectionRequestPending_;
+        const QSet<QString> previousPendingAnimationEffects = pendingAnimationEffects_;
         std::string error;
         const bool accepted = scope_ == state::ScopeKind::Global
             ? (g_vst3SelectionRequestControl ? g_vst3SelectionRequestControl(selection, &error)
@@ -839,11 +1010,42 @@ private:
                : (g_vst3TrackSelectionControl ? g_vst3TrackSelectionControl(
                   trackKey_.toStdString(), selection, &error) : true));
         if (accepted) {
-            setProperty("gpvst3SelectionState",
-                        (g_vst3SelectionRequestControl || g_vst3TrackSelectionRequestControl)
-                            ? "request_pending" : "applied");
+            selectionRequestPending_ = asynchronous;
+            pendingAnimationEffects_.clear();
+            if (asynchronous) {
+                // Keep feedback for requests that are still represented in
+                // the newest chain. This covers a second checkbox edit while
+                // the first plug-in is still initializing; removing an entry
+                // from the chain also removes its stale animation.
+                QSet<QString> requestedIdentities;
+                for (const auto &entry : selection)
+                    requestedIdentities.insert(QString::fromStdString(entry.module) +
+                                               QStringLiteral("\n") +
+                                               QString::fromStdString(entry.classId));
+                for (const auto &identity : previousPendingAnimationEffects)
+                    if (requestedIdentities.contains(identity))
+                        pendingAnimationEffects_.insert(identity);
+                if (requestedIdentities.contains(requestIdentity))
+                    pendingAnimationEffects_.insert(requestIdentity);
+            }
+            if (scope_ == state::ScopeKind::Track && asynchronous) {
+                pendingTrackSelection_ = true;
+                pendingTrackGeneration_ = selectionGeneration_;
+                pendingTrackEffects_.clear();
+                for (const auto &entry : selection)
+                    pendingTrackEffects_.insert(QString::fromStdString(entry.module) +
+                                                QStringLiteral("\n") +
+                                                QString::fromStdString(entry.classId));
+            }
+            setProperty("gpvst3SelectionState", asynchronous ? "request_pending" : "applied");
+            refreshRowLoading();
             return true;
         }
+        // A rejected replacement request leaves the previously queued work
+        // untouched, so retain its row feedback until that work completes.
+        selectionRequestPending_ = previousSelectionRequestPending;
+        pendingAnimationEffects_ = previousPendingAnimationEffects;
+        refreshRowLoading();
         setProperty("gpvst3SelectionState", "failed_reverted");
         QString message = QStringLiteral("无法启用此插件：插件初始化失败。");
         if (error == "host_unsupported")
@@ -921,6 +1123,11 @@ private:
             status_->setText(QStringLiteral("状态恢复失败：%1").arg(error));
         auto saved = state::scopeEffects(sidecar_, scope_, scoreKey_, trackKey_);
         effectsScopeKey_ = scope_ == state::ScopeKind::Track ? trackKey_ : QStringLiteral("global");
+        // Keep sidecar intent in effects_. Render track state separately so
+        // opening/rebuilding the panel cannot persist a temporary bypass over
+        // that intent. A busy snapshot retains the last known active set;
+        // before the first reliable snapshot, no entry is shown as active.
+        refreshActiveTrackState();
         QHash<QString, int> savedRows;
         for (int index = 0; index < saved.size(); ++index) {
             const auto effect = saved.at(index).toObject();
@@ -980,9 +1187,9 @@ private:
             missing.insert("identified", false);
             preservedMissing.append(missing);
         }
-        std::stable_sort(catalogEffects.begin(), catalogEffects.end(), [](const QJsonValue &a, const QJsonValue &b) {
+        std::stable_sort(catalogEffects.begin(), catalogEffects.end(), [this](const QJsonValue &a, const QJsonValue &b) {
             const auto left = a.toObject(), right = b.toObject();
-            const bool le = left.value("enabled").toBool(), re = right.value("enabled").toBool();
+            const bool le = displayedSelection(left), re = displayedSelection(right);
             if (le != re) return le > re;
             if (le) return left.value("order").toInt() < right.value("order").toInt();
             const auto ln = left.value("name").toString(), rn = right.value("name").toString();
@@ -1012,19 +1219,21 @@ private:
         // copy the previous selected track onto a newly inserted track while
         // Guitar Pro is still applying its asynchronous Score mutation.
         scanFeedback();
+        if (trackSelectionIsPending())
+            status_->setText(QStringLiteral("正在准备插件，点击勾选框可取消。"));
     }
 
     void appendRow(const QJsonObject &effect, const QString &label) {
         const int index = effects_.size();
         effects_.append(effect);
-        auto *targetList = effect.value("enabled").toBool() ? activeList() : activeAvailableList();
+        auto *targetList = displayedSelection(effect) ? activeList() : activeAvailableList();
         auto *item = new QListWidgetItem(targetList);
-        auto *row = new QWidget(targetList);
+        auto *row = new EffectRow(targetList);
         row->setMinimumHeight(qMax(32, qRound(32 * devicePixelRatioF())));
         auto *layout = new QHBoxLayout(row);
         layout->setContentsMargins(2, 1, 2, 1);
         layout->setSpacing(3);
-        auto *check = new QCheckBox(row);
+        auto *check = new SelectionCheckBox(row);
         const auto token = effect.value("class_id").toString();
         const auto prefix = scope_ == state::ScopeKind::Track ? QStringLiteral("gpvst3")
                                                               : QStringLiteral("gpvst3Global");
@@ -1032,12 +1241,15 @@ private:
         check->setObjectName(prefix + QStringLiteral("Enabled_") + token);
         check->setFixedWidth(20);
         const bool trackContextReady = scope_ != state::ScopeKind::Track ||
-            (trackContextAvailable() && g_vst3TrackSelectionControl);
+            (trackContextAvailable() && (g_vst3TrackSelectionControl ||
+             g_vst3TrackSelectionRequestControl || g_vst3TrackGenerationRequestControl));
         check->setEnabled(trackContextReady);
         check->setToolTip(trackContextReady ? QString{} :
             QStringLiteral("音轨效果器暂不可用：等待宿主音轨上下文（track_scope_unresolved）。"));
         check->setAccessibleName(QStringLiteral("启用 %1").arg(effect.value("name").toString()));
-        check->setChecked(effect.value("enabled").toBool());
+        check->setCheckState(checkStateFor(effect));
+        if (check->checkState() == Qt::PartiallyChecked)
+            check->setToolTip(QStringLiteral("正在准备插件，点击可取消。"));
         auto *name = new ElidedButton(row);
         name->setObjectName(prefix + QStringLiteral("Name_") + token);
         name->setFullText(label);
@@ -1070,10 +1282,23 @@ private:
         targetList->setItemWidget(item, row);
         const auto identity = key(effect);
         row->setProperty("gpvst3EntryId", identity);
+        row->setLoading(rowLoading(effect));
         connect(check, &QCheckBox::toggled, this, [this, identity, check](bool enabled) {
             const int index = indexFor(identity); if (index < 0) return;
+            const auto previousEffects = effects_;
+            const auto previousCheckState = checkStateFor(effects_.at(index).toObject());
+            // A user edit starts from the active/pending list they can see,
+            // rather than resurrecting an invisible stale sidecar selection.
+            if (scope_ == state::ScopeKind::Track && g_vst3TrackActiveControl) {
+                for (int i = 0; i < effects_.size(); ++i) {
+                    auto visible = effects_.at(i).toObject();
+                    const bool selected = displayedSelection(visible);
+                    visible.insert("enabled", selected);
+                    visible.insert("bypass", !selected);
+                    effects_.replace(i, visible);
+                }
+            }
             auto effect = effects_.at(index).toObject();
-            const auto previous = effect;
             const auto editorKey = (scope_ == state::ScopeKind::Global ? QStringLiteral("global") : trackKey_) + '\n' + key(effect);
             if (!enabled && g_pendingEditorKey == editorKey) g_pendingEditorKey.clear();
             if (!enabled && g_editorWindow && g_editorWindow->openedKey == editorKey) g_editorWindow->close();
@@ -1090,11 +1315,15 @@ private:
                 effect.insert("order", nextOrder);
             }
             effects_.replace(index, effect);
-            if (!publishSelection()) {
-                effects_.replace(index, previous);
+            if (!publishSelection(identity)) {
+                effects_ = previousEffects;
                 const QSignalBlocker blocked(check);
-                check->setChecked(previous.value("enabled").toBool());
+                check->setCheckState(previousCheckState);
                 return;
+            }
+            if (scope_ == state::ScopeKind::Track && g_vst3TrackActiveControl) {
+                const QSignalBlocker blocked(check);
+                check->setCheckState(checkStateFor(effect));
             }
             saveRuntimeState(false);
             status_->setToolTip(QString());
@@ -1102,7 +1331,8 @@ private:
                 ? (scope_ == state::ScopeKind::Track && !state::runtimeTrackContextAvailable()
                     ? QStringLiteral("已保存音轨链：等待宿主确认音轨上下文，当前保持旁路。")
                     : ((g_vst3SelectionRequestControl && scope_ == state::ScopeKind::Global) ||
-                       (g_vst3TrackSelectionRequestControl && scope_ == state::ScopeKind::Track)
+                       ((g_vst3TrackSelectionRequestControl || g_vst3TrackGenerationRequestControl) &&
+                        scope_ == state::ScopeKind::Track)
                         ? QStringLiteral("请求中：准备完成后自动生效。")
                         : QStringLiteral("已启用：双击名称打开原生 GUI")))
                 : QStringLiteral("已停用：%1").arg(effect.value("name").toString()));
@@ -1131,7 +1361,7 @@ private:
             return;
         }
         const auto effect = effects_.at(index).toObject();
-        if (!effect.value("enabled").toBool()) {
+        if (!displayedSelection(effect)) {
             status_->setText(QStringLiteral("请先勾选启用插件，再打开其 GUI。"));
             return;
         }
@@ -1236,14 +1466,28 @@ private:
     int trackIndex_ = -1;
     std::uint64_t selectionGeneration_ = 0;
     bool contextReady_ = false;
+    QSet<QString> activeTrackEffects_, pendingTrackEffects_;
+    bool pendingTrackSelection_ = false;
+    std::uint64_t pendingTrackGeneration_ = 0;
+    bool selectionRequestPending_ = false;
+    QSet<QString> pendingAnimationEffects_;
 
     void bindTrackContext() {
         const auto previousTrackKey = trackKey_;
+        const auto previousGeneration = selectionGeneration_;
         scoreKey_ = state::currentScoreKey();
         trackKey_ = state::currentTrackKey();
         trackIndex_ = configuredTrackIndex();
         contextReady_ = trackContextAvailable();
         selectionGeneration_ = state::runtimeSelectionGeneration();
+        if (scope_ == state::ScopeKind::Track &&
+            (previousTrackKey != trackKey_ || previousGeneration != selectionGeneration_)) {
+            activeTrackEffects_.clear();
+            pendingTrackEffects_.clear();
+            pendingAnimationEffects_.clear();
+            selectionRequestPending_ = false;
+            pendingTrackSelection_ = false;
+        }
         if (scope_ == state::ScopeKind::Track && previousTrackKey != trackKey_ &&
             !previousTrackKey.isEmpty()) {
             if (g_pendingEditorKey.startsWith(previousTrackKey + '\n')) g_pendingEditorKey.clear();
@@ -1441,6 +1685,59 @@ QWidget *ensureHostSection(QWidget *host, const QString &sectionName,
 
 } // namespace
 
+void setStartupProgress(int percent, const QString &message, bool active) noexcept {
+    if (!qApp) return;
+    g_startupProgressActive = active;
+    auto *window = mainWindow();
+    if (!window) return;
+    ensureAboutEntry();
+    auto *bar = g_startupProgress.data();
+    if (!bar) {
+        if (auto *toolbar = findTitleToolBar(window)) {
+            bar = new QProgressBar(toolbar);
+            bar->setObjectName(QStringLiteral("gpvst3StartupProgress"));
+            bar->setFixedWidth(112);
+            bar->setFixedHeight(10);
+            bar->setTextVisible(false);
+            bar->setToolTip(QStringLiteral("GuitarProVST3 启动进度"));
+            bar->setStyleSheet(QStringLiteral(
+                "QProgressBar { border: 0; background: rgba(128,128,128,45); border-radius: 4px; }"
+                "QProgressBar::chunk { background: #4f9cf9; border-radius: 4px; }"));
+            g_startupProgressAction = toolbar->addWidget(bar);
+            g_startupProgress = bar;
+        } else if (auto *status = window->statusBar()) {
+            bar = new QProgressBar(status);
+            bar->setObjectName(QStringLiteral("gpvst3StartupProgress"));
+            bar->setFixedWidth(112);
+            bar->setFixedHeight(10);
+            bar->setTextVisible(false);
+            bar->setToolTip(QStringLiteral("GuitarProVST3 启动进度"));
+            bar->setStyleSheet(QStringLiteral(
+                "QProgressBar { border: 0; background: rgba(128,128,128,45); border-radius: 4px; }"
+                "QProgressBar::chunk { background: #4f9cf9; border-radius: 4px; }"));
+            status->addPermanentWidget(bar);
+            g_startupProgressAction = nullptr;
+            g_startupProgress = bar;
+        }
+    }
+    if (!bar) return;
+    if (g_startupProgressAction) g_startupProgressAction->setVisible(active);
+    if (!active) {
+        bar->hide();
+        return;
+    }
+    bar->show();
+    bar->setAccessibleName(message);
+    bar->setToolTip(message);
+    if (percent < 0) {
+        bar->setRange(0, 0);
+    } else {
+        bar->setRange(0, 100);
+        bar->setValue(qBound(0, percent, 100));
+    }
+    bar->update();
+}
+
 const char *state() noexcept { return "panel_ready_p9"; }
 
 void setRealtimeBypassControl(RealtimeBypassControl control) noexcept {
@@ -1471,9 +1768,11 @@ void setVst3StateControl(Vst3StateControl control) noexcept {
     g_vst3StateControl = control;
 }
 
-void setVst3TrackControls(Vst3TrackStateControl state, Vst3TrackEditorControl editor) noexcept {
+void setVst3TrackControls(Vst3TrackStateControl state, Vst3TrackEditorControl editor,
+                          Vst3TrackActiveControl active) noexcept {
     g_vst3TrackStateControl = state;
     g_vst3TrackEditorControl = editor;
+    g_vst3TrackActiveControl = active;
 }
 
 void setVst3EditorControl(Vst3EditorControl open, Vst3EditorCloseControl close, Vst3EditorScaleControl scale) noexcept {
@@ -1517,6 +1816,18 @@ void setVst3ScanState(const QString &state, int checked, int total, bool cached,
         g_scanMessage = QStringLiteral("点击 VST3 可刷新插件清单。");
     } else if (state == "partial_failure" || state == "failed" || state == "timeout") {
         g_scanMessage = QStringLiteral("点击 VST3 可刷新插件清单。");
+    }
+    if (g_startupProgressActive) {
+        if (state == QStringLiteral("scanning") || state == QStringLiteral("recognition")) {
+            const int progress = state == QStringLiteral("scanning") && total > 0
+                ? 55 + qMin(40, checked * 40 / total) : -1;
+            setStartupProgress(progress,
+                state == QStringLiteral("recognition")
+                    ? QStringLiteral("正在识别 VST3 插件…")
+                    : QStringLiteral("正在扫描 VST3 插件…"));
+        } else {
+            setStartupProgress(100, QStringLiteral("VST3 启动扫描完成"), false);
+        }
     }
     if (qApp) for (auto *widget : QApplication::allWidgets()) {
         if (widget->objectName() == QStringLiteral("gpvst3SoundEffectChainButton")) {
