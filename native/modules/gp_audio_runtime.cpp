@@ -9,6 +9,7 @@
 #include "gp_object_registry.h"
 
 #include <QtCore/QCoreApplication>
+#include <QtCore/QThread>
 #include <QtCore/QEvent>
 #include <QtCore/QDynamicPropertyChangeEvent>
 #include <QtCore/QDir>
@@ -463,6 +464,15 @@ const char *bindingSource() noexcept { return g_bindingSource.load(std::memory_o
 
 void setRefreshNotifier(RefreshNotifier notifier) noexcept {
     g_refreshNotifier.store(notifier, std::memory_order_release);
+}
+
+QObject *nativeInputAction() noexcept {
+    if (!g_hostVerified.load() || !g_qtCoreVerified.load() || !qApp ||
+        QThread::currentThread() != qApp->thread()) return nullptr;
+    for (const auto &object : g_objects.objects())
+        if (object && object->objectName() == QStringLiteral("actionActivatedLineIn"))
+            return object.data();
+    return nullptr;
 }
 
 void markDirty() noexcept {

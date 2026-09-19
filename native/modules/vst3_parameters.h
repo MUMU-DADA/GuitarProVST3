@@ -39,6 +39,7 @@ public:
         queues_ = std::make_unique<ParameterQueue[]>(size_);
         active_ = std::make_unique<ParameterQueue *[]>(size_);
         count_ = 0;
+        anyPending_.store(false, std::memory_order_relaxed);
         for (int i = 0; i < size_; ++i) {
             Steinberg::Vst::ParameterInfo info{};
             if (controller->getParameterInfo(i, info) != Steinberg::kResultOk) return false;
@@ -51,14 +52,25 @@ public:
         for (int i = 0; i < size_; ++i) if (queues_[i].id == id) {
             queues_[i].pendingValue.store(value, std::memory_order_relaxed);
             queues_[i].pending.store(true, std::memory_order_release);
+            anyPending_.store(true, std::memory_order_release);
             return true;
         }
         return false;
     }
     void drain() noexcept {
         count_ = 0;
+        // Keep an idle audio block away from the entire parameter table.
+        // Publishers set this only after their mailbox, so a concurrent edit
+        // is either consumed below or leaves another scan for the next block.
+        if (!anyPending_.load(std::memory_order_acquire) ||
+            !anyPending_.exchange(false, std::memory_order_acq_rel)) return;
         for (int i = 0; i < size_; ++i)
-            if (queues_[i].pending.exchange(false, std::memory_order_acq_rel)) {
+            // Most blocks contain no UI edits. Avoid a locked read/modify/write
+            // for every idle parameter (commercial processors can expose
+            // thousands). An edit published after this load is delivered by
+            // the next block; exchange still consumes each observed mailbox.
+            if (queues_[i].pending.load(std::memory_order_acquire) &&
+                queues_[i].pending.exchange(false, std::memory_order_acq_rel)) {
                 queues_[i].value = queues_[i].pendingValue.load(std::memory_order_relaxed);
                 active_[count_++] = &queues_[i];
             }
@@ -74,6 +86,7 @@ public:
     }
 private:
     int size_ = 0, count_ = 0;
+    std::atomic<bool> anyPending_{false};
     std::unique_ptr<ParameterQueue[]> queues_;
     std::unique_ptr<ParameterQueue *[]> active_;
 };

@@ -26,8 +26,10 @@ $exe = Join-Path $OutputRoot 'p13_input_ui_test.exe'
 if ($LASTEXITCODE) { throw 'P13 input UI fixture compilation failed.' }
 $previousPath = $env:PATH
 $previousScale = $env:QT_SCALE_FACTOR
+$previousScreenshotRoot = $env:GPVST3_UI_SCREENSHOT_DIR
 try {
     $env:PATH = "$(Join-Path $QtDir 'bin');$env:PATH"
+    $env:GPVST3_UI_SCREENSHOT_DIR = $OutputRoot
     foreach ($scale in @('1', '1.25', '1.5')) {
         $env:QT_SCALE_FACTOR = $scale
         & $exe
@@ -36,5 +38,6 @@ try {
 } finally {
     $env:PATH = $previousPath
     $env:QT_SCALE_FACTOR = $previousScale
+    $env:GPVST3_UI_SCREENSHOT_DIR = $previousScreenshotRoot
 }
 Write-Output "PASS: P13 input UI isolated verification at three DPI scales. Evidence: $OutputRoot"

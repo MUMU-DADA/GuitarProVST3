@@ -366,12 +366,87 @@ bool largeBoundsAndNoAllocations() {
                "exact full-capacity mono bounds are safe")) return false;
     return true;
 }
+
+bool supportedRateTopologies() {
+    for (const auto rate : {44100U, 48000U, 88200U, 96000U, 176400U, 192000U}) {
+        Fixture f;
+        f.c.destinationRate = rate;
+        f.c.usesOutputRing = rate != 44100;
+        for (auto &channel : f.c.channel) {
+            if (rate == 44100) channel = {};
+            else if (rate == 88200 || rate == 176400) {
+                channel.interpolatorSourceRate = channel.interpolatorDestinationRate = 0;
+                if (rate == 176400) {
+                    channel.convolverCount = 2;
+                    channel.second = static_cast<const ConvolverTopology &>(channel);
+                }
+            } else channel.interpolatorDestinationRate = rate;
+        }
+        if (!check(f.start(), "all supported rate topologies admitted")) return false;
+        if (rate == 44100) {
+            if (!check(f.callback(2048, false, 0, 0, 0, 0) &&
+                    f.tracker.snapshot().state == State::Ready,
+                    "equal-rate direct callback has no SRC or ring history")) return false;
+            continue;
+        }
+        if (!f.callback(64, true, 18, 70, 12, 128)) return false;
+        if (rate == 88200) {
+            if (!check(f.tracker.snapshot().phase == Phase::Ring &&
+                       f.tracker.snapshot().interpolatorTarget == 0,
+                       "single power-of-two convolver drains directly into ring frontier")) return false;
+        } else {
+            const auto target = rate == 176400 ? 16U : 135U;
+            if (!check(f.tracker.snapshot().interpolatorTarget == target &&
+                       f.callback(64, true, target, 70, 24, 128),
+                       "two-stage bound converts following-stage history back to original source frames")) return false;
+        }
+        // Old ring samples survive the crossing block. New appends are clean
+        // and cannot activate overlay before the next callback entry.
+        const auto before = f.queue;
+        if (!check(f.callback(64, true, 64, 64, before, 128) &&
+                   f.tracker.snapshot().phase == Phase::NextCallback &&
+                   f.tracker.snapshot().state == State::Preparing &&
+                   f.callback(64, true, 64, 64, before, 128) &&
+                   f.tracker.snapshot().state == State::Ready,
+                   "every resampled rate excludes the complete old frontier")) return false;
+    }
+    return true;
+}
+
+bool extendedTopologyChangesFailClosed() {
+    auto c = config();
+    c.destinationRate = 176400;
+    for (auto &channel : c.channel) {
+        channel.convolverCount = 2;
+        channel.interpolatorSourceRate = channel.interpolatorDestinationRate = 0;
+        channel.second = static_cast<const ConvolverTopology &>(channel);
+    }
+    Tracker tracker;
+    if (!tracker.configure(c)) return false;
+    auto changed = c;
+    ++changed.channel[1].second.latency;
+    if (!check(!tracker.beginCallback(changed, 1, 64, 0, true) &&
+               tracker.snapshot().error == Error::ConfigChanged,
+               "second stage change invalidates the original epoch")) return false;
+    changed = c;
+    changed.channel[1].second.upFactor = 1;
+    Tracker invalid;
+    if (!check(!invalid.configure(changed), "malformed second stage never enters drain")) return false;
+    c.destinationRate = 44100;
+    c.usesOutputRing = false;
+    c.channel = {};
+    Tracker direct;
+    if (!direct.configure(c) || !direct.beginCallback(c, 1, 64, 0, true)) return false;
+    return check(!direct.srcCompleted(64, 64) && direct.snapshot().error == Error::InvalidSrc,
+                 "unexpected SRC in equal-rate route cannot be accepted as direct monitoring");
+}
 }
 
 int main() {
     if (!defaultsAndValidation() || !thresholdsAndNextCallback() || !realFrontierConsumption() ||
         !unequalChannelsAndNoProgress() || !invalidEvidence() || !configChangesCannotActivate() ||
-        !largeBoundsAndNoAllocations()) return 1;
+        !largeBoundsAndNoAllocations() || !supportedRateTopologies() ||
+        !extendedTopologyChangesFailClosed()) return 1;
     std::cout << "PASS: P13 experimental drain FSM; no host or audio acceptance implied.\n";
     return 0;
 }

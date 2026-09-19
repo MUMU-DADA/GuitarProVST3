@@ -544,7 +544,8 @@ QJsonObject initialize(const host::Verification &verification) {
         ui::setVst3EditorControl(&hook::openVst3Editor, &hook::closeVst3Editors, &hook::scaleVst3Editor);
         ui::setVst3InputControls(&hook::requestInputVst3Selection, &hook::captureInputVst3States,
                                 &hook::openInputVst3Editor, &hook::requestInputMonitorSettings,
-                                &hook::inputMonitorSnapshot);
+                                &hook::inputMonitorSnapshot, &hook::activeInputVst3States,
+                                &hook::setNativeInputState, &gp_audio::nativeInputAction);
     } else {
         ui::setRealtimeBypassControl(nullptr);
         ui::setVst3SelectionControl(nullptr);

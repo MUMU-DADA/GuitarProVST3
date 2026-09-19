@@ -145,7 +145,7 @@ public:
                 identity.generation && identity.revision && identity.generation == ticket.identity.generation &&
                 identity.revision == ticket.identity.revision && identity.rate == ticket.identity.rate &&
                 std::isfinite(identity.rate) && identity.rate >= 8000 && identity.rate <= 768000 &&
-                ticket.frames > 0 && ticket.frames <= 2048;
+                ticket.frames > 0 && ticket.frames <= 8192;
             if (!valid) unvalidatedBudgets_.fetch_add(1);
             else {
                 if (validatedBudgets_.fetch_add(1) == 0) {

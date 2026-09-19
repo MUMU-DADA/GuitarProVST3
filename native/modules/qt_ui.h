@@ -23,6 +23,8 @@ using Vst3TrackStateControl = std::vector<Vst3SelectionEntry> (*)(const std::str
 // the control could not obtain its non-blocking locks yet; the output vector
 // must then be ignored and the UI should retain its last known state.
 using Vst3TrackActiveControl = bool (*)(const std::string &, std::vector<Vst3SelectionEntry> &) noexcept;
+using Vst3ActiveControl = bool (*)(std::vector<Vst3SelectionEntry> &) noexcept;
+using NativeInputStateControl = void (*)(bool known, bool enabled) noexcept;
 using Vst3TrackEditorControl = bool (*)(const std::string &, const Vst3SelectionEntry &, void *) noexcept;
 using Vst3EditorControl = bool (*)(const Vst3SelectionEntry &, void *) noexcept;
 using Vst3EditorCloseControl = void (*)() noexcept;
@@ -49,7 +51,9 @@ void setVst3EditorControl(Vst3EditorControl open, Vst3EditorCloseControl close,
                          Vst3EditorScaleControl scale = nullptr) noexcept;
 void setVst3InputControls(Vst3SelectionRequestControl request, Vst3StateControl capture,
                           Vst3EditorControl editor, InputMonitorRequestControl monitor,
-                          InputMonitorSnapshotControl snapshot) noexcept;
+                          InputMonitorSnapshotControl snapshot, Vst3ActiveControl active = nullptr,
+                          NativeInputStateControl nativeInput = nullptr,
+                          QObject *(*nativeAction)() noexcept = nullptr) noexcept;
 void setVst3DiscoveryControl(Vst3RefreshControl refresh, Vst3IdentifyControl identify) noexcept;
 void syncVst3Selection();
 void refreshVst3TrackContext();

@@ -5,9 +5,12 @@
 #include <string>
 #include <vector>
 
+class QObject;
+
 namespace gpvst3::gp_audio {
 
 using RefreshNotifier = void (*)() noexcept;
+QObject *nativeInputAction() noexcept; // Qt thread, existing lifecycle registry
 
 struct Binding {
     void *chain = nullptr;

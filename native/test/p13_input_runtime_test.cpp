@@ -158,20 +158,21 @@ void verifyInputLatencyReporting(const char *fixture) {
 void verifyInputRuntime(const char *fixture) {
     // Startup host discovery remains disabled. The worker sees only this
     // copied identity; callback/lifetime correctness is tested separately.
-    inputTestStream.callback = {40, 2, 48000, true};
+    inputTestStream.callback = {40, 2, 32000, true};
     inputTestStream.binding = asioprobe::BindingState::Running;
     inputTestStream.limit = asioprobe::BindingLimit::None;
     inputTestStream.bound = true;
     inputTestStream.lifetimeProtected = true;
+    inputTestStream.driverFrames = 64;
+    setNativeInputState(true, true);
     g_runtime.stream.installed = true;
     g_listenerProbeInstalled = true;
     const Vst3SelectionEntry gain{fixture, "42302010605080701122334455667788"};
     const auto initial = stateValue(gain, 0.5);
     requestInput({}, {Mode::LowLatencyOverlay, 0.5});
     require(!g_inputMonitor.exchange.suppressed() && g_inputMonitor.phase == 6 &&
-                g_inputMonitor.error == "input_chain_empty" &&
-                inputTestInstalls == 0 && inputTestResets == 0,
-            "first empty chain preserves native route without lifecycle installation");
+                g_inputMonitor.error == "input_host_contract_unavailable",
+            "unsupported stream rejects even a dry chain without claiming readiness");
     requestInput({initial}, {Mode::LowLatencyOverlay, 0.5});
     require(!g_inputMonitor.exchange.suppressed() && g_inputMonitor.exchange.watching() &&
                 g_inputMonitor.phase == 6 && g_inputMonitor.desired.empty() &&
@@ -266,9 +267,22 @@ void verifyInputRuntime(const char *fixture) {
     require(savedValue(captureInputVst3States().at(0)) == 0.75,
             "failed replacement preserves latest input processor state");
     requestInput({}, {Mode::LowLatencyOverlay, 0.25});
-    require(g_inputMonitor.exchange.suppressed() && g_inputMonitor.phase == 5 &&
+    require(g_inputMonitor.exchange.suppressed() && g_inputMonitor.phase == 3 &&
                 g_inputMonitor.error.empty() && g_inputMonitor.desired.empty(),
-            "clearing an active input chain intentionally mutes without an error");
+            "clearing an active input chain publishes a dry monitor processor");
+    checkInputSamples(1.0, 0.25);
+    setNativeInputState(true, false);
+    {
+        const auto processed = g_inputMonitor.blocks.load();
+        MonitorCallback callback(reinterpret_cast<void *>(1), reinterpret_cast<void *>(1), 64,
+            reinterpret_cast<void *>(1), 999, 0);
+        require(!callback.requested() && !callback.suppress(), "host Off rejects even invalid borrowed audio before reading it");
+        callback.finish(0);
+        require(g_inputMonitor.blocks == processed && !g_inputMonitor.nativeSuppressed &&
+            inputMonitorSnapshot().value("state") == "waiting_for_input", "host Off has zero input processing despite saved low-latency mode");
+    }
+    setNativeInputState(true, true);
+    g_inputMonitor.nativeSuppressed = true;
     g_monitorAudio.suppressedGeneration = inputTestStream.callback.generation;
     g_monitorAudio.suppressedRevision = inputTestStream.callback.rateRevision;
     {
@@ -330,7 +344,7 @@ void verifyInputRuntime(const char *fixture) {
     const auto processingErrorsBeforeRateChange = g_inputMonitor.errors.load();
     const auto rejectedBlocksBeforeRateChange = g_inputMonitor.configurationRejectedBlocks.load();
     g_inputMonitor.callbackFault = 0;
-    inputTestStream.callback.actualRate = 48000;
+    inputTestStream.callback.actualRate = 32000;
     ++inputTestStream.callback.rateRevision;
     {
         MonitorCallback callback(nullptr, nullptr, 64, nullptr, 102, 0);
@@ -464,6 +478,29 @@ void verifyInputRuntime(const char *fixture) {
                 state::scopeEffects(saved, state::ScopeKind::Input).at(0).toObject().value("enabled").toBool(),
             "obsolete Qt rejection cannot disable successfully retried saved identity");
 }
+
+void verifyInputWarmCache(const char *fixture) {
+    inputTestStream.callback = {80, 1, 192000, true};
+    Vst3SelectionEntry latest;
+    for (int i = 0; i < 20; ++i) {
+        const auto path = fs::u8path(state::dataDirectory().toStdString()) /
+            ("cache-" + std::to_string(i)) / fs::u8path(fixture).filename();
+        fs::create_directories(path.parent_path());
+        fs::copy(fs::u8path(fixture), path, fs::copy_options::recursive);
+        latest = stateValue({path.u8string(), "42302010605080701122334455667788"}, 0.375);
+        requestInput({latest}, {Mode::LowLatencyOverlay, 0.25});
+        require(g_inputMonitor.error.empty() && inputSlot().selection.count == 1 &&
+            g_inputMonitor.warmEffects.size() <= EffectPool::kMaxWarmInstances,
+            "cycling beyond warm-cache capacity never rejects a valid input identity");
+    }
+    const auto previous = inputSlot().selection.effects[0];
+    requestInput({}, {Mode::LowLatencyOverlay, 0.25});
+    checkInputSamples(1.0, 0.25);
+    requestInput({latest}, {Mode::LowLatencyOverlay, 0.25});
+    require(inputSlot().selection.effects[0] == previous &&
+        savedValue(captureInputVst3States().at(0)) == 0.375,
+        "recent input effect survives disable and re-enable with identical instance and state");
+}
 }
 
 int main(int argc, char **argv) {
@@ -476,6 +513,11 @@ int main(int argc, char **argv) {
         require(argc == 2 && data.isValid(), "isolated data directory and fixture path");
         verifyInputRuntime(argv[1]);
         verifyInputLatencyReporting(argv[1]);
+        verifyInputWarmCache(argv[1]);
+        float output[]{-4.0f, -1.0f, -0.125f, 0.0f, 0.125f, 1.0f, 4.0f};
+        require(finishMonitorOutput(output, 7) && output[0] == -1 && output[6] == 1 &&
+            output[2] == -0.125f && output[4] == 0.125f && !finishMonitorOutput(output, 7),
+            "final monitor output restores native saturation and preserves all in-range samples");
         result = 0;
     } catch (const std::exception &error) {
         std::cerr << "FAIL: " << error.what() << '\n';

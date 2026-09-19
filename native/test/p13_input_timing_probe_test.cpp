@@ -99,6 +99,14 @@ bool distributionOverflowAndBudgets() {
                value.minimumFrames == 64 && value.maximumFrames == 96 && value.inputFailures == 1 &&
                value.inputBudgetExceeded == 1 && value.callbackBudgetExceeded == 6,
                "stream/rate change recomputes budget for the same callback")) return false;
+    record(*recorder, 3000000000, 21333334, 4096);
+    record(*recorder, 3100000000, 42666666, 8192);
+    record(*recorder, 3200000000, 42666667, 8192);
+    record(*recorder, 3300000000, 50000000, 8193);
+    value = recorder->snapshot(3400000000);
+    if (!check(value.validatedBudgets == 104 && value.unvalidatedBudgets == 1 &&
+               value.maximumFrames == 8192 && value.callbackBudgetExceeded == 8,
+               "full driver budgets cover 4096/8192 frames with exact threshold and reject oversize")) return false;
     return true;
 }
 bool invalidRateAndClock() {

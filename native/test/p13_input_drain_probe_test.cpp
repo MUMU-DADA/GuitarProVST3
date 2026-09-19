@@ -40,6 +40,8 @@ struct Fixture {
     std::array<std::uint8_t, 0xF0> impl{};
     std::array<std::array<std::uint8_t, 0x88>, 2> conv{};
     std::array<std::array<std::uint8_t, 0x50>, 2> filter{};
+    std::array<std::array<std::uint8_t, 0x88>, 2> secondConv{};
+    std::array<std::array<std::uint8_t, 0x50>, 2> secondFilter{};
     std::array<std::array<std::uint8_t, 0x1030>, 2> interp{};
     Context context{3, 7, 2, 192000, true};
 
@@ -86,6 +88,26 @@ struct Fixture {
     }
     bool snapshot(Snapshot &result) {
         return readSnapshot(module.data(), owner.data(), context, result);
+    }
+    void rate(double value) {
+        context.actualRate = value;
+        if (value == 44100) {
+            put(owner.data(), 0x20, static_cast<void *>(nullptr));
+            return;
+        }
+        for (std::size_t i = 0; i < 2; ++i) {
+            auto *r = impl.data() + i * 0x78;
+            if (value == 88200 || value == 176400)
+                put(r, 0x50, static_cast<void *>(nullptr));
+            else put(interp[i].data(), 0x1010, value);
+            if (value == 176400) {
+                secondConv[i] = conv[i];
+                secondFilter[i] = filter[i];
+                put(secondConv[i].data(), 8, secondFilter[i].data());
+                put(r, 16, secondConv[i].data());
+                put(r, 0x48, std::uint32_t{2});
+            }
+        }
     }
 };
 
@@ -182,10 +204,37 @@ bool trackerIntegrationNoAllocation() {
     return check(valid && tracker.snapshot().state == drain::State::Ready && unexpectedAllocations.load() == 0,
                  "observed snapshots feed actual Tracker through all phases without allocation");
 }
+
+bool rateTopologyMatrix() {
+    for (const auto rate : {44100., 48000., 88200., 96000., 176400., 192000.}) {
+        Fixture f;
+        f.rate(rate);
+        Snapshot before, after;
+        if (!check(f.snapshot(before) && before.config.destinationRate == rate &&
+                   before.config.usesOutputRing == (rate != 44100),
+                   "actual device rate selects verified direct/one-stage/two-stage topology")) return false;
+        if (!check(f.snapshot(after) && sameTopology(before, after),
+                   "all supported topology snapshots compare consistently")) return false;
+        if (rate == 176400) {
+            put(f.secondConv[1].data(), 0x44, std::uint32_t{15});
+            if (!check(f.snapshot(after) && !sameTopology(before, after),
+                       "second convolver change invalidates continuity")) return false;
+            put(f.secondConv[1].data(), 0x80, std::int32_t{13});
+            if (!check(!f.snapshot(after), "second convolver dynamic bounds checked")) return false;
+        }
+        if (rate == 44100) {
+            std::uint64_t consumed = 99;
+            if (!check(consumedSamples(before, after, 2048, consumed) && consumed == 0,
+                       "equal-rate route never inspects inactive shared ring")) return false;
+        }
+    }
+    return true;
+}
 }
 
 int main() {
-    if (!snapshotAndRing() || !invalidSnapshots() || !trackerIntegrationNoAllocation()) return 1;
+    if (!snapshotAndRing() || !invalidSnapshots() || !trackerIntegrationNoAllocation() ||
+        !rateTopologyMatrix()) return 1;
     std::cout << "PASS: drain snapshot topology/dynamic gates, ring wrap evidence, identity changes, Tracker integration, no allocation.\n";
     return 0;
 }

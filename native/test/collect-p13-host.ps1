@@ -24,6 +24,7 @@ param(
     [switch]$ScopeMatrix,
     [switch]$NativeEffectsMatrix,
     [switch]$NativeListenerSwitches,
+    [switch]$MonitoringOnly,
     [string]$InputOverlayFixture = '',
     [ValidateRange(0, 20)][int]$InputOverlaySwitches = 0,
     [ValidateRange(0, 20)][int]$RapidInputSwitches = 0,
@@ -35,6 +36,9 @@ param(
 # The silence experiment additionally requires a DLL built with the test-only
 # experiment define. The production DLL must reject this environment request.
 $ErrorActionPreference = 'Stop'
+if ($MonitoringOnly -and (-not $InputOverlayFixture -or -not $EnableNativeListener -or $RseVst3 -or $ScopeMatrix -or $OverlayCoexistenceProbe -or $MonitorLatency)) {
+    throw '-MonitoringOnly requires input and native listener without playback-specific matrices.'
+}
 if ($ProductionRuntime -and (-not $InputOverlayFixture -or $PcmProbe -or $StreamLifecycleProbe -or $RestartAsioStream -or $DrainProbe -or $OverlayCoexistenceProbe -or $ProbeListener -or $SilenceInputExperiment -or $SinkListenerExperiment -or $MonitorLatency -or $InspectAudioUnits -or $LoopbackInput2)) {
     throw '-ProductionRuntime requires an input fixture and excludes experimental probes.'
 }
@@ -199,7 +203,24 @@ function Enable-P13InputOverlay {
     if ($targets.Count -ne 1) { throw 'P13 low-latency control was not found.' }
     $result.input_overlay.monitor=Invoke-McpTool $session gp_set_property @{snapshot=$query.snapshot;id=$targets[0].id;property='checked';value=$true}
     $result.input_overlay.transitions=@()
-    Wait-P13InputStatus '低延迟监听已生效'
+    # Cold plug-ins and the initial native stream reset can outlive a fixed
+    # sleep. Wait for the actual prepared selection before requesting this
+    # test's native listening state; production never reopens LINE-IN.
+    if ($EnableNativeListener) {
+        $deadline=[DateTime]::UtcNow.AddSeconds(30)
+        do {
+            $query=Invoke-McpTool $session gp_objects @{query=$name;limit=10}
+            $selected=@($query.objects | Where-Object object_name -CEQ $name)
+            if ($selected.Count -eq 1 -and $selected[0].properties.checked -eq $true -and
+                $selected[0].properties.tristate -eq $false) { break }
+            Start-Sleep -Milliseconds 100
+        } while ([DateTime]::UtcNow -lt $deadline)
+        if ($selected.Count -ne 1 -or $selected[0].properties.checked -ne $true -or
+            $selected[0].properties.tristate -ne $false) { throw 'Input selection did not finish preparing.' }
+        $result.input_overlay.ready_window=Invoke-McpTool $session gp_window @{state='restore'}
+        Set-P13NativeListener $true 'overlay_listening_ready'
+    }
+    Wait-P13InputStatus '正在监听 · 输入效果器已生效'
 }
 
 function Invoke-P13InputSwitches {
@@ -210,7 +231,7 @@ function Invoke-P13InputSwitches {
             if ($target.Count -ne 1) { throw 'Input monitor control disappeared during switching.' }
             $response=Invoke-McpTool $session gp_set_property @{snapshot=$query.snapshot;id=$target[0].id;property='checked';value=$enabled}
             $result.input_overlay.transitions += @{round=$round;enabled=$enabled;response=$response}
-            Wait-P13InputStatus $(if($enabled){'低延迟监听已生效'}else{'低延迟监听未启用'})
+            Wait-P13InputStatus $(if($enabled){'正在监听 · 输入效果器已生效'}else{'低延迟监听未启用'})
         }
     }
 }
@@ -242,22 +263,35 @@ function Invoke-P13NativeListenerSwitches {
     $result.input_overlay.native_switches=@()
     foreach ($nativeEnabled in @($false,$true)) {
         Set-P13NativeListener $nativeEnabled 'overlay_native_user_change'
-        Wait-P13InputStatus '低延迟监听已生效'
+        Wait-P13InputStatus $(if($nativeEnabled){'正在监听 · 输入效果器已生效'}else{'LINE-IN 已关闭 · 监听已停止'})
+        $deadline=[DateTime]::UtcNow.AddSeconds(5)
+        do {
+            $offBaseline=(Read-P13Json (Join-Path $dataDirectory 'p2-observation.json')).gp_hook.input_monitor
+            if ($offBaseline.native_listener_known -and $offBaseline.native_listener_enabled -eq $nativeEnabled -and
+                ($nativeEnabled -or ($offBaseline.state -eq 'waiting_for_input' -and -not $offBaseline.input_native_effect_bypass))) { break }
+            Start-Sleep -Milliseconds 100
+        } while ([DateTime]::UtcNow -lt $deadline)
+        if (-not $offBaseline.native_listener_known -or $offBaseline.native_listener_enabled -ne $nativeEnabled) {
+            throw 'Native input state was not published before the monitoring baseline.'
+        }
         foreach ($overlayEnabled in @($false,$true)) {
             Set-P13Check 'gpvst3InputLowLatencyEnabled' $overlayEnabled
-            Wait-P13InputStatus $(if($overlayEnabled){'低延迟监听已生效'}else{'低延迟监听未启用'})
+            $expectedState=if(-not $overlayEnabled){'off'}elseif($nativeEnabled){'active'}else{'waiting_for_input'}
+            $expectedBypass=$overlayEnabled -and $nativeEnabled
+            Wait-P13InputStatus $(if(-not $overlayEnabled){'低延迟监听未启用'}elseif($nativeEnabled){'正在监听 · 输入效果器已生效'}else{'LINE-IN 已关闭 · 监听已停止'})
             $current=Get-P13NativeListenerAction
             $deadline=[DateTime]::UtcNow.AddSeconds(5)
             do {
                 $monitor=(Read-P13Json (Join-Path $dataDirectory 'p2-observation.json')).gp_hook.input_monitor
-                if ($monitor.state -eq $(if($overlayEnabled){'active'}else{'off'}) -and
-                    [bool]$monitor.input_native_effect_bypass -eq $overlayEnabled) { break }
+                if ($monitor.state -eq $expectedState -and $monitor.native_listener_enabled -eq $nativeEnabled -and
+                    [bool]$monitor.input_native_effect_bypass -eq $expectedBypass) { break }
                 Start-Sleep -Milliseconds 100
             } while ([DateTime]::UtcNow -lt $deadline)
-            $result.input_overlay.native_switches += @{native_enabled=$nativeEnabled;overlay_enabled=$overlayEnabled;native_readback=$current.action.checked;monitor=$monitor}
+            $result.input_overlay.native_switches += @{native_enabled=$nativeEnabled;overlay_enabled=$overlayEnabled;native_readback=$current.action.checked;monitor=$monitor;processed_delta=([int64]$monitor.processed_blocks-[int64]$offBaseline.processed_blocks)}
             if ($current.action.checked -ne $nativeEnabled -or
-                $monitor.state -ne $(if($overlayEnabled){'active'}else{'off'}) -or
-                [bool]$monitor.input_native_effect_bypass -ne $overlayEnabled -or $monitor.error_blocks -ne '0') {
+                $monitor.state -ne $expectedState -or
+                [bool]$monitor.input_native_effect_bypass -ne $expectedBypass -or $monitor.error_blocks -ne '0' -or
+                (-not $nativeEnabled -and $monitor.processed_blocks -ne $offBaseline.processed_blocks)) {
                 throw 'Overlay switching changed the current native-listener choice or failed to settle.'
             }
         }
@@ -290,7 +324,7 @@ function Invoke-P13RapidInputSwitches {
         if ($after.state -ne 'off' -or $after.input_native_effect_bypass) { throw 'Rapid cancellation retained suppression or an active input chain.' }
     }
     Set-P13Check 'gpvst3InputLowLatencyEnabled' $true
-    Wait-P13InputStatus '低延迟监听已生效'
+    Wait-P13InputStatus '正在监听 · 输入效果器已生效'
 }
 
 function Invoke-P13DeviceMatrix {
@@ -299,19 +333,26 @@ function Invoke-P13DeviceMatrix {
     $result.device_matrix=[ordered]@{cases=@();restore_confirmed=$false}
     try {
         foreach ($case in @(
+            @{property='audioBuffersSize';value=32;frames=32;state='active'},
             @{property='audioBuffersSize';value=128;frames=128;state='active'},
             @{property='audioBuffersSize';value=256;frames=256;state='active'},
             @{property='audioBuffersSize';value=512;frames=512;state='active'},
             @{property='audioBuffersSize';value=1024;frames=1024;state='active'},
             @{property='audioBuffersSize';value=2048;frames=2048;state='active'},
-            @{property='audioBuffersSize';value=4096;frames=0;state='host_limited'},
+            @{property='audioBuffersSize';value=4096;frames=2048;state='active'},
+            @{property='audioBuffersSize';value=8192;frames=2048;state='active'},
             @{property='audioBuffersSize';value=64;frames=64;state='active'},
             @{property='audioDevice';value='Standard';frames=0;state='host_limited'},
             @{property='audioDevice';value='ASIO';frames=64;state='active'})) {
             $before = Invoke-McpTool $session gp_audio_device
-            if ($case.value -notin $before.choices.($case.property)) { throw "Device choice unavailable: $($case.property)=$($case.value)" }
             $entry=[ordered]@{property=$case.property;value=$case.value;expected_state=$case.state;before=$before;confirmed=$false}
             $result.device_matrix.cases += $entry
+            if ($case.value -notin $before.choices.($case.property)) {
+                # Record the host's actual menu boundary. Algorithmic support
+                # does not make a driver-only choice available through GP.
+                $entry.status='host_choice_unavailable'
+                continue
+            }
             try {
                 $entry.request=Invoke-McpTool $session gp_audio_device @{operation='set';property=$case.property;value=$case.value}
             } catch {
@@ -320,7 +361,7 @@ function Invoke-P13DeviceMatrix {
                 $entry.device=Invoke-McpTool $session gp_audio_device
                 if (-not $entry.device.running -or ($entry.device.configuration | ConvertTo-Json -Compress) -cne
                     ($before.configuration | ConvertTo-Json -Compress)) { throw 'Rejected device change did not retain the prior running configuration.' }
-                Wait-P13InputStatus '低延迟监听已生效'
+                Wait-P13InputStatus '正在监听 · 输入效果器已生效'
                 $entry.confirmed=$true
                 $entry.status='host_rejected_restored'
                 continue
@@ -335,7 +376,8 @@ function Invoke-P13DeviceMatrix {
                     $monitor.state -eq $case.state -and $monitor.mode -eq 'low_latency_overlay' -and
                     (($case.state -eq 'host_limited' -and -not $monitor.input_native_effect_bypass) -or
                      ($case.state -eq 'active' -and $monitor.buffer_frames -eq $case.frames -and
-                      $monitor.process_frames -eq $case.frames -and $monitor.driver_buffer_frames -eq $case.frames))) {
+                      $monitor.process_frames -eq $case.frames -and
+                      $monitor.driver_buffer_frames -eq $(if($case.property -eq 'audioBuffersSize'){$case.value}else{$case.frames})))) {
                     $entry.confirmed=$true; break
                 }
             } while ([DateTime]::UtcNow -lt $deadline)
@@ -352,7 +394,7 @@ function Invoke-P13DeviceMatrix {
         $result.device_matrix.restore_confirmed=($restored.configuration | ConvertTo-Json -Compress) -ceq ($original | ConvertTo-Json -Compress)
         if (-not $result.device_matrix.restore_confirmed) { throw 'Device matrix did not restore the original audio configuration.' }
     }
-    Wait-P13InputStatus '低延迟监听已生效'
+    Wait-P13InputStatus '正在监听 · 输入效果器已生效'
 }
 
 function Set-P13Check([string]$Name, [bool]$Enabled) {
@@ -398,10 +440,17 @@ function Read-P13Fixture([string]$Scope, [double]$SetGain = -1) {
         Invoke-McpTool $session gp_set_property @{snapshot=$q.snapshot;id=$gain[0].id;property='value';value=$SetGain} | Out-Null
         Start-Sleep -Milliseconds 300
     }
-    $q=Invoke-McpTool $session gp_objects @{query='gpvst3TestProcessor';limit=10}
-    $states=@($q.objects | Where-Object { $_.object_name -ceq 'gpvst3TestProcessor' -and $_.properties.text })
-    if ($states.Count -ne 1) { throw 'Fixture processor state is ambiguous.' }
-    $state=$states[0].properties.text | ConvertFrom-Json
+    # Parameter delivery and the fixture's Qt report are asynchronous; a
+    # silent/resting track need not process during an arbitrary 300 ms sleep.
+    $deadline=[DateTime]::UtcNow.AddSeconds(8)
+    do {
+        $q=Invoke-McpTool $session gp_objects @{query='gpvst3TestProcessor';limit=10}
+        $states=@($q.objects | Where-Object { $_.object_name -ceq 'gpvst3TestProcessor' -and $_.properties.text })
+        if ($states.Count -ne 1) { throw 'Fixture processor state is ambiguous.' }
+        $state=$states[0].properties.text | ConvertFrom-Json
+        if ($SetGain -lt 0 -or $state.gain -eq $SetGain) { break }
+        Start-Sleep -Milliseconds 100
+    } while ([DateTime]::UtcNow -lt $deadline)
     if ($SetGain -ge 0 -and $state.gain -ne $SetGain) { throw "$Scope editor did not update its processor." }
     return $state
 }
@@ -442,18 +491,22 @@ function Invoke-P13ScopeMatrix {
     }
     Invoke-McpTool $session gp_playback @{operation='set_loop';document=$savedDocument;enabled=$true} | Out-Null
     Invoke-McpTool $session gp_playback @{operation='play';document=$savedDocument} | Out-Null
+    # GP may turn LINE-IN off while activating another score. Input state
+    # remains independent, but listening must follow that native choice.
+    $result.scope_matrix.native_after_document=(Get-P13NativeListenerAction).action.checked
+    Set-P13NativeListener $true 'scope_empty_chain_listening'
     Set-P13Check 'gpvst3InputEnabled_40302010605080701122334455667788' $false
-    Wait-P13InputStatus '输入监听已静音'
+    Wait-P13InputStatus '正在监听 · 原声直通'
     $deadline=[DateTime]::UtcNow.AddSeconds(5)
     do {
         $empty=(Read-P13Json (Join-Path $dataDirectory 'p2-observation.json')).gp_hook.input_monitor
-        if ($empty.state -eq 'muted' -and $empty.input_native_effect_bypass) { break }
+        if ($empty.state -eq 'active' -and $empty.dry_monitoring -and $empty.input_native_effect_bypass) { break }
         Start-Sleep -Milliseconds 100
     } while ([DateTime]::UtcNow -lt $deadline)
     $result.scope_matrix.empty=$empty
-    if ($empty.state -ne 'muted' -or -not $empty.input_native_effect_bypass) { throw 'Empty input chain did not retain native suppression.' }
+    if ($empty.state -ne 'active' -or -not $empty.dry_monitoring -or -not $empty.input_native_effect_bypass) { throw 'Empty input chain did not preserve active dry monitoring.' }
     Set-P13Check 'gpvst3InputEnabled_40302010605080701122334455667788' $true
-    Wait-P13InputStatus '低延迟监听已生效'
+    Wait-P13InputStatus '正在监听 · 输入效果器已生效'
     $input=Read-P13Fixture 'input'
     $result.scope_matrix.after_empty=$input
     if ($input.gain -ne 0.25) { throw 'Re-enabling input lost its parameter state.' }
@@ -805,15 +858,17 @@ try {
     $initialPlayback = Invoke-McpTool $session gp_playback @{operation='state';document=$document}
     $result.observations += Get-P13Observation 'before_playback'
     Invoke-McpTool $session gp_playback @{operation='set_loop';document=$document;enabled=$true} | Out-Null
-    $result.play_request = Invoke-McpTool $session gp_playback @{operation='play';document=$document}
+    $result.monitoring_only = [bool]$MonitoringOnly
+    $expectedPlaying = -not $MonitoringOnly
+    $result.play_request = Invoke-McpTool $session gp_playback @{operation=$(if($MonitoringOnly){'stop'}else{'play'});document=$document}
     $playDeadline = [DateTime]::UtcNow.AddSeconds(10)
     do {
         $started = Get-P13Observation 'awaiting_playback'
         $result.observations += $started
-        if ($started.playback.playing -eq $true -and $started.playback.counting_down -ne $true) { break }
+        if ($started.playback.playing -eq $expectedPlaying -and $started.playback.counting_down -ne $true) { break }
         Start-Sleep -Milliseconds 100
     } while ([DateTime]::UtcNow -lt $playDeadline)
-    if ($started.playback.playing -ne $true -or $started.playback.counting_down -eq $true) { throw 'RSE playback was not observed running within 10 seconds.' }
+    if ($started.playback.playing -ne $expectedPlaying -or $started.playback.counting_down -eq $true) { throw 'Requested transport state was not observed within 10 seconds.' }
     $result.playback_confirmed_ns = $started.playback_query_end_ns
     $result.playback_confirmed_utc = $started.utc
     if ($OverlayTransitionProbe) {
@@ -860,7 +915,7 @@ try {
         Start-Sleep -Milliseconds 500
         $observed = Get-P13Observation 'during_playback'
         $result.observations += $observed
-        if ($observed.playback.playing -ne $true -or $observed.playback.counting_down -eq $true) { throw 'RSE playback stopped during the probe window.' }
+        if ($observed.playback.playing -ne $expectedPlaying -or $observed.playback.counting_down -eq $true) { throw 'Transport state changed during the probe window.' }
         $currentProbe = Read-P13Json (Join-Path $dataDirectory 'p13-input-probe.json')
         $elapsedCaptureMs = $clock.ElapsedMilliseconds - $captureStartMs
         if ((Test-P13Complete $currentProbe ([bool]$ProbeListener)) -and $elapsedCaptureMs -ge $minimumCaptureMs) { break }
@@ -868,7 +923,7 @@ try {
     $result.capture_wait_finished_utc = [DateTime]::UtcNow.ToString('o')
     $observed = Get-P13Observation 'before_stop'
     $result.observations += $observed
-    if ($observed.playback.playing -ne $true) { throw 'RSE playback was not running after the probe wait.' }
+    if ($observed.playback.playing -ne $expectedPlaying) { throw 'Transport state changed after the probe wait.' }
     if ($ScopeMatrix) {
         Invoke-P13ScopeMatrix
         # Returning to a score restarts its transport/count-in and track
@@ -1013,6 +1068,8 @@ try {
             duration_ms=([decimal]($endNs - $startNs) / 1000000)
             bracketed_by_playing_observations=($startNs -ge [uint64]$result.playback_confirmed_ns -and $endNs -le [uint64]$result.playback_last_confirmed_ns)
             continuous_playback_proven=$false
+            transport_expected_playing=$expectedPlaying
+            monitoring_only=[bool]$MonitoringOnly
             note='Polling brackets the recorded window; it does not prove continuous playback or audible RSE output.'
         }
     }
@@ -1020,7 +1077,10 @@ try {
     $result.external_vst3_modules = @($process.Modules | Where-Object FileName -Like '*.vst3' | ForEach-Object FileName)
     if ($InputOverlayFixture) {
         $allowedPrefix=$InputOverlayFixture.TrimEnd('\') + '\'
-        $unexpected=@($result.external_vst3_modules | Where-Object { -not $_.StartsWith($allowedPrefix,[StringComparison]::OrdinalIgnoreCase) })
+        $unexpected=@($result.external_vst3_modules | Where-Object {
+            -not $_.Equals($InputOverlayFixture,[StringComparison]::OrdinalIgnoreCase) -and
+            -not $_.StartsWith($allowedPrefix,[StringComparison]::OrdinalIgnoreCase)
+        })
         if ($unexpected.Count) { throw 'An unexpected VST3 module was loaded during the input-overlay collection.' }
         $runtime=(Read-P13Json (Join-Path $dataDirectory 'p2-observation.json')).gp_hook.input_monitor
         if (-not $runtime) { $runtime=$result.probe.input_monitor }

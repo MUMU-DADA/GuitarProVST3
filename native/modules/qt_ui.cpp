@@ -15,6 +15,8 @@
 #include <QtCore/QSet>
 #include <QtCore/QTimer>
 #include <QtCore/QSignalBlocker>
+#include <QtCore/QScopeGuard>
+#include <QtCore/QChildEvent>
 #include <functional>
 #include <QtWidgets/QAbstractItemView>
 #include <QtWidgets/QAbstractButton>
@@ -53,6 +55,7 @@
 #include <QtWidgets/QSizePolicy>
 #include <QtWidgets/QTabWidget>
 #include <QtWidgets/QToolBar>
+#include <QtWidgets/QToolButton>
 
 namespace gpvst3::ui {
 namespace {
@@ -77,6 +80,13 @@ Vst3StateControl g_vst3InputStateControl = nullptr;
 Vst3EditorControl g_vst3InputEditorControl = nullptr;
 InputMonitorRequestControl g_inputMonitorRequestControl = nullptr;
 InputMonitorSnapshotControl g_inputMonitorSnapshotControl = nullptr;
+Vst3ActiveControl g_vst3InputActiveControl = nullptr;
+NativeInputStateControl g_nativeInputStateControl = nullptr;
+QObject *(*g_nativeInputActionControl)() noexcept = nullptr;
+QPointer<QAction> g_nativeInputAction;
+QPointer<QObject> g_nativeInputObserver;
+QMetaObject::Connection g_nativeInputToggled, g_nativeInputDestroyed;
+bool g_nativeInputBindPending = false;
 Vst3RefreshControl g_refreshControl = nullptr;
 Vst3IdentifyControl g_identifyControl = nullptr;
 QJsonArray g_vst3Catalog;
@@ -440,6 +450,95 @@ QMainWindow *mainWindow() {
     return nullptr;
 }
 
+void bindNativeInputAction(QAction *observed = nullptr);
+
+void scheduleNativeInputBinding() {
+    if (!qApp || !g_nativeInputStateControl || g_nativeInputBindPending) return;
+    g_nativeInputBindPending = true;
+    QTimer::singleShot(0, qApp, [] {
+        g_nativeInputBindPending = false;
+        bindNativeInputAction();
+    });
+}
+
+class NativeInputObserver final : public QObject {
+public:
+    explicit NativeInputObserver(QObject *parent) : QObject(parent) {}
+protected:
+    bool eventFilter(QObject *object, QEvent *event) override {
+        if (!g_nativeInputStateControl || !event) return false;
+        if (event->type() == QEvent::ChildAdded && !g_nativeInputAction) {
+            // ChildAdded runs while QAction is still being constructed. Read
+            // its final type/name on Qt's next turn, without scanning the
+            // widget tree for ordinary layout or animation events.
+            const QPointer<QObject> child(static_cast<QChildEvent *>(event)->child());
+            QTimer::singleShot(0, this, [child] {
+                if (auto *action = qobject_cast<QAction *>(child.data())) {
+                    if (action->objectName() == QStringLiteral("actionActivatedLineIn"))
+                        bindNativeInputAction(action);
+                }
+            });
+        } else if (event->type() == QEvent::ActionAdded) {
+            // QAction registration does not establish QObject ownership. GP
+            // keeps its Line-In action in a service and only associates it
+            // with widgets, so observe this relationship explicitly.
+            auto *action = static_cast<QActionEvent *>(event)->action();
+            if (action && action->objectName() == QStringLiteral("actionActivatedLineIn"))
+                bindNativeInputAction(action);
+        } else if (!g_nativeInputAction &&
+                   (event->type() == QEvent::Show || event->type() == QEvent::WindowActivate) &&
+                   qobject_cast<QMainWindow *>(object)) {
+            scheduleNativeInputBinding();
+        }
+        return false;
+    }
+};
+
+QAction *findNativeInputAction() {
+    if (g_nativeInputActionControl)
+        if (auto *action = qobject_cast<QAction *>(g_nativeInputActionControl())) return action;
+    QList<QObject *> pending{qApp};
+    for (auto *widget : QApplication::allWidgets()) pending.append(widget);
+    QSet<QObject *> seen;
+    while (!pending.isEmpty()) {
+        auto *object = pending.takeLast();
+        if (!object || seen.contains(object)) continue;
+        seen.insert(object);
+        if (auto *action = qobject_cast<QAction *>(object))
+            if (action->objectName() == QStringLiteral("actionActivatedLineIn")) return action;
+        pending.append(object->children());
+        if (auto *widget = qobject_cast<QWidget *>(object))
+            for (auto *action : widget->actions()) pending.append(action);
+    }
+    return nullptr;
+}
+
+void bindNativeInputAction(QAction *observed) {
+    if (!g_nativeInputStateControl) return;
+    // Walk application/service children and registered widget actions only
+    // while locating a missing action. A live binding uses its Qt signals;
+    // panel maintenance must not turn this into another full-tree scan.
+    auto *action = observed ? observed : g_nativeInputAction ? g_nativeInputAction.data() : findNativeInputAction();
+    if (action == g_nativeInputAction) {
+        g_nativeInputStateControl(action && action->isCheckable(), action && action->isChecked());
+        return;
+    }
+    QObject::disconnect(g_nativeInputToggled);
+    QObject::disconnect(g_nativeInputDestroyed);
+    g_nativeInputAction = action;
+    g_nativeInputStateControl(action && action->isCheckable(), action && action->isChecked());
+    if (!action) return;
+    g_nativeInputToggled = QObject::connect(action, &QAction::toggled, qApp, [action](bool enabled) {
+        if (g_nativeInputStateControl) g_nativeInputStateControl(action->isCheckable(), enabled);
+        syncVst3Selection();
+    });
+    g_nativeInputDestroyed = QObject::connect(action, &QObject::destroyed, qApp, [] {
+        g_nativeInputAction = nullptr;
+        if (g_nativeInputStateControl) g_nativeInputStateControl(false, false);
+        scheduleNativeInputBinding();
+    });
+}
+
 QDialog *aboutDialog() {
     if (g_aboutDialog) return g_aboutDialog;
     auto *owner = mainWindow();
@@ -457,7 +556,7 @@ QDialog *aboutDialog() {
     title->setFont(titleFont);
     layout->addWidget(title);
     auto *details = new QLabel(
-        QStringLiteral("版本：0.10.0\n"
+        QStringLiteral("版本：0.10.1\n"
                        "已验证宿主：Guitar Pro 8.1.1.17（Windows x64）\n"
                        "许可证：MIT License\n"
                        "第三方声明：VST3 SDK 及插件各自遵循其许可证。\n"
@@ -742,9 +841,34 @@ public:
         setMinimumWidth(0);
         auto *root = new QVBoxLayout(this);
         root->setContentsMargins(0, 0, 0, 0);
+        if (scope == state::ScopeKind::Input) {
+            // A detached QWidget has no sound-rack background. Paint every
+            // surface locally so Guitar Pro's application stylesheet cannot
+            // leave a black window with dark, unreadable plug-in names.
+            setAttribute(Qt::WA_StyledBackground);
+            setFont(QFont(QStringLiteral("Microsoft YaHei UI"), 9));
+            root->setContentsMargins(18, 16, 18, 16);
+            root->setSpacing(10);
+            setStyleSheet(QStringLiteral(
+                "QWidget#gpvst3InputPanel { background:#292b36; color:#edf0f7; font-family:'Microsoft YaHei UI'; font-size:12px; }"
+                "QWidget#gpvst3InputPanel QWidget { background:transparent; font-family:'Microsoft YaHei UI'; font-size:12px; }"
+                "QWidget#gpvst3InputPanel QLabel, QWidget#gpvst3InputPanel QCheckBox { color:#edf0f7; background:transparent; }"
+                "QWidget#gpvst3InputPanel QLabel#gpvst3InputContext { font-size:18px; font-weight:600; }"
+                "QWidget#gpvst3InputPanel QLabel[gpvst3Secondary=\"true\"] { color:#b4bacb; }"
+                "QWidget#gpvst3InputPanel QFrame#gpvst3InputMonitorCard { background:#343745; border:1px solid #494e60; border-radius:8px; }"
+                "QWidget#gpvst3InputPanel QListWidget { background:#22242e; border:1px solid #44495a; border-radius:6px; outline:0; }"
+                "QWidget#gpvst3InputPanel QListWidget::item:selected { background:#414c68; }"
+                "QWidget#gpvst3InputPanel QPushButton { color:#edf0f7; background:transparent; border:0; min-height:28px; }"
+                "QWidget#gpvst3InputPanel QPushButton:hover { background:#41495e; border-radius:4px; }"
+                "QWidget#gpvst3InputPanel QPushButton:disabled { color:#8991a5; }"
+                "QWidget#gpvst3InputPanel QDoubleSpinBox { color:#edf0f7; background:#22242e; border:1px solid #596178; border-radius:4px; padding:5px 6px; min-height:22px; }"
+                "QWidget#gpvst3InputPanel QToolButton { color:#b4c9f5; background:transparent; border:0; padding:3px 0; text-align:left; }"
+                "QWidget#gpvst3InputPanel QCheckBox { spacing:8px; }"
+                "QWidget#gpvst3InputPanel QCheckBox::indicator { width:16px; height:16px; }"));
+        }
         auto *heading = new QHBoxLayout;
         trackContext_ = new QLabel(scope == state::ScopeKind::Track ? configuredTrackLabel()
-            : scope == state::ScopeKind::Input ? QStringLiteral("音频输入 · 独立 VST3 链")
+            : scope == state::ScopeKind::Input ? QStringLiteral("输入监听")
                                                : QStringLiteral("全局 Master"), this);
         trackContext_->setObjectName(scope == state::ScopeKind::Input
             ? QStringLiteral("gpvst3InputContext") : QStringLiteral("gpvst3TrackContext"));
@@ -754,10 +878,13 @@ public:
         close->setToolTip(QStringLiteral("关闭选择区"));
         close->setFixedWidth(24);
         heading->addWidget(close);
+        if (scope == state::ScopeKind::Input) close->hide(); // Native window close button owns this action.
         connect(close, &QPushButton::clicked, this, &QWidget::close);
         root->addLayout(heading);
         if (scope == state::ScopeKind::Input) createInputMonitorControls(root);
-        root->addWidget(new QLabel(QStringLiteral("正在使用（从上到下为效果顺序）"), this));
+        root->addWidget(new QLabel(scope == state::ScopeKind::Input
+            ? QStringLiteral("输入效果器 · 从上到下依次处理")
+            : QStringLiteral("正在使用（从上到下为效果顺序）"), this));
         list_ = new QListWidget(this);
         list_->setObjectName(scope == state::ScopeKind::Track ? QStringLiteral("gpvst3TrackChainList")
                                                              : scopePrefix() + QStringLiteral("ChainList"));
@@ -769,6 +896,12 @@ public:
         list_->setMinimumWidth(0);
         list_->setMaximumHeight(150);
         root->addWidget(list_);
+        if (scope == state::ScopeKind::Input) {
+            inputEmptyChain_ = new QLabel(QStringLiteral("未启用效果器 · 原声直通"), this);
+            inputEmptyChain_->setObjectName(QStringLiteral("gpvst3InputEmptyChain"));
+            inputEmptyChain_->setProperty("gpvst3Secondary", true);
+            root->addWidget(inputEmptyChain_);
+        }
         root->addWidget(new QLabel(QStringLiteral("可用插件"), this));
         availableList_ = new QListWidget(this);
         availableList_->setObjectName(scopePrefix() + QStringLiteral("AvailableList"));
@@ -777,10 +910,17 @@ public:
         availableList_->setStyleSheet(list_->styleSheet());
         availableList_->setMinimumWidth(0);
         availableList_->setMaximumHeight(120);
-        root->addWidget(availableList_);
+        root->addWidget(availableList_, scope == state::ScopeKind::Input ? 1 : 0);
+        if (scope == state::ScopeKind::Input) {
+            auto *hint = new QLabel(QStringLiteral("勾选启停 · 双击名称打开界面 · 拖动调整顺序"), this);
+            hint->setProperty("gpvst3Secondary", true);
+            hint->setWordWrap(true);
+            root->addWidget(hint);
+        }
         status_ = new QLabel(this);
         status_->setObjectName(scopePrefix() + QStringLiteral("Status"));
         status_->setWordWrap(true);
+        if (scope == state::ScopeKind::Input) status_->setProperty("gpvst3Secondary", true);
         root->addWidget(status_);
         connect(list_->model(), &QAbstractItemModel::rowsMoved, this,
                 [this] { syncOrderFromList(); });
@@ -821,6 +961,7 @@ public:
     }
 
     void reloadSavedSelection() {
+        if (selectionEditDepth_ > 0) { selectionReloadDeferred_ = true; return; }
         loadChain();
         bool failed = false, anyEnabled = false;
         for (const auto &value : effects_) {
@@ -828,13 +969,15 @@ public:
             anyEnabled |= checkStateFor(effect) == Qt::Checked;
             failed |= !effect.value("last_error").toString().isEmpty();
         }
-        setProperty("gpvst3SelectionState", pendingTrackSelection_ ? "request_pending" :
+        const bool pending = pendingTrackSelection_ || selectionRequestPending_;
+        setProperty("gpvst3SelectionState", pending ? "request_pending" :
                     failed ? "failed_reverted" : "applied");
         if (status_) {
-            if (pendingTrackSelection_) status_->setText(QStringLiteral("正在准备插件，点击勾选框可取消。"));
+            if (pending) status_->setText(QStringLiteral("正在准备插件，点击勾选框可取消。"));
             else if (failed) status_->setText(QStringLiteral("启用失败，已恢复到实际状态；可重新勾选重试。"));
             else if (anyEnabled) status_->setText(scope_ == state::ScopeKind::Input
-                ? QStringLiteral("已保存输入插件选择；监听状态见上方。") : QStringLiteral("已生效。"));
+                ? QStringLiteral("插件已准备好；监听跟随 LINE-IN 开关。") : QStringLiteral("已生效。"));
+            else if (scope_ == state::ScopeKind::Input) status_->clear();
         }
         refreshRowLoading();
         refreshInputMonitor();
@@ -864,6 +1007,7 @@ public:
     }
 
     void syncSelection() {
+        if (selectionEditDepth_ > 0) { selectionReloadDeferred_ = true; return; }
         // Selection completion is delivered by the control maintenance tick
         // (the same tick that reloads failed entries). This avoids a 50 ms
         // UI polling loop while still retrying exactly once after the worker
@@ -875,9 +1019,15 @@ public:
             // transient try-lock failure cannot strand the row in PartiallyChecked.
             if (selectionRequestPending_) {
                 selectionRequestPending_ = false;
-                pendingAnimationEffects_.clear();
+                if (!hasActiveSelectionControl()) pendingAnimationEffects_.clear();
+                // Input and global requests use the same completion signal
+                // as track requests. Reload the acknowledged saved state so
+                // failures, partial checkmarks and queued editor opens all
+                // observe the completed request instead of stale UI intent.
+                if (scope_ != state::ScopeKind::Track) reloadSavedSelection();
             }
             if (pendingTrackSelection_) reloadSavedSelection();
+            if (!pendingTrackSelection_) pendingAnimationEffects_.clear();
         }
         if (!g_pendingEditorKey.isEmpty() && (!g_vst3BusyControl || !g_vst3BusyControl())) {
             bool matched = false;
@@ -934,12 +1084,23 @@ private:
         QJsonObject chain;
         state::loadChain(chain);
         state::readInputMonitorSettings(chain, inputSettings_);
-        inputMonitorEnabled_ = new QCheckBox(QStringLiteral("低延迟监听"), this);
+        auto *card = new QFrame(this);
+        card->setObjectName(QStringLiteral("gpvst3InputMonitorCard"));
+        auto *controls = new QVBoxLayout(card);
+        controls->setContentsMargins(14, 12, 14, 12);
+        controls->setSpacing(9);
+        root->addWidget(card);
+        inputMonitorEnabled_ = new QCheckBox(QStringLiteral("低延迟输入监听"), card);
         inputMonitorEnabled_->setObjectName(QStringLiteral("gpvst3InputLowLatencyEnabled"));
-        inputMonitorEnabled_->setToolTip(QStringLiteral("使用独立输入效果器链；先勾选需要的插件，再开启监听。"));
+        inputMonitorEnabled_->setToolTip(QStringLiteral("跟随 Guitar Pro 的 LINE-IN 开关；没有启用效果器时直接监听原始输入。"));
         inputMonitorEnabled_->setChecked(inputSettings_.mode == state::InputMonitorMode::LowLatencyOverlay);
         inputMonitorEnabled_->setEnabled(g_inputMonitorRequestControl != nullptr);
-        root->addWidget(inputMonitorEnabled_);
+        controls->addWidget(inputMonitorEnabled_);
+        auto *description = new QLabel(QStringLiteral("跟随 Guitar Pro 的 LINE-IN 开关。未启用效果器时，直接监听原始输入。"), card);
+        description->setObjectName(QStringLiteral("gpvst3InputMonitorDescription"));
+        description->setProperty("gpvst3Secondary", true);
+        description->setWordWrap(true);
+        controls->addWidget(description);
         auto *gainRow = new QHBoxLayout;
         auto *gainLabel = new QLabel(QStringLiteral("监听增益"), this);
         inputGain_ = new QDoubleSpinBox(this);
@@ -953,12 +1114,36 @@ private:
         inputGain_->setEnabled(g_inputMonitorRequestControl != nullptr);
         gainLabel->setBuddy(inputGain_);
         gainRow->addWidget(gainLabel);
-        gainRow->addWidget(inputGain_, 1);
-        root->addLayout(gainRow);
+        gainRow->addStretch(1);
+        inputGain_->setFixedWidth(104);
+        gainRow->addWidget(inputGain_);
+        controls->addLayout(gainRow);
         inputMonitorStatus_ = new QLabel(this);
         inputMonitorStatus_->setObjectName(QStringLiteral("gpvst3InputMonitorStatus"));
         inputMonitorStatus_->setWordWrap(true);
-        root->addWidget(inputMonitorStatus_);
+        controls->addWidget(inputMonitorStatus_);
+        inputMonitorFormat_ = new QLabel(card);
+        inputMonitorFormat_->setObjectName(QStringLiteral("gpvst3InputMonitorFormat"));
+        inputMonitorFormat_->setProperty("gpvst3Secondary", true);
+        inputMonitorFormat_->setWordWrap(true);
+        controls->addWidget(inputMonitorFormat_);
+        auto *details = new QToolButton(card);
+        details->setObjectName(QStringLiteral("gpvst3InputDetailsToggle"));
+        details->setText(QStringLiteral("设备详情"));
+        details->setCheckable(true);
+        details->setToolButtonStyle(Qt::ToolButtonTextBesideIcon);
+        details->setArrowType(Qt::RightArrow);
+        controls->addWidget(details, 0, Qt::AlignLeft);
+        inputMonitorDetails_ = new QLabel(card);
+        inputMonitorDetails_->setObjectName(QStringLiteral("gpvst3InputMonitorDetails"));
+        inputMonitorDetails_->setProperty("gpvst3Secondary", true);
+        inputMonitorDetails_->setWordWrap(true);
+        inputMonitorDetails_->hide();
+        controls->addWidget(inputMonitorDetails_);
+        connect(details, &QToolButton::toggled, this, [this, details](bool expanded) {
+            details->setArrowType(expanded ? Qt::DownArrow : Qt::RightArrow);
+            inputMonitorDetails_->setVisible(expanded);
+        });
         connect(inputMonitorEnabled_, &QCheckBox::toggled, this, [this](bool enabled) {
             auto requested = inputSettings_;
             requested.mode = enabled ? state::InputMonitorMode::LowLatencyOverlay : state::InputMonitorMode::Off;
@@ -981,7 +1166,7 @@ private:
         const QSignalBlocker monitorBlocked(inputMonitorEnabled_), gainBlocked(inputGain_);
         inputMonitorEnabled_->setChecked(inputSettings_.mode == state::InputMonitorMode::LowLatencyOverlay);
         inputGain_->setValue(inputSettings_.gain);
-        inputMonitorStatus_->setText(QStringLiteral("监听设置未生效，请检查已启用的输入插件与 ASIO 设备。"));
+        inputMonitorStatus_->setText(QStringLiteral("监听设置未生效，请检查 LINE-IN 与 ASIO 设备。"));
         inputMonitorStatus_->setProperty("gpvst3Diagnostic", QString::fromStdString(error));
     }
 
@@ -1006,50 +1191,68 @@ private:
         }
         const auto runtimeState = snapshot.value("state").toString();
         QString message;
-        if (runtimeState == QStringLiteral("active")) message = QStringLiteral("低延迟监听已生效");
+        const bool requested = inputSettings_.mode == state::InputMonitorMode::LowLatencyOverlay;
+        if (requested && snapshot.contains("native_listener_known") && !snapshot.value("native_listener_known").toBool())
+            message = QStringLiteral("等待 Guitar Pro 输入状态");
+        else if (requested && snapshot.contains("native_listener_enabled") && !snapshot.value("native_listener_enabled").toBool())
+            message = QStringLiteral("LINE-IN 已关闭 · 监听已停止");
+        else if (runtimeState == QStringLiteral("active")) message = list_->count() == 0
+            ? QStringLiteral("正在监听 · 原声直通") : QStringLiteral("正在监听 · 输入效果器已生效");
         else if (runtimeState == QStringLiteral("preparing")) message = QStringLiteral("正在准备低延迟监听…");
         else if (runtimeState == QStringLiteral("draining")) message = QStringLiteral("正在切换输入监听…");
-        else if (runtimeState == QStringLiteral("muted")) message = QStringLiteral("输入监听已静音，请检查设备或重新启用输入插件。");
+        else if (runtimeState == QStringLiteral("muted")) message = QStringLiteral("输入监听已静音，请检查设备与插件。");
         else if (runtimeState == QStringLiteral("host_limited")) message = QStringLiteral("当前设备或宿主暂不支持低延迟监听。");
         else if (runtimeState == QStringLiteral("legacy")) message = QStringLiteral("兼容输入模式");
         else if (runtimeState == QStringLiteral("inactive") || runtimeState == QStringLiteral("off"))
             message = inputSettings_.mode == state::InputMonitorMode::Legacy
             ? QStringLiteral("兼容输入模式") : QStringLiteral("低延迟监听未启用");
         else message = QStringLiteral("等待输入监听状态");
+        QStringList format;
+        QString details;
         const bool configurationValidated = snapshot.value("configuration_validated").toBool();
         const auto sampleRate = configurationValidated ? snapshot.value("sample_rate").toDouble() : 0.0;
-        if (std::isfinite(sampleRate) && sampleRate > 0.0)
-            message += QStringLiteral("\n采样率：%1 Hz").arg(sampleRate, 0, 'f', 0);
+        if (std::isfinite(sampleRate) && sampleRate > 0.0) {
+            format.append(QStringLiteral("%1 kHz").arg(sampleRate / 1000.0, 0, 'g', 5));
+            details += QStringLiteral("采样率：%1 Hz").arg(sampleRate, 0, 'f', 0);
+        }
         const auto callbackFrames = configurationValidated ? snapshot.value("buffer_frames").toInt() : 0;
-        if (callbackFrames > 0) message += QStringLiteral("\n回调：%1 帧").arg(callbackFrames);
+        if (callbackFrames > 0) details += QStringLiteral("\n回调：%1 帧").arg(callbackFrames);
         const auto driverFrames = configurationValidated ? snapshot.value("driver_buffer_frames").toInt() : 0;
-        if (driverFrames > 0) message += QStringLiteral("\n驱动缓冲：%1 帧").arg(driverFrames);
-        else message += QStringLiteral("\n驱动缓冲：未知");
+        if (driverFrames > 0) {
+            format.append(QStringLiteral("缓冲 %1 帧").arg(driverFrames));
+            details += QStringLiteral("\n驱动缓冲：%1 帧").arg(driverFrames);
+        } else details += QStringLiteral("\n驱动缓冲：未知");
         const auto channels = configurationValidated ? snapshot.value("input_channels").toInt() : 0;
-        if (channels > 0) message += QStringLiteral("\n输入通道：%1").arg(channels);
+        if (channels > 0) {
+            format.append(channels == 1 ? QStringLiteral("单声道") : QStringLiteral("%1 通道").arg(channels));
+            details += QStringLiteral("\n输入通道：%1").arg(channels);
+        }
         if (snapshot.contains("input_native_effect_bypass"))
-            message += snapshot.value("input_native_effect_bypass").toBool()
+            details += snapshot.value("input_native_effect_bypass").toBool()
                 ? QStringLiteral("\n原生输入监听：已旁通") : QStringLiteral("\n原生输入监听：未旁通");
         const auto latency = snapshot.value("plugin_latency_samples");
         bool latencyStringValid = false;
         const auto latencySamples = latency.toString().toULongLong(&latencyStringValid);
         if (latency.isString() && latencyStringValid)
-            message += QStringLiteral("\n插件报告延迟：%1 样本").arg(latencySamples);
+            details += QStringLiteral("\n插件报告延迟：%1 样本").arg(latencySamples);
         else if (latency.isDouble() && std::isfinite(latency.toDouble()) && latency.toDouble() >= 0.0)
-            message += QStringLiteral("\n插件报告延迟：%1 样本").arg(latency.toDouble(), 0, 'f', 0);
+            details += QStringLiteral("\n插件报告延迟：%1 样本").arg(latency.toDouble(), 0, 'f', 0);
         bool errorsValid = false;
         const auto errorBlocks = snapshot.value("error_blocks").toString().toULongLong(&errorsValid);
         if (errorsValid && errorBlocks > 0)
-            message += QStringLiteral("\n输入处理错误：%1 次").arg(errorBlocks);
+            details += QStringLiteral("\n输入处理错误：%1 次").arg(errorBlocks);
         bool rejectionsValid = false;
         const auto rejectedBlocks = snapshot.value("configuration_rejected_blocks").toString().toULongLong(&rejectionsValid);
         if (rejectionsValid && rejectedBlocks > 0)
-            message += QStringLiteral("\n配置未验证跳过：%1 块").arg(rejectedBlocks);
+            details += QStringLiteral("\n配置未验证跳过：%1 块").arg(rejectedBlocks);
         bool clippedValid = false;
         const auto clippedBlocks = snapshot.value("clipped_blocks").toString().toULongLong(&clippedValid);
         if (clippedValid && clippedBlocks > 0)
-            message += QStringLiteral("\n混音削波：%1 块，请降低输入增益").arg(clippedBlocks);
+            details += QStringLiteral("\n混音削波：%1 块，请降低输入增益").arg(clippedBlocks);
         inputMonitorStatus_->setText(message);
+        inputMonitorFormat_->setText(format.join(QStringLiteral(" · ")));
+        inputMonitorFormat_->setVisible(!format.isEmpty());
+        inputMonitorDetails_->setText(details.trimmed());
         inputMonitorStatus_->setProperty("gpvst3RuntimeState", runtimeState);
         inputMonitorStatus_->setProperty("gpvst3Diagnostic", snapshot.value("detail").toString());
         inputMonitorStatus_->setProperty("gpvst3Error", snapshot.value("error").toString());
@@ -1057,7 +1260,7 @@ private:
 
     bool rowLoading(const QJsonObject &effect) const {
         const auto identity = key(effect);
-        if (scope_ == state::ScopeKind::Track)
+        if (scope_ == state::ScopeKind::Track || (scope_ == state::ScopeKind::Input && g_vst3InputActiveControl))
             return trackSelectionIsPending() && pendingAnimationEffects_.contains(identity);
         return selectionRequestPending_ && pendingAnimationEffects_.contains(identity);
     }
@@ -1076,32 +1279,40 @@ private:
     }
 
     bool trackSelectionIsPending() const {
-        return scope_ == state::ScopeKind::Track && pendingTrackSelection_ &&
-               pendingTrackGeneration_ == selectionGeneration_;
+        return pendingTrackSelection_ && (scope_ == state::ScopeKind::Input ||
+               (scope_ == state::ScopeKind::Track && pendingTrackGeneration_ == selectionGeneration_));
+    }
+
+    bool hasActiveSelectionControl() const {
+        return scope_ == state::ScopeKind::Input ? g_vst3InputActiveControl != nullptr
+             : scope_ == state::ScopeKind::Track && g_vst3TrackActiveControl;
     }
 
     bool displayedSelection(const QJsonObject &effect) const {
-        if (scope_ != state::ScopeKind::Track || !g_vst3TrackActiveControl)
+        if (!hasActiveSelectionControl())
             return effect.value("enabled").toBool();
         return (trackSelectionIsPending() ? pendingTrackEffects_ : activeTrackEffects_).contains(key(effect));
     }
 
     Qt::CheckState checkStateFor(const QJsonObject &effect) const {
         if (!displayedSelection(effect)) return Qt::Unchecked;
-        if (scope_ == state::ScopeKind::Track && g_vst3TrackActiveControl &&
+        if (hasActiveSelectionControl() &&
             !activeTrackEffects_.contains(key(effect))) return Qt::PartiallyChecked;
+        if (scope_ == state::ScopeKind::Global && rowLoading(effect)) return Qt::PartiallyChecked;
         return Qt::Checked;
     }
 
     void refreshActiveTrackState() {
-        if (scope_ != state::ScopeKind::Track) return;
-        if (!g_vst3TrackActiveControl || trackKey_.isEmpty()) {
+        if (scope_ != state::ScopeKind::Track && scope_ != state::ScopeKind::Input) return;
+        if (!hasActiveSelectionControl() || (scope_ == state::ScopeKind::Track && trackKey_.isEmpty())) {
             if (pendingTrackSelection_ && (!g_vst3BusyControl || !g_vst3BusyControl()))
                 pendingTrackSelection_ = false;
             return;
         }
         std::vector<Vst3SelectionEntry> live;
-        if (!g_vst3TrackActiveControl(trackKey_.toStdString(), live)) return;
+        const bool reliable = scope_ == state::ScopeKind::Input
+            ? g_vst3InputActiveControl(live) : g_vst3TrackActiveControl(trackKey_.toStdString(), live);
+        if (!reliable) return;
         activeTrackEffects_.clear();
         for (const auto &entry : live)
             activeTrackEffects_.insert(QString::fromStdString(entry.module) + '\n' +
@@ -1138,6 +1349,7 @@ private:
     }
 
     bool publishSelection(const QString &requestIdentity = QString()) {
+        const QPointer<P7Panel> self(this);
         if (scope_ == state::ScopeKind::Track &&
             selectionGeneration_ != state::runtimeSelectionGeneration()) {
             setProperty("gpvst3SelectionState", "stale_scope");
@@ -1155,6 +1367,7 @@ private:
         // so the input backend applies the same identity-preserving contract.
         const auto liveInputStates = scope_ == state::ScopeKind::Input
             ? captureStates() : std::vector<Vst3SelectionEntry>{};
+        if (!self) return false;
         std::vector<Vst3SelectionEntry> selection;
         for (int index = 0; index < effects_.size(); ++index) {
             auto effect = effects_.at(index).toObject();
@@ -1201,6 +1414,7 @@ private:
                   trackKey_.toStdString(), selection, &error)
                : (g_vst3TrackSelectionControl ? g_vst3TrackSelectionControl(
                   trackKey_.toStdString(), selection, &error) : true));
+        if (!self) return false;
         if (accepted) {
             selectionRequestPending_ = asynchronous;
             pendingAnimationEffects_.clear();
@@ -1220,7 +1434,7 @@ private:
                 if (requestedIdentities.contains(requestIdentity))
                     pendingAnimationEffects_.insert(requestIdentity);
             }
-            if (scope_ == state::ScopeKind::Track && asynchronous) {
+            if ((scope_ == state::ScopeKind::Track || scope_ == state::ScopeKind::Input) && asynchronous) {
                 pendingTrackSelection_ = true;
                 pendingTrackGeneration_ = selectionGeneration_;
                 pendingTrackEffects_.clear();
@@ -1300,6 +1514,7 @@ private:
     }
 
     void loadChain() {
+        if (selectionEditDepth_ > 0) { selectionReloadDeferred_ = true; return; }
         const auto previousTrackKey = trackKey_;
         QString selectedIdentity;
         if (list_ && list_->currentRow() >= 0) {
@@ -1403,8 +1618,14 @@ private:
                 activeList()->setCurrentRow(selectedRow);
         }
         const auto rowHeight = qMax(32, qRound(32 * devicePixelRatioF()));
-        list_->setFixedHeight(qMin(150, qMax(1, list_->count()) * rowHeight + 4));
-        availableList_->setFixedHeight(qMin(120, qMax(1, availableList_->count()) * rowHeight + 4));
+        list_->setFixedHeight(qMin(scope_ == state::ScopeKind::Input ? 200 : 150,
+                                  qMax(1, list_->count()) * rowHeight + 4));
+        if (scope_ == state::ScopeKind::Input) {
+            list_->setVisible(list_->count() > 0);
+            inputEmptyChain_->setVisible(list_->count() == 0);
+            availableList_->setMinimumHeight(100);
+            availableList_->setMaximumHeight(QWIDGETSIZE_MAX);
+        } else availableList_->setFixedHeight(qMin(120, qMax(1, availableList_->count()) * rowHeight + 4));
         // Scope loading is read-only. Writing this in-memory list here can
         // copy the previous selected track onto a newly inserted track while
         // Guitar Pro is still applying its asynchronous Score mutation.
@@ -1474,13 +1695,24 @@ private:
         const auto identity = key(effect);
         row->setProperty("gpvst3EntryId", identity);
         row->setLoading(rowLoading(effect));
-        connect(check, &QCheckBox::toggled, this, [this, identity, check](bool enabled) {
+        const auto rowGeneration = selectionGeneration_;
+        connect(check, &QCheckBox::toggled, this,
+                [this, identity, rowGeneration, check = QPointer<QCheckBox>(check)](bool enabled) {
+            if (scope_ == state::ScopeKind::Track && rowGeneration != state::runtimeSelectionGeneration()) return;
             const int index = indexFor(identity); if (index < 0) return;
+            const QPointer<P7Panel> self(this);
+            ++selectionEditDepth_;
+            const auto finished = qScopeGuard([self] {
+                if (!self || --self->selectionEditDepth_ != 0 || !self->selectionReloadDeferred_) return;
+                self->selectionReloadDeferred_ = false;
+                self->reloadSavedSelection();
+                if (self) self->syncSelection();
+            });
             const auto previousEffects = effects_;
             const auto previousCheckState = checkStateFor(effects_.at(index).toObject());
             // A user edit starts from the active/pending list they can see,
             // rather than resurrecting an invisible stale sidecar selection.
-            if (scope_ == state::ScopeKind::Track && g_vst3TrackActiveControl) {
+            if (hasActiveSelectionControl()) {
                 for (int i = 0; i < effects_.size(); ++i) {
                     auto visible = effects_.at(i).toObject();
                     const bool selected = displayedSelection(visible);
@@ -1491,8 +1723,6 @@ private:
             }
             auto effect = effects_.at(index).toObject();
             const auto editorKey = editorScopeKey() + '\n' + key(effect);
-            if (!enabled && g_pendingEditorKey == editorKey) g_pendingEditorKey.clear();
-            if (!enabled && g_editorWindow && g_editorWindow->openedKey == editorKey) g_editorWindow->close();
             effect.insert("enabled", enabled);
             effect.insert("bypass", !enabled);
             effect.insert("configured", true);
@@ -1506,13 +1736,20 @@ private:
                 effect.insert("order", nextOrder);
             }
             effects_.replace(index, effect);
-            if (!publishSelection(identity)) {
+            const bool accepted = publishSelection(identity);
+            if (!self) return;
+            if (!accepted) {
                 effects_ = previousEffects;
-                const QSignalBlocker blocked(check);
-                check->setCheckState(previousCheckState);
+                if (check) {
+                    const QSignalBlocker blocked(check);
+                    check->setCheckState(previousCheckState);
+                } else selectionReloadDeferred_ = true;
                 return;
             }
-            if (scope_ == state::ScopeKind::Track && g_vst3TrackActiveControl) {
+            if (!enabled && g_pendingEditorKey == editorKey) g_pendingEditorKey.clear();
+            if (!enabled && g_editorWindow && g_editorWindow->openedKey == editorKey) g_editorWindow->close();
+            if (!self) return;
+            if (hasActiveSelectionControl() && check) {
                 const QSignalBlocker blocked(check);
                 check->setCheckState(checkStateFor(effect));
             }
@@ -1528,9 +1765,10 @@ private:
                         ? QStringLiteral("请求中：准备完成后自动生效。")
                         : QStringLiteral("已启用：双击名称打开原生 GUI")))
                 : QStringLiteral("已停用：%1").arg(effect.value("name").toString()));
-            // Rebuild after the current signal so enabled rows move immediately.
-            QTimer::singleShot(0, this, [this] { loadChain(); });
-        });
+            // The transaction runs after setChecked returns. Rebuild once it
+            // finishes, after any nested plug-in editor/state callbacks.
+            selectionReloadDeferred_ = true;
+        }, Qt::QueuedConnection);
         const auto openEditorForEntry = [this, identity] {
             const int index = indexFor(identity);
             if (index >= 0) openEditor(index);
@@ -1553,13 +1791,14 @@ private:
             return;
         }
         const auto effect = effects_.at(index).toObject();
+        const auto editorKey = editorScopeKey() + '\n' + key(effect);
         if (!displayedSelection(effect)) {
+            if (g_pendingEditorKey == editorKey) g_pendingEditorKey.clear();
             status_->setText(QStringLiteral("请先勾选启用插件，再打开其 GUI。"));
             return;
         }
-        const auto editorKey = editorScopeKey() + '\n' + key(effect);
         g_pendingEditorKey = editorKey;
-        if (g_vst3BusyControl && g_vst3BusyControl()) {
+        if (checkStateFor(effect) == Qt::PartiallyChecked || (g_vst3BusyControl && g_vst3BusyControl())) {
             status_->setText(QStringLiteral("正在准备插件，完成后自动打开 GUI。"));
             return;
         }
@@ -1667,6 +1906,7 @@ private:
     QCheckBox *inputMonitorEnabled_ = nullptr;
     QDoubleSpinBox *inputGain_ = nullptr;
     QLabel *inputMonitorStatus_ = nullptr;
+    QLabel *inputMonitorFormat_ = nullptr, *inputMonitorDetails_ = nullptr, *inputEmptyChain_ = nullptr;
     state::InputMonitorSettings inputSettings_;
     QJsonObject sidecar_;
     QJsonArray effects_;
@@ -1681,6 +1921,8 @@ private:
     bool pendingTrackSelection_ = false;
     std::uint64_t pendingTrackGeneration_ = 0;
     bool selectionRequestPending_ = false;
+    int selectionEditDepth_ = 0;
+    bool selectionReloadDeferred_ = false;
     QSet<QString> pendingAnimationEffects_;
 
     void bindTrackContext() {
@@ -2009,12 +2251,22 @@ void setVst3EditorControl(Vst3EditorControl open, Vst3EditorCloseControl close, 
 
 void setVst3InputControls(Vst3SelectionRequestControl request, Vst3StateControl capture,
                           Vst3EditorControl editor, InputMonitorRequestControl monitor,
-                          InputMonitorSnapshotControl snapshot) noexcept {
+                          InputMonitorSnapshotControl snapshot, Vst3ActiveControl active,
+                          NativeInputStateControl nativeInput,
+                          QObject *(*nativeAction)() noexcept) noexcept {
+    g_nativeInputActionControl = nativeAction;
     g_vst3InputSelectionRequestControl = request;
     g_vst3InputStateControl = capture;
     g_vst3InputEditorControl = editor;
     g_inputMonitorRequestControl = monitor;
     g_inputMonitorSnapshotControl = snapshot;
+    g_vst3InputActiveControl = active;
+    g_nativeInputStateControl = nativeInput;
+    if (qApp && nativeInput && !g_nativeInputObserver) {
+        g_nativeInputObserver = new NativeInputObserver(qApp);
+        qApp->installEventFilter(g_nativeInputObserver);
+    }
+    bindNativeInputAction();
 }
 
 void setVst3Catalog(const QJsonArray &catalog) {
@@ -2186,7 +2438,7 @@ void showEffectChainPanel(bool show) {
             auto *input = new P7Panel(state::ScopeKind::Input);
             input->setParent(mainWindow(), Qt::Window);
             input->setWindowTitle(QStringLiteral("输入监听 · VST3"));
-            input->resize(380, 600);
+            input->resize(420, 640);
             input->setVisible(g_inputExpanded);
             qApp->setProperty("gpvst3InputPanel", QVariant::fromValue(static_cast<QWidget *>(input)));
             QObject::connect(input, &QObject::destroyed, qApp, [] {

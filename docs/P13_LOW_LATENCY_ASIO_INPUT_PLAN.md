@@ -1,20 +1,20 @@
 # P13：ASIO 输入低延迟监听与 RSE 共存计划
 
-状态：P13-0～P13-4 已完成实现与固定配置验收，版本 0.10.0（2026-09-19）。已验证 ASIO 192000 Hz / 64 帧、GP 内部 44100 Hz 的低延迟监听、RSE 逐样本共存、三 scope 隔离、尾音/快速切换、冷启动/设备恢复和发布包；其他真实设备与格式仍按计划记为未验证/宿主受限。当前证据见 [P13 实现记录](P13_IMPLEMENTATION.md) 和 [宿主边界调查](P13_HOST_BOUNDARY.md)。
+状态：0.10.1 已修订输入开关、插件启停、UI、空链监听、多率/大 buffer 与实时处理开销（2026-09-20）。离线专项及真实宿主开关、三链、冷启动与编辑器重入回归已通过；全硬件矩阵和实际演奏的零爆音验收仍未完成。0.10.0 的 ASIO 192000 Hz / 64 帧固定配置验收仅作历史证据。当前结果见 [P13 实现记录](P13_IMPLEMENTATION.md) 和 [宿主边界调查](P13_HOST_BOUNDARY.md)。
 
 本阶段目标是降低实时输入监听延迟：在验证 ASIO 输入到宿主 callback 之间没有额外大块聚合后，使用实际输入 block 进入独立 VST3 输入链，同时保留 Guitar Pro RSE 音源、原生效果器链以及现有 global/track VST3 音频逻辑。两路必须可以同时发声，在设备输出边界合成；保留 RSE 原有渲染线程和调度，不要求 RSE DSP 与输入 DSP 都嵌套在同一 callback 内执行。
 
-当前普通构建按本机真实 192000 Hz、64 帧 ASIO callback 运行独立 input overlay；原生监听的 output 在进入共享混音前分流，原生 DSP 继续运行。实际支持受宿主 hash、stream identity、generation、rate 与 SRC 拓扑共同门控，其他格式报告 `host_limited`。录音要求按 GP8 官方手册判为宿主不提供/不适用，不能用实验 PCM recorder 代替；电平、尾音与切换仍须以各自证据判定，不能把短窗口运行成功扩大为全部设备或全部第三方插件已验证。
+当前代码仅在 Guitar Pro LINE-IN 已开启且低延迟模式已请求时运行独立 input overlay；原生监听的 output 在进入共享混音前分流，原生 DSP 继续运行。已实现 44100、48000、88200、96000、176400、192000 Hz 对应拓扑，32、64、128、256、512、1024、2048、4096、8192 帧已有离线分块覆盖。实际支持仍受宿主 hash、stream identity、generation、rate 与 SRC 拓扑共同门控，范围外或合同不符报告 `host_limited`。这不是硬件全矩阵通过声明。录音要求按 GP8 官方手册判为宿主不提供/不适用，不能用实验 PCM recorder 代替。
 
 ## 1. 目标和不变约束
 
 ### 1.1 目标
 
-1. 在明确打开低延迟输入模式时，真实 ASIO 输入直接进入独立的 input VST3 chain。
-2. input VST3 的 `ProcessData.numSamples` 使用经验证的输入 callback 实际 `frames`；分别记录 ASIO 驱动 buffer 与宿主 callback block，不把两者默认视为相同。
+1. Guitar Pro LINE-IN 已开启且明确请求低延迟输入模式时，真实 ASIO 输入直接进入独立的 input VST3 chain；空链按监听增益干声直通。保存模式偏好不能自行开启宿主输入。
+2. input VST3 的 `ProcessData.numSamples` 使用经验证的当前处理段实际 `frames`；大 callback 在同次调用内按不超过 2048 帧分段，分别记录 ASIO 驱动 buffer 与处理帧数，不把两者默认视为相同。
 3. RSE 播放保留现有原生音轨效果、track VST3、原生 Master 效果和 global VST3 的处理顺序、块大小与调度。
 4. RSE 生成的 output 与输入 VST3 的结果在 callback 内叠加，输入监听不能覆盖 RSE 播放声。
-5. 首次准备失败时保留原路由；激活后的输入处理故障只静音输入贡献并保留 GP 输出；用户关闭模式时恢复启用前的原生监听状态。
+5. 首次准备失败时保留原路由；激活后的输入处理故障只静音输入贡献并保留 GP 输出；关闭模式时解除原生监听分流，遵从用户当前 LINE-IN 开关，不恢复旧选择。
 
 ### 1.2 不变约束
 
@@ -94,18 +94,19 @@ RSE/现有 GP output ───────────────────�
 
 ### 3.2 callback 内调用顺序
 
-在 P13-0 确认接入边界后采用下面的顺序，保留原始 callback 调用及返回语义：
+在已确认的接入边界采用下面的顺序。大 callback 先拆为不超过 2048 帧的连续处理段，每段遵循同一流程，原函数提前结束时保留其返回状态并清零未处理尾部：
 
 ```text
-streamCallbackHook
-  ├─ 获取一次 mode / slot / stream generation 配置快照
+streamCallbackChunk
+  ├─ 核对 LINE-IN 当前状态并获取 mode / slot / stream generation 配置快照
   ├─ 验证输入边界、格式、通道、frames、容量和指针
   ├─ 必要时将真实 input 复制到预分配 scratch，防止原 callback 改写别名数据
   ├─ 按已验证的合同抑制原生输入监听贡献
   ├─ 调用 GP 原始 callback
   │    └─ 保留原有调度，得到不含原生输入监听贡献的 GP output
-  ├─ 同一配置快照下：真实 input → input VST3 chain → 独立 scratch
+  ├─ 同一配置快照下：真实 input → input VST3 chain（空链直通）→ 独立 scratch
   ├─ 校验成功后将 inputGain * processedInput 叠加到 GP output
+  ├─ 补齐原生 [-1,1] 设备输出范围并记录削波
   └─ 返回原始 callback 状态
 ```
 
@@ -113,19 +114,20 @@ streamCallbackHook
 
 原生输入抑制和 overlay 发布必须共用同一份配置快照并在块边界原子提交，避免一次 callback 中出现两份监听或模式前后不一致。
 
-切换快照先进入 `draining`：此时 native 贡献已抑制而 overlay 尚未输出。只有经过计数证据确认 SRC/ring 旧数据排空，才在后续块入口进入 `active`；这段有界数据排空的监听空隙不能显示为已生效。停止或暂停时无数据推进，不以墙钟超时强制激活。
+存在 output SRC/ring 的切换先进入 `draining`：此时 native 贡献已抑制而 overlay 尚未输出。只有经过计数证据确认旧数据排空，才在后续块入口进入 `active`；这段有界数据排空的监听空隙不能显示为已生效。44100 Hz 无 output SRC/ring 时核对直通拓扑后不等待不存在的历史队列。停止或暂停时无数据推进，不以墙钟超时强制激活。
 
 ### 3.3 混音与故障合同
 
 ```text
-output = unchanged GP/RSE output + inputGain * processedInput
+mixedOutput = unchanged GP/RSE output + inputGain * processedInput
+deviceOutput = clamp(mixedOutput, -1, 1)
 ```
 
 - 输入采用明确的增益、固定通道映射和有限值检查；输入处理和试混音全部成功之前不改写 GP output，错误时丢弃整块输入结果，包括加法溢出。
-- 不动态归一化、压缩或延迟 RSE 来适配输入。提供手动输入增益与削波检测，留出相加的余量；新路径不复用旧 `interleave` 的整块限幅，也不新增混音后的 limiter，沿用宿主既有设备输出边界。最终设备若发生饱和，合成声音会改变，因此 RSE 不变性以叠加前信号和未削波条件验收。
-- 首次准备失败、空 input 链或宿主合同未通过：不提交低延迟模式，原始路由保持不变。第一版不将空链隐式解释为干声直通。
+- 不动态归一化、压缩或延迟 RSE 来适配输入。提供手动输入增益与削波检测，留出相加的余量；overlay 叠加后补齐 AMAudio 原有 `[-1,1]` 输出范围并计数，避免绕过原生最后一道输出边界。削波时合成声音会改变，因此 RSE 不变性以叠加前信号和未削波条件验收。
+- 首次准备失败或宿主合同未通过：不提交低延迟模式，原始路由保持不变。空 input 链是合法干声监听配置，采用同一宿主开关、格式门控、排空和增益流程。
 - 激活后发生插件返回错误、非有限输出、容量不足或重配置：保留 GP output，静音 input overlay，继续抑制原生输入监听；不得自动放出干声或原生湿声。流重建时按新 generation 重新验证，旧指针失效后不得继续替换输入。
-- 用户明确关闭模式时恢复启用前的原生监听状态和旧路由；原来关闭的监听不能被强制打开，也不能一律切到 legacy。
+- 用户明确关闭模式时解除分流并遵从 LINE-IN 当前状态；宿主关闭输入时立即停止输入贡献，不得因保存的模式或旧开关状态重新开启输入，也不能一律切到 legacy。
 - 设备 callback 内的原始处理、输入处理和混音共用 `frames / sampleRate` 的时间预算。实例隔离不代表 CPU 或崩溃隔离；进程内第三方插件超时、死锁或崩溃仍可能影响整个宿主。
 
 ## 4. 运行时状态和配置
@@ -134,7 +136,7 @@ output = unchanged GP/RSE output + inputGain * processedInput
 
 ```text
 input_monitor_mode = off | legacy | low_latency_overlay
-input_runtime_state = inactive | preparing | draining | active | muted | host_limited
+input_runtime_state = off | legacy | waiting_for_input | preparing | draining | active | muted | host_limited
 input_native_effect_bypass = false | true
 input_asio_driver_frames
 input_callback_frames
@@ -145,17 +147,17 @@ input_bypass_reason
 
 语义：
 
-- `off`：本插件的输入扩展关闭，不代表强制关闭 GP 原生监听；退出低延迟模式时恢复启用前的状态。
+- `off`：本插件的输入扩展关闭，不代表强制关闭 GP 原生监听；退出低延迟模式后继续遵从 LINE-IN 当前状态。
 - `legacy`：保持现有 `input_insert`/`bus_mix` 兼容行为，便于回滚和旧测试。
-- `low_latency_overlay`：输入 native effect 旁通（仅在合同通过时），真实 input 独立进入 VST3，再与 GP output 叠加。
+- `low_latency_overlay`：LINE-IN 开启且合同通过时旁通原生输入贡献，真实 input 独立进入 VST3（空链干声直通），再与 GP output 叠加。LINE-IN 关闭或状态未知时为 `waiting_for_input`，不分流或处理输入。
 
 低延迟模式不允许把 `bus_mix` 当作别名。若用户选择了不支持 overlay 的路由，UI/API 必须返回明确状态并保持旧模式。
 
 低延迟开关同时控制原生输入监听旁通和 overlay 激活；`input_native_effect_bypass` 是实际生效状态，不作为允许双重监听的第二个独立开关。用户请求与实际状态分开保存。驱动 block 无可靠证据时显示未知，不能用 callback `frames` 填充冒充驱动值。
 
-输入链使用独立 scope 保存插件列表、顺序、启停、参数/state、增益和 editor 归属；复用现有持久化机制并兼容旧数据，不能改写 global/track 的字段。editor 可以复用现有窗口管理，但其控制器与参数必须属于 input 实例。明确 input 配置的设备/会话归属，切谱、切轨与 global 修改不得触发输入重建或参数同步。
+输入链使用独立 scope 保存插件列表、顺序、启停、参数/state、增益和 editor 归属；复用现有持久化机制并兼容旧数据，不能改写 global/track 的字段。启用、取消、停用及 editor 操作采用与其他 scope 一致的待提交/实际运行状态确认；请求中不能假报已生效。editor 的控制器与参数必须属于 input 实例。切谱、切轨与 global 修改不得触发输入重建或参数同步。
 
-`setupProcessing.maxSamplesPerBlock` 是准备容量；每次 `process` 的 `numSamples` 才是实际帧数。在容量以内的可变 `frames` 直接处理，不填满固定长度、不另增整块 FIFO、不因每次块长变化重新 setup。采样率、通道、stream generation 变化或所需容量增长才发布重配置请求，由控制线程准备并提交新 slot；callback 不调用 `setupProcessing`、分配内存或销毁实例。容量需与宿主格式门控、router scratch 和各插件准备容量一致。
+`setupProcessing.maxSamplesPerBlock` 是准备容量；每次 `process` 的 `numSamples` 才是实际帧数。在容量以内的可变 `frames` 直接处理，不填满固定长度、不另增整块 FIFO、不因每次块长变化重新 setup。4096/8192 帧在同一次设备 callback 内按 2048 帧连续处理，推进输入/输出指针及 ADC/DAC 采样时间，保持该次调用的 `currentTime` 基准；原函数提前结束时清零尚未处理的尾部。采样率、通道、stream generation 变化或所需容量增长由控制线程重新准备 slot；callback 不调用 `setupProcessing`、分配内存或销毁实例。
 
 P13-0 已发现本机 ASIO 实际 rate 可为 192000，而 `PaStreamInfo.sampleRate` 仍为 GP 请求值 44100，GP 在内部转换两者。低延迟 input slot 必须按真实 capture rate 准备并绑定当前 stream generation；不能用旧 `portaudio::Configuration.sampleRate`、RSE rate、callback 间隔推算值或 UI 设置代替。驱动 rate 在控制线程独立查询与验证，callback 不调用 driver 控制接口；无法保证当前 generation 的实际 rate 时拒绝激活或静音输入贡献。
 
@@ -189,11 +191,11 @@ P13-0 已发现本机 ASIO 实际 rate 可为 192000，而 `PaStreamInfo.sampleR
 - 仅在 P13-0 合同通过后启用已验证的输入监听分支旁通；静音 input 候选必须满足同等合同。
 - 在块边界提交输入抑制、slot、路由和 generation 的一致快照；请求接收与冷启动准备完成分开记录，不能承诺新插件在下一个 callback 就准备好。
 - 验证长尾效果、排队旧数据和快速切换的过渡；不得重置共享 RSE 状态。切换期间不能销毁仍被音频线程使用的 slot。
-- 保留录音、输入电平和宿主状态的行为证据；恢复时还原原状态，不强制打开旧监听。
+- 保留输入电平和宿主状态的行为证据；退出分流时遵从 LINE-IN 当前状态，不强制打开输入。原生录音按宿主不提供处理。
 
 ### P13-3：UI、诊断和持久化
 
-- 在输入监听区域增加“低延迟输入模式”开关，以及只读的原生输入旁通状态；提供独立插件选择、编辑、启停和输入增益。
+- 输入窗口集中显示“低延迟输入监听”、增益和当前状态；插件列表沿用其他 scope 的启停与 GUI 操作流程，设备详情默认折叠。等待 LINE-IN、空链干声、准备、排空、运行与故障分别显示。
 - 显示已验证的驱动 buffer、`input_callback_frames`、采样率、通道数、输入链延迟样本、overlay/muted 原因和错误计数。串行插件延迟按实际链路累计，并响应延迟变化通知。
 - 低延迟模式的用户意图与运行时状态分开保存；宿主不支持时保持配置、拒绝激活，并显示原因。
 - RSE/global/track 的现有开关、参数、编辑器和 sidecar 不复用输入模式字段。
@@ -218,10 +220,11 @@ P13-0 已发现本机 ASIO 实际 rate 可为 192000，而 `PaStreamInfo.sampleR
 | 同时运行 | overlay 在最终输出边界加法合成；新模式不使用旧 `input_insert` / `bus_mix`，旧模式语义不变 |
 | 隔离 | input 实例、scratch、选择、启停、参数、state、editor 与故障状态独立；global/track 操作不改变 input，反向亦然 |
 | 切换 | 请求可在块边界接收，准备与尾音过渡独立验收；原生抑制与 overlay 一致提交，无重复监听、过期指针或 RSE 重建 |
+| 宿主开关与空链 | 保存低延迟偏好不打开 LINE-IN；关闭 LINE-IN 后零输入处理且不抑制原生监听；空链或全部停用仍正常干声监听 |
 | 输入故障 | 已激活时静音 input 并保留 GP output，不意外切到干声/原生监听；首次准备失败不改变原路由 |
 | 稳定性 | 无音频线程分配、Qt 调用、阻塞锁、sequence gap、非有限样本和未解释的 xrun |
 | 延迟证据 | 区分驱动 buffer、callback 时长、处理 CPU 耗时、插件延迟和实测监听延迟；后台计算 P50/P95/max，实测显示旁通消除了所定位的额外等待 |
-| 回滚 | 关闭后恢复启用前的监听状态和路由，RSE/global/track 状态无需重建 |
+| 回滚 | 关闭模式后解除分流并遵从 LINE-IN 当前状态，RSE/global/track 状态无需重建 |
 
 ## 7. 风险和明确边界
 
@@ -230,6 +233,6 @@ P13-0 已发现本机 ASIO 实际 rate 可为 192000，而 `PaStreamInfo.sampleR
 - 驱动和宿主 block 大小可能不同。只取得 1024 帧时不能宣称直接获取了 128 帧；若未找到更早的合适边界，本模式不满足低 buffer 目标。
 - VST3 自身的 lookahead、oversampling 或非零 `getLatencySamples()` 仍会增加输入监听延迟；本阶段记录并显示，不伪造零延迟保证。
 - 低 buffer 缩短两路共用的处理期限；插件状态独立不能保证重负载下 RSE 完全免受音频超时影响。第三方插件兼容性与并发负载必须实测。
-- 本机固定配置已取得硬件回环监听延迟对照；其他 ASIO 驱动、实际采样率、硬件 buffer 和 Guitar Pro 版本尚无完整矩阵。当前设备拒绝 128～4096 帧请求并恢复 64 帧的证据只证明拒绝/恢复合同，不证明其他 buffer 运行通过；实验结果、已验证版本与 `host_limited` 的具体原因分别记录，不扩大验收范围。
+- 0.10.0 固定配置已取得硬件回环监听延迟对照；0.10.1 的六种 rate、九档 buffer 目前有算法与离线专项，新的硬件矩阵、实际监听、爆音验收与崩溃调查仍待完成。历史设备拒绝 128～4096 帧请求并恢复 64 帧的证据只证明拒绝/恢复合同，不证明其他 buffer 运行通过。Neural 离线 DSP 计时不包含完整宿主 callback 或驱动调度，不能替代物理 xrun 验收。
 
 关联文档：[实时实现总览](REALTIME_IMPLEMENTATION_PLAN.md)、[运行逻辑与介入逻辑总图](PLUGIN_RUNTIME_AND_INTERVENTION.md)、[P12 事件驱动计划](P12_EVENT_DRIVEN_LAZY_RUNTIME_PLAN.md)、[测试与验证](TESTING.md)。

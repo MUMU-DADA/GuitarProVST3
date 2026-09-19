@@ -24,6 +24,7 @@ struct StreamIdentity {
     BindingLimit limit = BindingLimit::None;
     bool bound = false;
     bool lifetimeProtected = false;
+    std::uint64_t driverFrames = 0;
 };
 
 // Call only after the full AMAudio module hash gate, on the control thread.

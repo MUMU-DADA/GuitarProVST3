@@ -1,10 +1,55 @@
 # P13 实现与验证记录
 
-状态：P13-0～P13-4 的实现及固定配置验收已完成，版本 0.10.0（2026-09-19）。范围是精确匹配的 GP 8.1.1.17 和下述已验证 ASIO/SRC 合同，不代表所有设备、采样率或第三方插件已实测。
+状态：0.10.1 输入修订已完成代码、离线专项以及真实宿主开关、三链和冷启动回归（2026-09-20），并修复编辑器关闭重入导致的 UI 崩溃。Neural DSP 的参数同步开销与输出范围已修正；192000 Hz / 64 帧仍观察到少量超时，尚未完成实际吉他演奏的零爆音验收。0.10.0 的固定配置验收保留为历史证据，不代表本版或其他设备已通过。
 
-本记录区分工具实现、真实观测与尚未证明的合同。当前普通构建可在匹配的 Guitar Pro 8.1.1.17、实际 ASIO 192000 Hz、GP 内部 44100 Hz 和已验证 SRC 拓扑上启用独立监听；其他格式或合同不满足时为 `host_limited`。PCM、实验路由、逐样本观测和有界计时仅在 `GPVST3_P13_PROBE_BUILD` 中编译。早期普通构建的 `input_host_contract_not_released` 门禁已经移除，不应再作为当前行为；下方历史章节保留各轮采集当时的限制，不能将单项诊断 PASS 解释为 P13 完成。
+本记录区分工具实现、真实观测与尚未证明的合同。当前代码支持匹配的 Guitar Pro 8.1.1.17、GP 内部 44100 Hz 与实际 ASIO 44100、48000、88200、96000、176400、192000 Hz 的对应拓扑；运行时仍核对宿主 hash、stream identity、generation、rate revision 和实际 SRC/ring 对象。范围外或合同不满足时为 `host_limited`。PCM、实验路由、逐样本观测和有界计时仅在 `GPVST3_P13_PROBE_BUILD` 中编译。下方历史章节保留各轮采集当时的限制，不能将单项诊断 PASS 解释为本版完成验收。
 
-## 独立监听当前实现与新增验证
+## 0.10.1 当前修订与离线证据
+
+- **宿主输入开关**：通过 Guitar Pro 的 `actionActivatedLineIn` 获取当前 LINE-IN 状态并响应事件。保存低延迟偏好只恢复模式请求；宿主输入关闭或状态未知时为 `waiting_for_input`，不读取 capture、不处理输入 VST3、不分流原生监听。关闭低延迟模式后遵从用户当前 LINE-IN 选择，不恢复旧开关值。输入接管与输出处理入口均检查宿主开关。
+- **空链监听**：低延迟模式下空 input 链是合法运行配置，经过相同的格式验证与排空后保持 `active`、`dry_monitoring=true`，按监听增益输出原始输入。取消所有效果器仅停止效果处理；准备或 DSP 故障仍按故障合同静音，不隐式转为干声。
+- **输入插件操作与 UI**：input 使用实际运行列表与待提交列表，准备期间可取消，准备完成后确认勾选状态；停用关闭对应 editor，重新启用复用仍存活的独立实例与参数。监听开关、增益、当前状态集中显示，效果器列表区分正在使用与可用项，设备诊断默认折叠。空链、等待 LINE-IN、准备、排空、运行、故障各有独立显示。
+- **采样率与 buffer**：44100 Hz 使用无 output SRC/ring 路径；88200 Hz 使用一级 2× convolver；176400 Hz 使用两级 2× convolver；48000/96000/192000 Hz 使用一级 2× convolver 加 interpolator。4096/8192 帧 callback 按不超过 2048 帧连续处理，保留驱动时间基准并推进各分段的 ADC/DAC 采样位置；驱动 buffer 与每段处理帧数分别报告。实际流格式仍决定实例准备容量和重新配置。
+- **实时路径与输出边界**：参数 mailbox 通过全局 dirty 标记跳过空闲参数表；有更新时仅对待处理值执行 atomic exchange，避免大参数表每块进行无效原子写。PortAudio status flags 单独计数，不因一次已报告的 over/underrun 将后续监听永久静音。overlay 合成后补齐 AMAudio 原有的 `[-1,1]` 输出范围并统计削波，未削波信号不变；这不等于消除 CPU 过载或提高可用电平余量。
+
+`test-p13-drain.ps1` 与 `test-p13-drain-probe.ps1` 已验证多率拓扑、动态边界和原有排空拒绝路径。`test-p13-native-src.ps1` 在独立进程加载 hash 匹配的真实 AMAudio.dll，分别处理两个历史输入不同的 SRC 实例；五种需要 SRC 的 rate 在门限后共比较 5,549,622 个样本，最大差异均为 0。44100 Hz 的无 SRC 路径由 drain/probe 专项覆盖。拓扑、公式与逐 rate 结果见 [排空分析](P13_SRC_DRAIN_ANALYSIS.md#9-多采样率拓扑与真实-src-验证)。
+
+`test-p13-callback-split.ps1` 直接调用生产 callback 入口，覆盖六种 rate × 32、64、128、256、512、1024、2048、4096、8192 帧 × 三种声道映射，以及 Start 时 rate 尚未验证、空 capture、原函数提前返回和越界保护。该专项替代原宿主处理函数，只证明分块算法，不证明驱动在全部配置下成功打开。
+
+### Neural 插件离线计时
+
+真实 `Archetype Mateus Asato` 有 2218 个参数。专项使用生产 `RuntimeEffect → audio_adapter → input_router` 路径与合成拨弦输入，192000 Hz / 64 帧，每组先预热 1 秒、再处理 24000 块（8 秒音频）。以下对照固定 `setup_max_frames=64`、FTZ 关闭；单位为 µs：
+
+| 指标 | 修改前 | 参数 mailbox 优化后 |
+|---|---:|---:|
+| P50 | 104.6 | 24.3 |
+| P95 | 150.1 | 133.4 |
+| P99 | 186.8 | 145.5 |
+| 最大值 | 360.6 | 233.6 |
+| 超过 333.333 µs 的块 | 3 / 24000 | 0 / 24000 |
+
+原始结果分别为 `.tools/native/p13-neural-investigation-final/timing-192000-64.json` 和 `.tools/native/p13-neural-mailbox-regression/timing-192000-64.json`。两组输出 peak 均为 0.4951501787、RMS 均为 0.1560338523，非有限及超满幅样本均为 0；参数更新、空闲读取及并发发布的最终交付专项也通过。
+
+最终增加空闲 dirty 标记后的同条件结果为 P50/P95/max = 21.8/138.0/295.4 µs、超预算 0/24000，输出数值不变；证据为 `.tools/native/p13-neural-idle-mailbox/timing-192000-64.json`。该文件的 `setup_max_frames=2048`、FTZ 关闭组仍有 1/24000 超预算，不能用选定的 64 帧组代表所有准备容量。插件的输入耗时有轻重交替，P50 位于两簇交界，不能据此计算整体加速倍率。
+
+这是不按实时节奏运行、没有声卡参与的输入 DSP 计时，不含完整 GP/RSE callback、驱动调度和物理输出。它支持减少参数同步开销的结论，不能替代用户硬件上的爆音验收。FTZ 与较小准备容量本身未显示稳定收益，FTZ 实验未进入生产代码。
+
+### 0.10.1 真实宿主与稳定性证据
+
+- `artifacts/p13-host-e07a8b4d8bf0420eab7c82224f0e1b1c/collection.json`：普通构建在 192000 Hz / 64 帧通过 LINE-IN Off/On、低延迟开关、三链独立实例与 0.25/0.5/0.75 增益、editor 关闭重开、切谱和空链干声检查。原生输入 Off 时输入处理增量为 0；最终输入处理 57932 块，处理错误、削波、status flags 均为 0，退出码 0，未强退。
+- `artifacts/p13-input-startup-9036d2801d594a02b3502f01f915c1b6/verification.json`：三个新进程验证保存低延迟偏好不擅自开启 LINE-IN、On→Off→On、参数恢复和保存模式 Off。原生 Off 的启动阶段输入处理为 0；三次正常退出并恢复原生状态。
+- 实际崩溃 dump 与失败夹具均定位到 checkbox `setChecked()` 尚未返回时，editor 关闭回调重入 Qt，列表 reload 销毁 checkbox，随后 Qt accessibility 使用悬空控件。勾选事务改为 queued connection，事务期间延后 reload/sync，并对延迟控件与音轨 generation 做检查。global/input editor 重入、立即取消与保存状态不复活、P13/P8/P9 UI 三 DPI 通过；Windows 平台截图也已检查。
+- 最新普通构建纳入 dirty 参数优化，`artifacts/p13-final-runtime.log` 与 `artifacts/p8-runtime-6dbcb3a05cac491d840d23d63d57366b/` 通过独立输入 runtime、异步选择、VST3 采样率/状态/失败路径和真实宿主 editor 生命周期回归。
+- 同一普通 DLL 的最终 Neural 回归为 `artifacts/p13-host-fda1ed08c4b841899fe10dcea14fa69a/collection.json`：192000 Hz / 64 帧、两轮模式 Off→On 后持续 30 秒，累计处理 93689 块，处理错误、配置拒绝、削波、status flags 均为 0，正常退出并恢复设备/LINE-IN。该普通构建不包含计时探针，所以没有据此宣称 deadline 或物理 xrun 为 0。最终三进程重启回归 `artifacts/p13-input-startup-adbaa2eeaba54b86bed2eb547aed568e/verification.json` 为 `pass`。
+- `artifacts/p13-host-d4ee6626a2cb40c2a7a7610266bdc480/collection.json`：原生菜单对 32/128/256/512/1024/2048/4096 的请求拒绝并恢复 64；8192 未枚举，分别记录 `host_rejected_restored` 和 `host_choice_unavailable`，不计为硬件通过。Standard 切换为 `host_limited`，返回 ASIO 后实际 64 帧监听恢复。设备和监听状态恢复，正常退出。
+
+部分初轮冷加载采集在实例就绪前就开启测试 LINE-IN，后续宿主窗口/流变化撤销了该状态，导致等待 active 失败；保留失败记录，不作为有效 A/B。collector 已改为等待插件实际准备完成，再恢复测试窗口并通过原生 action 请求监听，生产代码仍不触发 LINE-IN。勾选/Off/On 的生产语义另由专项验证。
+
+真实 Neural、最新参数实现的两轮有界实验记录为 `artifacts/p13-host-199584bbc33745cca4bf6f4b9fcd561e/`（RSE 播放）与 `artifacts/p13-host-576377818e6948cd9e0c1b74e545199f/`（只监听）。前者 136188 个 hook callback 中 753 个超过约 333.333 µs，输入处理单独超预算 49 次；后者分别为 132811、785 和 84。均无输入处理失败、削波、PortAudio status flags 或观察到的 ASIO overload/resync 通知，正常退出。计时包含探针开销与清理时段，没有全程物理输出或现场吉他演奏，因此零通知不证明零 xrun，也不能宣布全部爆音原因已消除。用户暂时无法演奏，本轮按要求先完成自动验证，保留该听感验收边界。
+
+## 0.10.0 独立监听实现与专项记录（历史）
+
+本节及其后的 0.10.0 音频记录描述当时行为。其中“清链静音”“LINE-IN 关闭后仍 active”和“保存模式后自动监听”已由 0.10.1 的上述合同替代；原始结果保留，不作为当前预期。
 
 - input 使用自己的 settings、effects、runtime pool、双槽、processor、参数/state 和 editor 归属；不会从 global/track 镜像。gain 更新及同采样率重绑保留实例与实时参数。顶层 `input` 保存 `monitor_mode`、`input_gain` 和 `effects`，不跟随切谱/切轨。
 - `MonitorExchange` 用一个带代际的 token 同时发布 slot、native suppression 和 legacy fallback；callback 使用有界 reader admission。发布失败可在控制线程有界重试，slot 退役等 reader 退出后才改写。状态反馈同样携带 publication version，旧回调不能覆盖新 Off 状态。
@@ -50,7 +95,7 @@
 
 旧 P8 顺序脚本的启动断言也已对齐 P12：保留 sidecar 的 enabled/order/state 意图，global 随工程恢复，track 必须显式激活；不再要求启动清空保存配置，也不从仅含 catalog 的 status.json 判断运行时。新进程单独保留 observation，验证恢复后的实际 CAB 处理。此前过时断言和测试曲谱保存提示造成的失败记录保留。
 
-## 本轮真实验证与有效范围
+## 0.10.0 真实验证与有效范围（历史）
 
 | 项目 | 证据与结论 |
 |---|---|
@@ -88,10 +133,10 @@ P50/P95 使用 1 µs 桶的严格上界，计时包含实验开销。外层范�
 
 ## 发布范围与设备限制
 
-- 生产范围按宿主 hash、ASIO stream generation/rate 与 SRC 拓扑门控。其他采样率保持 `host_limited`；不同声卡、真实 rate 改变及异常驱动通知尚未硬件实测，不能扩大为通用 ASIO 兼容声明。当前硬件拒绝的 buffer 列为宿主受限，可变帧算法另有离线容量/处理长度验证。
+- 生产范围按宿主 hash、ASIO stream generation/rate 与 SRC 拓扑门控。六种已实现 rate 及九档 buffer 有算法和离线专项证据，范围外或实际拓扑不符仍为 `host_limited`；本版不同声卡、真实 rate/buffer 改变、异常驱动通知和第三方负载尚未完成硬件矩阵，不能扩大为通用 ASIO 兼容声明。历史测试被设备拒绝的 buffer 请求不算成功运行。
 - 原生音频录音为宿主不提供／不适用。GP8 官方手册 PDF 第 315 页明确 “There is not any record feature in Guitar Pro 8”；来源与 UI/字段调查见 [宿主边界](P13_HOST_BOUNDARY.md)。输入电平已实测，实验 PCM 不算原生录音。
 - 任意第三方插件的崩溃、死锁及 CPU 过载仍属于进程内风险；本阶段提供整块错误静音、削波/插件延迟诊断及安全退役，不承诺进程隔离或零延迟。
-- 0.10.0 使用普通构建打包；PCM、逐样本 observer、实验路由和长计时入口不会进入发布 DLL。包内 manifest 记录各文件 SHA256，release 附带 ZIP 校验文件；安装/卸载与普通 DLL 生命周期证据见上表。
+- 0.10.1 普通 DLL 已通过上述宿主验证；`artifacts/p6-package-e51074864a0944afb92564b5ec00e115/` 通过包清单、ZIP 内容、安装归属、幂等更新、旧 DLL 备份和卸载保护专项。PCM、逐样本 observer、实验路由和长计时入口不能进入发布 DLL；manifest 记录各文件 SHA256，release 附带 ZIP 校验文件。上表旧安装/卸载证据属于 0.10.0。
 
 ## 历史调查记录
 
@@ -214,13 +259,13 @@ RSE 生产端 `0x48570` 经 `0x487BD → 0x47890 → 0x47BA0` 调用 `Conductor:
 
 证据：`artifacts/p13-host-boundary/units-53472-20260918222809765.json`、`GPRSE_INPUT_BOUNDARY_REVIEW.md` 及对应反汇编片段。模块 hash、完整宿主调用链和剩余边界见 [宿主边界调查](P13_HOST_BOUNDARY.md)。
 
-## 当前支持边界
+## 0.10.0 支持边界总结（历史）
 
 真实设备目前按 192 kHz 提供 capture，而 GP RSE 仍使用 44.1 kHz。既有 `portaudio_capture_abi.h` 从 `PaStreamInfo` 读取的值不能直接用作低延迟输入 processor 的准备采样率。P13 必须在控制线程获取并验证实际 rate、绑定 stream generation，并在流重建时重新准备；不能只将 64 帧传给按 44100 准备的 VST3。
 
 联合实验及本轮实际 overlay 观测已经在固定配置证明原生监听输出分流、SRC/ring 保守排空、SRC 输入等于 RSE unit PCM 之和与独立输入加法合成；前后监听延迟对照也已取得。剩余门禁见上，不能将固定配置证据扩大为所有设备、效果组合和用户操作均通过。
 
-普通构建已完成本计划在固定宿主与设备合同下的实现及验收。其他硬件和格式按计划保留为未验证/宿主受限；完整证据包括真实音频、生命周期、故障夹具及安装包，不能只用单项工具 PASS 代替。
+0.10.0 普通构建完成了当时固定宿主与设备合同下的验收。0.10.1 的行为修订、离线结果与待完成门禁以本文开头为准；完整证据须包括真实音频、生命周期、故障夹具及安装包，不能只用单项工具 PASS 代替。
 
 ## 复现入口
 

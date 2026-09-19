@@ -6,9 +6,9 @@ param(
     [string]$OutputRoot = ''
 )
 
-# Real-host production regression. Never writes device/listener controls and
-# never attaches to an existing process. The only edited settings are in the
-# new test-local input sidecar and its gain fixture editor.
+# Real-host production regression. Never changes the audio device or attaches
+# to an existing process. Native Line-In is toggled through its ordinary
+# QAction in each owned host and restored before closing that process.
 $ErrorActionPreference = 'Stop'
 $root = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
 if (-not $PluginPath) { $PluginPath = Join-Path $root '.tools/native/p13-release/plugins/imageformats/guitarpro_vst3_autoload.dll' }
@@ -52,8 +52,8 @@ $initialState = [Convert]::ToBase64String([BitConverter]::GetBytes([double]0.25)
     })}
 } | ConvertTo-Json -Depth 12 | Set-Content -LiteralPath $chainPath -Encoding UTF8
 $result = [ordered]@{schema=1;status='running';run=$run;runs=@();cleanup_errors=@();
-    scope='production input cold startup, restart and saved Off; current ASIO 192000 Hz / 64 frames; no physical audio source required';
-    input_switch_writes=0;device_or_native_listener_writes=0}
+    scope='production saved low-latency cold startup with native Line-In Off, native On/Off gating, restart and saved Off; current ASIO 192000 Hz / 64 frames; no physical audio source required';
+    input_switch_writes=0;device_writes=0;native_listener_writes=0}
 $before = Get-Gpvst3HostSnapshot $HostDirectory
 $session = $null; $process = $null; $document = $null; $currentRun = $null
 
@@ -84,15 +84,57 @@ function Get-StartupControl([string]$Name) {
     } while ([DateTime]::UtcNow -lt $deadline)
     throw "Expected one $Name control; found $($items.Count)."
 }
-function Get-StartupListener {
+function Get-StartupListenerAction {
     $query = Invoke-McpTool $session gp_actions @{query='actionActivatedLineIn';limit=20}
     $items = @($query.objects | Where-Object object_name -CEQ 'actionActivatedLineIn')
-    if ($items.Count -ne 1 -or $items[0].checked -isnot [bool]) { throw 'Cannot read the native-listener checked state.' }
-    return [bool]$items[0].checked
+    if ($items.Count -ne 1 -or $items[0].checked -isnot [bool] -or $items[0].checkable -ne $true) {
+        throw 'Cannot read the native-listener checked state.'
+    }
+    return [pscustomobject]@{snapshot=$query.snapshot;action=$items[0]}
+}
+function Get-StartupListener { return [bool](Get-StartupListenerAction).action.checked }
+function Set-StartupListener([bool]$Enabled, [string]$Phase) {
+    $evidence = [ordered]@{phase=$Phase;desired_checked=$Enabled;triggered=$false;confirmed=$false}
+    $currentRun.listener_operations += $evidence
+    $current = Get-StartupListenerAction
+    $evidence.before = $current.action
+    if ($current.action.checked -ne $Enabled) {
+        $dialogs = Invoke-McpTool $session gp_dialogs
+        if ($dialogs.blocked) { throw "A modal dialog blocks native Line-In $Phase." }
+        if (-not $current.action.enabled) {
+            Invoke-McpTool $session gp_window @{state='restore'} | Out-Null
+            $deadline = [DateTime]::UtcNow.AddSeconds(5)
+            do {
+                Start-Sleep -Milliseconds 100
+                $current = Get-StartupListenerAction
+                if ($current.action.enabled) { break }
+            } while ([DateTime]::UtcNow -lt $deadline)
+        }
+        $current = Get-StartupListenerAction
+        if ($current.action.checked -ne $Enabled) {
+            if (-not $current.action.enabled) { throw "Native Line-In remains disabled during $Phase." }
+            # Exactly one trigger; do not replay an uncertain transport result.
+            $evidence.triggered = $true
+            ++$result.native_listener_writes
+            $evidence.response = Invoke-McpTool $session gp_trigger @{snapshot=$current.snapshot;id=$current.action.id}
+        }
+    }
+    $deadline = [DateTime]::UtcNow.AddSeconds(5)
+    do {
+        $current = Get-StartupListenerAction
+        if ($current.action.checked -eq $Enabled) {
+            $evidence.confirmed = $true
+            $evidence.after = $current.action
+            return
+        }
+        Start-Sleep -Milliseconds 100
+    } while ([DateTime]::UtcNow -lt $deadline)
+    throw "Native Line-In did not reach checked=$Enabled during $Phase."
 }
 function Assert-StartupActive($Monitor, [double]$Gain) {
     if (-not $Monitor -or $Monitor.state -ne 'active' -or $Monitor.mode -ne 'low_latency_overlay' -or
-        $Monitor.gain -ne $Gain -or -not $Monitor.configuration_validated -or
+        $Monitor.gain -ne $Gain -or -not $Monitor.native_listener_known -or -not $Monitor.native_listener_enabled -or
+        -not $Monitor.configuration_validated -or
         $Monitor.sample_rate -ne 192000 -or $Monitor.driver_buffer_frames -ne 64 -or
         $Monitor.buffer_frames -ne 64 -or $Monitor.process_frames -ne 64 -or
         -not $Monitor.input_native_effect_bypass -or [uint64]$Monitor.processed_blocks -eq 0 -or
@@ -100,13 +142,39 @@ function Assert-StartupActive($Monitor, [double]$Gain) {
         throw "Input startup is not healthy at ASIO 192000/64: $($Monitor | ConvertTo-Json -Compress)"
     }
 }
-function Wait-StartupActive([double]$Gain) {
+function Wait-StartupWaiting([double]$Gain, [switch]$FreshProcess) {
+    $deadline = [DateTime]::UtcNow.AddSeconds(15)
+    $stableSince = $null; $previousBlocks = $null
+    do {
+        $process.Refresh()
+        if ($process.HasExited) { throw 'Test host exited while waiting for native Line-In Off.' }
+        $monitor = (Read-StartupJson $observationPath).gp_hook.input_monitor
+        if ($monitor.state -eq 'waiting_for_input' -and $monitor.mode -eq 'low_latency_overlay' -and
+            $monitor.gain -eq $Gain -and $monitor.native_listener_known -eq $true -and
+            $monitor.native_listener_enabled -eq $false -and $monitor.input_native_effect_bypass -eq $false -and
+            $monitor.configuration_validated -eq $false) {
+            $blocks = [uint64]$monitor.processed_blocks
+            if (($FreshProcess -and $blocks -ne 0) -or [uint64]$monitor.error_blocks -ne 0 -or
+                $monitor.callback_fault_stage -ne 0 -or $monitor.error) {
+                throw "Native Line-In Off acquired unexpected processing/errors: $($monitor | ConvertTo-Json -Compress)"
+            }
+            if ($null -eq $stableSince -or $previousBlocks -ne $blocks) {
+                $stableSince = [DateTime]::UtcNow
+                $previousBlocks = $blocks
+            }
+            if (([DateTime]::UtcNow - $stableSince).TotalSeconds -ge 2) { return $monitor }
+        } else { $stableSince = $null }
+        Start-Sleep -Milliseconds 100
+    } while ([DateTime]::UtcNow -lt $deadline)
+    throw "Saved low-latency mode did not settle waiting for native input: $($monitor | ConvertTo-Json -Compress)"
+}
+function Wait-StartupActive([double]$Gain, [uint64]$PreviousBlocks = 0) {
     $deadline = [DateTime]::UtcNow.AddSeconds(45)
     do {
         $process.Refresh()
         if ($process.HasExited) { throw 'Test host exited while waiting for automatic input startup.' }
         $monitor = (Read-StartupJson $observationPath).gp_hook.input_monitor
-        if ($monitor.state -eq 'active' -and $monitor.gain -eq $Gain -and [uint64]$monitor.processed_blocks -gt 0) {
+        if ($monitor.state -eq 'active' -and $monitor.gain -eq $Gain -and [uint64]$monitor.processed_blocks -gt $PreviousBlocks) {
             Assert-StartupActive $monitor $Gain
             return $monitor
         }
@@ -116,11 +184,13 @@ function Wait-StartupActive([double]$Gain) {
 }
 function Wait-StartupOff([switch]$FreshProcess) {
     $deadline = [DateTime]::UtcNow.AddSeconds(15)
+    $expectedNative = Get-StartupListener
     do {
         $process.Refresh()
         if ($process.HasExited) { throw 'Test host exited while waiting for saved Off.' }
         $monitor = (Read-StartupJson $observationPath).gp_hook.input_monitor
         if ($monitor.state -eq 'off' -and $monitor.mode -eq 'off' -and $monitor.gain -eq 0.55 -and
+            $monitor.native_listener_known -eq $true -and $monitor.native_listener_enabled -eq $expectedNative -and
             $monitor.input_native_effect_bypass -eq $false -and $monitor.configuration_validated -eq $false) {
             if ([uint64]$monitor.error_blocks -ne 0 -or $monitor.callback_fault_stage -ne 0 -or $monitor.error -or
                 ($FreshProcess -and [uint64]$monitor.processed_blocks -ne 0)) {
@@ -168,6 +238,11 @@ function Close-StartupHost {
     if (-not $process) { return }
     if ($session) {
         try {
+            if ($currentRun.listener_before -is [bool]) {
+                Set-StartupListener ([bool]$currentRun.listener_before) 'cleanup_restore'
+                $currentRun.listener_restore_confirmed = (Get-StartupListener) -eq $currentRun.listener_before
+                if (-not $currentRun.listener_restore_confirmed) { throw 'Native Line-In cleanup restoration failed.' }
+            }
             if ($document) {
                 $closed = Invoke-McpTool $session gp_close @{document=$document;unsaved='discard'}
                 Wait-StartupOperation $closed.request 'closed' | Out-Null
@@ -193,7 +268,7 @@ try {
         if (@(Get-Process -Name GuitarPro -ErrorAction SilentlyContinue).Count) {
             throw 'Another Guitar Pro process is running; restart will not attach to or close it.'
         }
-        $currentRun = [ordered]@{round=$round;directory=(Join-Path $run "launch-$round")}
+        $currentRun = [ordered]@{round=$round;directory=(Join-Path $run "launch-$round");listener_operations=@();listener_restore_confirmed=$false}
         $result.runs += $currentRun
         # Preserve old evidence but make it impossible to read a previous
         # process's active snapshot. The persistent sidecar stays in place.
@@ -224,14 +299,19 @@ try {
         $currentRun.audio_before = (Invoke-McpTool $session gp_audio_device).configuration
         $currentRun.listener_before = Get-StartupListener
         if ($currentRun.audio_before.audioDevice -cne 'ASIO') { throw 'Current device is not ASIO; this test does not change the user device.' }
+        if ($currentRun.listener_before) {
+            throw 'Cold-start Off verification requires the native LINE-IN action to start unchecked; this process is not cold-start Off evidence.'
+        }
         $opened = Invoke-McpTool $session gp_open @{path=$scoreCopy}
         $document = (Wait-StartupOperation $opened.request 'opened').document
         Invoke-McpTool $session gp_activate @{document=$document} | Out-Null
         $expectedMonitor = if ($round -eq 0) {0.35} else {0.55}
         $expectedFixture = if ($round -eq 0) {0.25} else {0.75}
         # This snapshot is taken before opening the input panel/editor or
-        # writing any product control, proving automatic sidecar restoration.
-        $currentRun.automatic_input = if ($round -eq 2) { Wait-StartupOff -FreshProcess } else { Wait-StartupActive $expectedMonitor }
+        # writing any product/native input control. Saved low latency must
+        # restore its preference and plug-in state without starting capture.
+        $currentRun.automatic_input = if ($round -eq 2) { Wait-StartupOff -FreshProcess }
+            else { Wait-StartupWaiting $expectedMonitor -FreshProcess }
         $panel = Get-StartupControl 'gpvst3InputEffectChainButton'
         Invoke-McpTool $session gp_trigger @{snapshot=$panel.snapshot;id=$panel.control.id} | Out-Null
         $monitorControl = Get-StartupControl 'gpvst3InputLowLatencyEnabled'
@@ -239,7 +319,7 @@ try {
         $effectControl = Get-StartupControl ('gpvst3InputEnabled_' + $classId)
         $label = Get-StartupControl 'gpvst3InputMonitorStatus'
         $expectedChecked = $round -ne 2
-        $expectedStatus = if ($expectedChecked) {'低延迟监听已生效'} else {'低延迟监听未启用'}
+        $expectedStatus = if ($expectedChecked) {'LINE-IN 已关闭'} else {'低延迟监听未启用'}
         if ($monitorControl.control.properties.checked -ne $expectedChecked -or -not $effectControl.control.properties.checked -or
             $gainControl.control.properties.value -ne $expectedMonitor -or
             -not ([string]$label.control.properties.text).StartsWith($expectedStatus)) { throw 'Restored input UI does not match saved settings.' }
@@ -258,14 +338,36 @@ try {
         if ([uint64]$hook.editor_request_generation -le $beforeEditor -or $hook.editor_stage -ne 'visible' -or
             -not ([string]$hook.editor_identity).StartsWith("input`n") -or
             -not ([string]$hook.editor_identity).EndsWith($classId)) { throw 'The input fixture editor did not become current.' }
-        $currentRun.fixture = Read-StartupFixture $expectedFixture -Dormant:($round -eq 2)
+        $currentRun.fixture = Read-StartupFixture $expectedFixture -Dormant
         $currentRun.processor_identity = "$($process.Id)/$($currentRun.process_start_filetime)/$($currentRun.fixture.instance)"
+        Set-StartupListener $true 'native_on'
+        if ($round -eq 2) {
+            $currentRun.off_with_native_on = Wait-StartupOff -FreshProcess
+            $currentRun.fixture_with_native_on = Read-StartupFixture $expectedFixture -Dormant
+        } else {
+            $currentRun.input_with_native_on = Wait-StartupActive $expectedMonitor
+            $currentRun.fixture_with_native_on = Read-StartupFixture $expectedFixture
+            Set-StartupListener $false 'native_off'
+            $currentRun.input_with_native_off = Wait-StartupWaiting $expectedMonitor
+            $currentRun.saved_with_native_off = Assert-StartupSaved $expectedMonitor $expectedFixture
+            Set-StartupListener $true 'native_on_again'
+            $currentRun.input_with_native_on_again = Wait-StartupActive $expectedMonitor ([uint64]$currentRun.input_with_native_off.processed_blocks)
+        }
         if ($round -eq 0) {
             $fixtureGain = Get-StartupControl 'gpvst3TestGain'
             Invoke-McpTool $session gp_set_property @{snapshot=$fixtureGain.snapshot;id=$fixtureGain.control.id;property='value';value=0.75} | Out-Null
             $currentRun.fixture_after_edit = Read-StartupFixture 0.75
             $gainControl = Get-StartupControl 'gpvst3InputGain'
             Invoke-McpTool $session gp_set_property @{snapshot=$gainControl.snapshot;id=$gainControl.control.id;property='value';value=0.55} | Out-Null
+            # The host can revoke LINE-IN during window/document activation.
+            # Verify that choice before explicitly resuming the next listening
+            # phase; changing gain must never turn input back on implicitly.
+            Start-Sleep -Milliseconds 300
+            $currentRun.native_after_gain = Get-StartupListener
+            if (-not $currentRun.native_after_gain) {
+                $currentRun.waiting_after_gain = Wait-StartupWaiting 0.55
+                Set-StartupListener $true 'resume_after_gain'
+            }
             $currentRun.input_after_edit = Wait-StartupActive 0.55
         }
         if ($round -eq 2) {
@@ -281,12 +383,20 @@ try {
         }
         $nativeEditor = Get-StartupControl 'gpvst3NativeEditorWindow'
         Invoke-McpTool $session gp_close_window @{snapshot=$nativeEditor.snapshot;id=$nativeEditor.control.id} | Out-Null
+        if ($round -ne 2) {
+            Start-Sleep -Milliseconds 300
+            $currentRun.native_after_editor_close = Get-StartupListener
+            if (-not $currentRun.native_after_editor_close) {
+                $currentRun.waiting_after_editor_close = Wait-StartupWaiting 0.55
+                Set-StartupListener $true 'resume_after_editor_close'
+            }
+        }
         $currentRun.input_final = if ($round -eq 2) { Wait-StartupOff -FreshProcess } else { Wait-StartupActive 0.55 }
         $savedMode = if ($round -eq 2) {'off'} else {'low_latency_overlay'}
         $currentRun.saved_before_exit = Assert-StartupSaved 0.55 0.75 $savedMode
         if ($round -eq 1) {
             # The only mode write in this test is an ordinary explicit Off
-            # after the second successful automatic activation and state check.
+            # after the second successful host-controlled activation/state check.
             $monitorControl = Get-StartupControl 'gpvst3InputLowLatencyEnabled'
             Invoke-McpTool $session gp_set_property @{snapshot=$monitorControl.snapshot;id=$monitorControl.control.id;property='checked';value=$false} | Out-Null
             ++$result.input_switch_writes
@@ -296,6 +406,11 @@ try {
             $savedMode = 'off'
             $currentRun.saved_off_before_exit = Assert-StartupSaved 0.55 0.75 $savedMode
         }
+        Set-StartupListener ([bool]$currentRun.listener_before) 'restore_before_exit'
+        $currentRun.listener_restore_confirmed = (Get-StartupListener) -eq $currentRun.listener_before
+        if (-not $currentRun.listener_restore_confirmed) { throw 'Native Line-In was not restored before host exit.' }
+        $currentRun.input_after_listener_restore = if ($savedMode -eq 'off') { Wait-StartupOff }
+            else { Wait-StartupWaiting 0.55 }
         $currentRun.audio_after = (Invoke-McpTool $session gp_audio_device).configuration
         $currentRun.listener_after = Get-StartupListener
         if (($currentRun.audio_before | ConvertTo-Json -Compress -Depth 10) -cne ($currentRun.audio_after | ConvertTo-Json -Compress -Depth 10) -or
@@ -326,4 +441,4 @@ try {
     $result | ConvertTo-Json -Depth 30 | Set-Content -LiteralPath (Join-Path $run 'verification.json') -Encoding UTF8
 }
 if ($result.status -ne 'pass') { throw "P13 input startup regression failed: $($result.failure). Evidence: $run" }
-Write-Output "PASS: production input restored on two launches and stayed Off on the third; UI/fixture gain persistence, ASIO 192000/64 and clean exit. Evidence: $run"
+Write-Output "PASS: two saved low-latency cold starts stayed silent with native Line-In Off, native On/Off controlled monitoring, and saved Off stayed silent on the third; gain/editor persistence, restored native state and clean exit. Evidence: $run"

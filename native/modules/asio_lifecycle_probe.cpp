@@ -513,6 +513,7 @@ StreamIdentity currentStream() noexcept {
     const auto *context = state.current.load(std::memory_order_acquire);
     if (context) {
         result.callback = identityOf(context);
+        result.driverFrames = context->driverFrames;
         result.bound = context->created.load(std::memory_order_acquire) &&
             context->stream.load(std::memory_order_acquire) != 0;
         const bool accepting = context->accepting.load(std::memory_order_seq_cst);

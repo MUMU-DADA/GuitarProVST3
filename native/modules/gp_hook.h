@@ -307,6 +307,8 @@ bool requestInputVst3Selection(const std::vector<Vst3SelectionEntry> &selection,
 bool requestInputMonitorSettings(const state::InputMonitorSettings &settings,
                                   std::string *error = nullptr) noexcept;
 QJsonObject inputMonitorSnapshot();
+void setNativeInputState(bool known, bool enabled) noexcept;
+bool activeInputVst3States(std::vector<Vst3SelectionEntry> &result) noexcept;
 std::vector<Vst3SelectionEntry> captureInputVst3States();
 bool openInputVst3Editor(const Vst3SelectionEntry &entry, void *parentWindow) noexcept;
 std::vector<Vst3SelectionEntry> captureTrackVst3States(const std::string &trackKey);

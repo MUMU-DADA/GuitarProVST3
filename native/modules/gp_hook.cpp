@@ -1520,7 +1520,7 @@ struct InputMonitorSlot {
     float gain = 0.5f;
     static bool process(void *context, const audio::BlockView &block) noexcept {
         auto &slot = *static_cast<InputMonitorSlot *>(context);
-        if (!slot.selection.processBlock(block)) return false;
+        if (slot.selection.count ? !slot.selection.processBlock(block) : !audio::bypass(block)) return false;
         for (std::size_t c = 0; c < block.channelCount; ++c)
             for (std::size_t f = 0; f < block.frameCount; ++f)
                 block.outputChannels[c][f] *= slot.gain;
@@ -1533,15 +1533,18 @@ struct InputMonitorSlot {
 struct InputMonitorRuntime {
     input::MonitorExchange exchange;
     InputMonitorSlot monitorSlots[2];
+    std::vector<std::shared_ptr<RuntimeEffect>> warmEffects; // selection worker only
     std::vector<Vst3SelectionEntry> desired;
     state::InputMonitorSettings settings;
     std::string error;
     int retained = -1;
     bool intentLoaded = false; // Qt thread, independent of score lifecycle.
+    std::atomic<bool> nativeListenerKnown{false}, nativeListenerEnabled{false};
     std::atomic<int> phase{0}; // off, legacy, preparing, draining, active, muted, host_limited
     std::atomic<std::uint64_t> callbackPhase{0};
     std::atomic<bool> nativeSuppressed{false};
     std::atomic<std::uint64_t> blocks{0}, errors{0}, clipped{0};
+    std::atomic<std::uint64_t> statusBlocks{0};
     std::atomic<std::uint64_t> configurationRejectedBlocks{0}, configurationToken{0};
     std::atomic<int> callbackFault{0}, listenerFaultFlags{0};
     std::atomic<std::int64_t> listenerReturnedFrames{0}, listenerRequestedFrames{0};
@@ -2131,22 +2134,17 @@ bool configureIndependentInput(const std::vector<Vst3SelectionEntry> &selection,
         g_inputMonitor.error.clear();
         if (sameSelection(selection, g_inputMonitor.desired)) return true;
     }
-    if (selection.empty()) {
+    if (selection.empty() && !low) {
         std::lock_guard<std::mutex> requestLock(g_runtime.selectionRequestMutex);
         if (generation != g_runtime.inputRequestGeneration) return false;
-        const bool actuallySuppressed = g_inputMonitor.nativeSuppressed.load();
-        if (low && actuallySuppressed) g_inputMonitor.exchange.mute();
-        else if (low && g_inputMonitor.exchange.suppressed()) {
-            if (g_inputMonitor.exchange.legacyFallback()) g_inputMonitor.exchange.legacy();
-            else g_inputMonitor.exchange.off();
-        }
-        g_inputMonitor.phase.store(low ? (actuallySuppressed ? 5 : 6) : (settings.mode == Mode::Legacy ? 1 : 0));
+        g_inputMonitor.phase.store(settings.mode == Mode::Legacy ? 1 : 0);
         g_inputMonitor.desired = selection;
         g_inputMonitor.settings = settings;
-        g_inputMonitor.error = low && !actuallySuppressed ? "input_chain_empty" : "";
+        g_inputMonitor.error.clear();
         return true;
     }
     double rate = 44100;
+    std::size_t maxBlock = portaudio::kMaxFrames;
     std::uint64_t streamGeneration = 0, rateRevision = 0;
     if (low) {
         auto stream = asioprobe::currentStream();
@@ -2160,6 +2158,8 @@ bool configureIndependentInput(const std::vector<Vst3SelectionEntry> &selection,
         rate = stream.callback.actualRate;
         streamGeneration = stream.callback.generation;
         rateRevision = stream.callback.rateRevision;
+        if (stream.driverFrames > 0 && stream.driverFrames <= 8192)
+            maxBlock = (std::min)(std::size_t(stream.driverFrames), portaudio::kMaxFrames);
         if (stream.binding == asioprobe::BindingState::HostLimited) {
             error = stream.limit == asioprobe::BindingLimit::ProxyCapacityExhausted
                 ? "input_stream_capacity_exhausted_restart_required" : "input_stream_callbacks_unsupported";
@@ -2170,7 +2170,8 @@ bool configureIndependentInput(const std::vector<Vst3SelectionEntry> &selection,
             g_drainProbeRequested || g_inputProbeSilence ||
 #endif
             !g_listenerProbeInstalled ||
-            !stream.bound || !stream.lifetimeProtected || !stream.callback.rateValidated || rate != 192000) {
+            !stream.bound || !stream.lifetimeProtected || !stream.callback.rateValidated ||
+            !input::drain::supportedDestinationRate(rate)) {
             error = "input_host_contract_unavailable";
             return false;
         }
@@ -2188,6 +2189,10 @@ bool configureIndependentInput(const std::vector<Vst3SelectionEntry> &selection,
     auto &slot = g_inputMonitor.monitorSlots[target];
     auto effectiveSelection = selection;
     std::vector<std::shared_ptr<RuntimeEffect>> reusable;
+    for (const auto &effect : g_inputMonitor.warmEffects)
+        if (effect->ready.load() && effect->configuredRate.load() == static_cast<int>(rate) &&
+            effect->configuredBlock.load() == maxBlock)
+            reusable.push_back(effect);
     // A monitor gain/mode change must retain parameter edits made since the
     // last selection request. This API edits order/enabled identity, not state
     // imports: retained active identities always keep their latest live state.
@@ -2200,15 +2205,24 @@ bool configureIndependentInput(const std::vector<Vst3SelectionEntry> &selection,
                     containsIdentity(g_inputMonitor.desired, entry)) {
                     entry = previous.effects[i]->captureState();
                     if (previous.effects[i]->configuredRate.load() == static_cast<int>(rate) &&
-                        previous.effects[i]->configuredBlock.load() >= portaudio::kMaxFrames)
+                        previous.effects[i]->configuredBlock.load() == maxBlock &&
+                        std::find(reusable.begin(), reusable.end(), previous.effects[i]) == reusable.end())
                         reusable.push_back(previous.effects[i]);
                     break;
                 }
     }
+    // Leave room for an entire requested chain even when every requested
+    // state needs a new instance. Retiring cache references is safe: active
+    // slots and editor windows retain their own shared ownership.
+    std::stable_partition(reusable.begin(), reusable.end(), [&](const auto &effect) {
+        return containsIdentity(effectiveSelection, effect->identity);
+    });
+    const auto retainedLimit = EffectPool::kMaxWarmInstances - effectiveSelection.size();
+    if (reusable.size() > retainedLimit) reusable.resize(retainedLimit);
     slot.selection.shutdown();
     slot.pool.effects.clear();
     slot.pool.effects = std::move(reusable);
-    if (!slot.selection.prepare(effectiveSelection, rate, portaudio::kMaxFrames, slot.pool, &error) ||
+    if (!slot.selection.prepare(effectiveSelection, rate, maxBlock, slot.pool, &error) ||
         !slot.router.prepare(2, portaudio::kMaxFrames)) {
         if (error.empty()) error = "input_overlay_prepare_failed";
         return false;
@@ -2259,6 +2273,7 @@ bool configureIndependentInput(const std::vector<Vst3SelectionEntry> &selection,
         }
     }
     slot.selection.markActive();
+    g_inputMonitor.warmEffects = slot.pool.effects;
     g_inputMonitor.retained = target;
     g_inputMonitor.desired = effectiveSelection;
     g_runtime.pendingInputSelection = effectiveSelection;
@@ -4219,6 +4234,7 @@ void shutdown() noexcept {
         g_inputMonitor.monitorSlots[index].selection.shutdown();
         g_inputMonitor.monitorSlots[index].pool.effects.clear();
     }
+    g_inputMonitor.warmEffects.clear();
     g_inputMonitor.retained = -1;
     g_inputMonitor.nativeSuppressed.store(false);
     std::lock_guard<std::recursive_mutex> editorLock(g_runtime.editorMutex);
@@ -4346,7 +4362,7 @@ bool readDrainProbeSnapshot(void *owner, unsigned long frames,
                             input::drainprobe::Snapshot &snapshot) noexcept {
     const auto identity = asioprobe::currentCallback();
     portaudio::Configuration config;
-    if (!identity.rateValidated || identity.actualRate != 192000 || !owner ||
+    if (!identity.rateValidated || !input::drain::supportedDestinationRate(identity.actualRate) || !owner ||
         frames == 0 || frames > portaudio::kMaxFrames ||
         !portaudio::configuration(g_runtime.audioModule, owner, config) ||
         config.sampleRate != 44100 || config.outputChannels != 2) return false;
@@ -4354,7 +4370,8 @@ bool readDrainProbeSnapshot(void *owner, unsigned long frames,
     const auto *base = static_cast<const std::uint8_t *>(g_runtime.audioModule);
     if (!stream || stream != portaudio::read<const void *>(base, 0x2F2620) ||
         portaudio::read<const void *>(stream, 0x28) != owner ||
-        portaudio::read<std::uint32_t>(stream, 0x178) != frames) return false;
+        portaudio::read<std::uint32_t>(stream, 0x178) < frames ||
+        portaudio::read<std::uint32_t>(stream, 0x178) > 8192) return false;
     const auto *streamInterface = portaudio::read<const void *>(stream, 0x10);
     if (!streamInterface || portaudio::read<const void *>(streamInterface, 0) != base + 0x6DF60 ||
         portaudio::read<const void *>(streamInterface, 8) != base + 0x6FE90 ||
@@ -4528,12 +4545,37 @@ struct MonitorAudioState {
     std::array<float, 32768 * 2> sink{};
 } g_monitorAudio;
 
+bool finishMonitorOutput(float *samples, std::size_t count) noexcept {
+    bool clipped = false;
+    for (std::size_t i = 0; i < count; ++i) {
+        // AMAudio applies this final range before returning. The overlay is
+        // added afterwards, so restore the same device-output contract. The
+        // router already rejected non-finite sums before any output write.
+        if (samples[i] > 1.0f) { samples[i] = 1.0f; clipped = true; }
+        else if (samples[i] < -1.0f) { samples[i] = -1.0f; clipped = true; }
+    }
+    return clipped;
+}
+
 class MonitorCallback final {
 public:
     MonitorCallback(const void *capture, void *output, unsigned long frames,
                     void *owner, std::uint64_t sequence, unsigned long status) noexcept
         : output_(output), owner_(owner), frames_(frames), sequence_(sequence) {
         g_inputMonitor.exchange.acquire(lease_);
+        if (!g_inputMonitor.nativeListenerKnown.load(std::memory_order_acquire) ||
+            !g_inputMonitor.nativeListenerEnabled.load(std::memory_order_acquire)) {
+            // The saved mode is a preference, never permission to open input.
+            // No borrowed capture, listener sink or VST3 processor is touched.
+            held_ = !g_inputMonitor.processing.test_and_set(std::memory_order_acquire);
+            if (held_) {
+                g_monitorAudio.configured = false;
+                g_monitorAudio.slotToken = 0;
+                g_inputMonitor.nativeSuppressed.store(false, std::memory_order_release);
+                g_inputMonitor.configurationToken.store(0, std::memory_order_release);
+            }
+            return;
+        }
         requested_ = lease_.suppressNative();
         if (!requested_ && !lease_.watchStream()) return;
         held_ = !g_inputMonitor.processing.test_and_set(std::memory_order_acquire);
@@ -4572,7 +4614,11 @@ public:
             portaudio::configuration(g_runtime.audioModule, owner, captureConfig) &&
             captureConfig.inputChannels >= 1 && captureConfig.inputChannels <= 2 &&
             readDrainProbeSnapshot(owner, frames, before_));
-        valid_ = !configurationRejected_ && status == 0;
+        // PortAudio status flags describe a preceding over/underrun. The
+        // current callback still owns valid buffers; don't latch permanent
+        // monitor silence on one scheduling hiccup.
+        if (status) g_inputMonitor.statusBlocks.fetch_add(1, std::memory_order_relaxed);
+        valid_ = !configurationRejected_;
         if (!valid_) return;
         inputChannels_ = captureConfig.inputChannels;
         before_.config.epoch = g_monitorAudio.token;
@@ -4602,12 +4648,12 @@ public:
             g_monitorAudio.tracker.beginCallback(before_.config, sequence, frames, before_.ring.queued, true);
         if (!valid_) return;
         failureStage_ = 2;
-        observing_ = asioprobe::beginOutputSrc(before_.outputSrc
+        observing_ = before_.outputSrc && asioprobe::beginOutputSrc(before_.outputSrc
 #ifdef GPVST3_P13_PROBE_BUILD
             , g_overlayProbeRequested ? &observeDrainSource : nullptr
 #endif
         );
-        valid_ = observing_;
+        valid_ = observing_ || !before_.config.usesOutputRing;
         if (valid_) {
             failureStage_ = 3;
             suppress_ = true;
@@ -4627,10 +4673,23 @@ public:
     }
     bool suppress() const noexcept { return suppress_; }
     bool requested() const noexcept { return requested_; }
-    bool legacy() const noexcept { return lease_.legacy(); }
+    bool legacy() const noexcept {
+        return lease_.legacy() && g_inputMonitor.nativeListenerKnown.load(std::memory_order_acquire) &&
+            g_inputMonitor.nativeListenerEnabled.load(std::memory_order_acquire);
+    }
     bool ownsSink() const noexcept { return held_; }
     void listener(bool valid) noexcept { ++listenerCalls_; listenerValid_ &= valid; }
     void finish(int result) noexcept {
+        if (!g_inputMonitor.nativeListenerKnown.load(std::memory_order_acquire) ||
+            !g_inputMonitor.nativeListenerEnabled.load(std::memory_order_acquire)) {
+            if (held_) {
+                g_monitorAudio.configured = false;
+                g_monitorAudio.slotToken = 0;
+                g_inputMonitor.nativeSuppressed.store(false, std::memory_order_release);
+                g_inputMonitor.configurationToken.store(0, std::memory_order_release);
+            }
+            return;
+        }
         if (!requested_) {
             if (g_inputMonitor.exchange.current(lease_.token()))
                 g_inputMonitor.nativeSuppressed.store(false, std::memory_order_release);
@@ -4638,9 +4697,9 @@ public:
         }
         if (!held_) return;
         if (!slot_) {
-            // An explicitly empty chain (or a failed preparation after prior
-            // activation) is a valid muted configuration, not a per-block DSP
-            // error. Its unobserved drain history cannot be reused on resume.
+            // A failed preparation after prior activation can retain a muted
+            // exchange without a slot. Its unobserved drain history cannot
+            // be reused on resume; an empty chain has its own dry slot.
             g_monitorAudio.configured = false;
             g_inputMonitor.publishCallbackPhase(lease_.token(), suppress_ ? 5 : 6);
             return;
@@ -4660,7 +4719,9 @@ public:
         if (!valid_) { fail(); return; }
         if (result != 0) { failureStage_ = 4; fail(); return; }
         if (!listenerValid_) { failureStage_ = 5; fail(); return; }
-        if (listenerCalls_ != src.calls) { failureStage_ = 12; fail(); return; }
+        if (listenerCalls_ != (before_.config.usesOutputRing ? src.calls : 1)) {
+            failureStage_ = 12; fail(); return;
+        }
         if (src.calls > 1 || src.inputFrames < 0 || src.outputFrames < 0) { failureStage_ = 6; fail(); return; }
         if (!readDrainProbeSnapshot(owner_, frames_, after)) {
             configurationRejected_ = true;
@@ -4717,9 +4778,7 @@ public:
             }
         }
 #endif
-        bool clipped = false;
-        for (std::size_t i = 0; i < std::size_t(frames_) * 2; ++i)
-            clipped |= std::abs(static_cast<const float *>(output_)[i]) > 1.0f;
+        const bool clipped = finishMonitorOutput(static_cast<float *>(output_), std::size_t(frames_) * 2);
         if (clipped) g_inputMonitor.clipped.fetch_add(1);
         g_inputMonitor.blocks.fetch_add(1);
         g_inputMonitor.processFrames.store(frames_);
@@ -4939,7 +4998,7 @@ std::int64_t listenerProbeHook(void *self, const float *input, std::uint32_t inp
 #endif
 }
 
-int streamCallbackHook(const void *input, void *output, unsigned long frames,
+int streamCallbackChunk(const void *input, void *output, unsigned long frames,
                        const void *timeInfo, unsigned long status, void *userData) {
 #ifdef GPVST3_P13_PROBE_BUILD
     InputTimingScope timingScope(frames, status);
@@ -5228,6 +5287,45 @@ int streamCallbackHook(const void *input, void *output, unsigned long frames,
     }
 #endif
     return result;
+}
+
+int streamCallbackHook(const void *input, void *output, unsigned long frames,
+                       const void *timeInfo, unsigned long status, void *userData) {
+    if (frames <= portaudio::kMaxFrames)
+        return streamCallbackChunk(input, output, frames, timeInfo, status, userData);
+    portaudio::Configuration config;
+    const auto identity = asioprobe::currentCallback();
+    // GP clamps each native call to 2048 frames. Keep that ABI capacity and
+    // advance the borrowed buffers so larger ASIO buffers have no stale tail.
+    if (frames > 8192 || !output ||
+        !portaudio::configuration(g_runtime.audioModule, userData, config))
+        return reinterpret_cast<StreamCallback>(g_runtime.stream.trampoline)(
+            input, output, frames, timeInfo, status, userData);
+    for (unsigned long offset = 0; offset < frames;) {
+        const auto count = (std::min)(static_cast<unsigned long>(portaudio::kMaxFrames), frames - offset);
+        double times[3]{};
+        if (timeInfo) {
+            std::memcpy(times, timeInfo, sizeof(times));
+            if (identity.rateValidated && identity.actualRate > 0) {
+                // currentTime belongs to this driver invocation. GP derives
+                // the render timestamp from DAC-current, so only advance the
+                // ADC/DAC sample positions for subsequent native sub-blocks.
+                times[0] += double(offset) / identity.actualRate;
+                times[2] += double(offset) / identity.actualRate;
+            }
+        }
+        const auto result = streamCallbackChunk(
+            input ? static_cast<const float *>(input) + offset * config.inputChannels : nullptr,
+            static_cast<float *>(output) + offset * config.outputChannels, count,
+            timeInfo ? times : nullptr, status, userData);
+        offset += count;
+        if (result != 0) {
+            std::fill_n(static_cast<float *>(output) + offset * config.outputChannels,
+                (frames - offset) * config.outputChannels, 0.0f);
+            return result;
+        }
+    }
+    return 0;
 }
 
 void setTotalBypass(bool bypassed) noexcept {
@@ -5615,8 +5713,8 @@ QJsonObject inputProbeSnapshot() {
 }
 #endif
 
-void prepareIndependentInputBackend(bool hasSelection, state::InputMonitorMode mode) {
-    if (!hasSelection || mode != state::InputMonitorMode::LowLatencyOverlay) return;
+void prepareIndependentInputBackend(state::InputMonitorMode mode) {
+    if (mode != state::InputMonitorMode::LowLatencyOverlay) return;
     if (!g_runtime.stream.ready()) prepare(g_verification, true);
     if (g_initial.hostSupported && g_runtime.stream.ready()) {
         if (!g_listenerProbeInstalled) g_listenerProbeInstalled = installListenerProbe();
@@ -5642,7 +5740,7 @@ bool requestInputVst3Selection(const std::vector<Vst3SelectionEntry> &selection,
         std::lock_guard<std::mutex> requestLock(g_runtime.selectionRequestMutex);
         mode = g_runtime.pendingInputSettings.mode;
     }
-    prepareIndependentInputBackend(!selection.empty(), mode);
+    prepareIndependentInputBackend(mode);
     startSelectionWorker();
     {
         std::lock_guard<std::mutex> lock(g_runtime.selectionRequestMutex);
@@ -5664,12 +5762,7 @@ bool requestInputMonitorSettings(const state::InputMonitorSettings &settings,
         if (error) *error = detail.isEmpty() ? "input_settings_load_failed" : detail.toStdString();
         return false;
     }
-    bool hasInputSelection = false;
-    {
-        std::lock_guard<std::mutex> requestLock(g_runtime.selectionRequestMutex);
-        hasInputSelection = !g_runtime.pendingInputSelection.empty();
-    }
-    prepareIndependentInputBackend(hasInputSelection, settings.mode);
+    prepareIndependentInputBackend(settings.mode);
     if (!state::writeChain(chain)) { if (error) *error = "input_settings_save_failed"; return false; }
     startSelectionWorker();
     {
@@ -5679,6 +5772,30 @@ bool requestInputMonitorSettings(const state::InputMonitorSettings &settings,
         ++g_runtime.inputRequestGeneration;
     }
     wakeSelectionWorker();
+    return true;
+}
+
+void setNativeInputState(bool known, bool enabled) noexcept {
+    const bool wasEnabled = g_inputMonitor.nativeListenerEnabled.exchange(known && enabled, std::memory_order_acq_rel);
+    const bool wasKnown = g_inputMonitor.nativeListenerKnown.exchange(known, std::memory_order_acq_rel);
+    if (wasEnabled == (known && enabled) && wasKnown == known) return;
+    g_inputMonitor.statusChanged.store(true, std::memory_order_release);
+    if (const auto handle = g_inputMonitor.event.load(std::memory_order_acquire)) SetEvent(handle);
+}
+
+bool activeInputVst3States(std::vector<Vst3SelectionEntry> &result) noexcept {
+    result.clear();
+    std::unique_lock<std::mutex> lock(g_runtime.selectionMutex, std::try_to_lock);
+    if (!lock.owns_lock()) return false;
+    std::lock_guard<std::mutex> requestLock(g_runtime.selectionRequestMutex);
+    if (g_runtime.inputSelectionRequestPending) return false;
+    // Selection readiness is independent of the host's monitoring switch.
+    // An Off monitor can retain prepared processors and their editor state.
+    if (g_inputMonitor.retained < 0) return true;
+    const auto &slot = g_inputMonitor.monitorSlots[g_inputMonitor.retained].selection;
+    for (std::size_t i = 0; i < slot.count; ++i)
+        if (slot.effects[i] && containsIdentity(g_inputMonitor.desired, slot.effects[i]->identity))
+            result.push_back({slot.effects[i]->identity.module, slot.effects[i]->identity.classId});
     return true;
 }
 
@@ -5714,7 +5831,12 @@ QJsonObject inputMonitorSnapshot() {
     if (index >= 0)
         for (const auto &effect : g_inputMonitor.monitorSlots[index].selection.effects)
             if (effect && effect->processor) latency += effect->processor->getLatencySamples();
-    return {{"state", pending ? "preparing" : phases[phase]},
+    const bool hostWaiting = requested.mode == state::InputMonitorMode::LowLatencyOverlay &&
+        (!g_inputMonitor.nativeListenerKnown.load() || !g_inputMonitor.nativeListenerEnabled.load());
+    return {{"state", hostWaiting ? "waiting_for_input" : pending ? "preparing" : phases[phase]},
+        {"native_listener_known", g_inputMonitor.nativeListenerKnown.load()},
+        {"native_listener_enabled", g_inputMonitor.nativeListenerEnabled.load()},
+        {"dry_monitoring", g_inputMonitor.desired.empty()},
         {"mode", modes[static_cast<int>(requested.mode)]}, {"gain", requested.gain},
         {"detail", details[phase]}, {"error", QString::fromStdString(g_inputMonitor.error)},
         {"configuration_validated", configurationValidated},
@@ -5734,6 +5856,7 @@ QJsonObject inputMonitorSnapshot() {
         {"fault_listener_calls", int(g_inputMonitor.faultListenerCalls.load())},
         {"fault_src_calls", int(g_inputMonitor.faultSrcCalls.load())},
         {"error_blocks", QString::number(g_inputMonitor.errors.load())},
+        {"status_flag_blocks", QString::number(g_inputMonitor.statusBlocks.load())},
         {"configuration_rejected_blocks", QString::number(g_inputMonitor.configurationRejectedBlocks.load())},
         {"clipped_blocks", QString::number(g_inputMonitor.clipped.load())}};
 }
