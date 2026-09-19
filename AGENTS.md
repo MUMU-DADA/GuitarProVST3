@@ -26,6 +26,8 @@
 - [P11 实现记录](docs/P11_IMPLEMENTATION.md)：P11 当前实现、验证证据和宿主受限项。
 - [P12 事件驱动切轨与按需运行时计划](docs/P12_EVENT_DRIVEN_LAZY_RUNTIME_PLAN.md)：曲谱生命周期、切轨 hook、按需实例化、warm-cache 和主界面启动性能。
 - [P12 实现记录](docs/P12_IMPLEMENTATION.md)：P12 当前实现、验证证据和宿主受限项。
+- [P13 ASIO 输入低延迟监听计划](docs/P13_LOW_LATENCY_ASIO_INPUT_PLAN.md)：ASIO 输入低 buffer、输入效果旁通、RSE 共存和独立 input VST3 chain。
+- [P13 实现记录](docs/P13_IMPLEMENTATION.md)：宿主边界调查、实验诊断、已验证证据与未完成门禁。
 - [测试与验证](docs/TESTING.md)：构建、免安装宿主回归和常用测试命令。
 
 历史阶段记录和完整计划快照见 [docs/archive](docs/archive/README.md)。

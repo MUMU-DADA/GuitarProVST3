@@ -8,7 +8,14 @@
 
 namespace gpvst3::state {
 
-enum class ScopeKind { Global, Track };
+enum class ScopeKind { Global, Track, Input };
+enum class InputMonitorMode { Off, Legacy, LowLatencyOverlay };
+struct InputMonitorSettings {
+    // This is requested configuration only. A device session owns the actual
+    // mode, processor instances and generation; none of those are persisted.
+    InputMonitorMode mode = InputMonitorMode::Off;
+    double gain = 0.5;
+};
 using ScoreKey = QString;
 using TrackKey = QString;
 
@@ -26,6 +33,15 @@ bool disableAllEffectsAtStartup();
 bool migrateDesiredEnabledIntent();
 bool loadChain(QJsonObject &chain, QString *error = nullptr);
 bool writeChain(const QJsonObject &chain);
+// Missing input/settings fields use Off and 0.5. Invalid persisted values
+// return false, reset settings to those safe defaults and optionally set error.
+// Both helpers are pure JSON operations; neither activates a monitor or saves.
+bool readInputMonitorSettings(const QJsonObject &chain, InputMonitorSettings &settings,
+                              QString *error = nullptr);
+// Reject invalid modes, non-finite gains and gains outside [0, 4] atomically.
+// Existing input metadata, effects and unknown fields remain intact.
+bool setInputMonitorSettings(QJsonObject &chain, const InputMonitorSettings &settings,
+                             QString *error = nullptr);
 QJsonArray scopeEffects(const QJsonObject &chain, ScopeKind scope,
                         const ScoreKey &score = {}, const TrackKey &track = {});
 void setScopeEffects(QJsonObject &chain, ScopeKind scope, const QJsonArray &effects,

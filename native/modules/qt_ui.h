@@ -6,6 +6,7 @@
 #include <vector>
 
 #include "gp_hook.h"
+#include "state_manager.h"
 
 namespace gpvst3::ui {
 
@@ -28,6 +29,8 @@ using Vst3EditorCloseControl = void (*)() noexcept;
 using Vst3EditorScaleControl = void (*)(void *, double) noexcept;
 using Vst3RefreshControl = void (*)();
 using Vst3IdentifyControl = QJsonArray (*)(const QString &, QString *);
+using InputMonitorRequestControl = bool (*)(const state::InputMonitorSettings &, std::string *) noexcept;
+using InputMonitorSnapshotControl = QJsonObject (*)();
 
 // The P7 selector belongs to the sound section; the native plug-in editor
 // is a separate nonmodal window owned by the Guitar Pro main window.
@@ -44,6 +47,9 @@ void setVst3TrackControls(Vst3TrackStateControl state, Vst3TrackEditorControl ed
                           Vst3TrackActiveControl active = nullptr) noexcept;
 void setVst3EditorControl(Vst3EditorControl open, Vst3EditorCloseControl close,
                          Vst3EditorScaleControl scale = nullptr) noexcept;
+void setVst3InputControls(Vst3SelectionRequestControl request, Vst3StateControl capture,
+                          Vst3EditorControl editor, InputMonitorRequestControl monitor,
+                          InputMonitorSnapshotControl snapshot) noexcept;
 void setVst3DiscoveryControl(Vst3RefreshControl refresh, Vst3IdentifyControl identify) noexcept;
 void syncVst3Selection();
 void refreshVst3TrackContext();
@@ -57,6 +63,9 @@ void setStartupProgress(int percent, const QString &message, bool active = true)
 void resizeNativeEditor(void *host, int width, int height);
 double nativeEditorScale(void *host);
 void shutdownEditors();
+// Called on Qt before an input runtime replaces the editor's processor.
+// Preserve an editor belonging to the global or track scope.
+void closeInputEditorForRuntimeChange();
 void showEffectChainPanel(bool show = true);
 
 }

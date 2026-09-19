@@ -4,6 +4,7 @@ param(
     [string]$Vst3SdkDir = '',
     [string]$GuitarProMcpRoot = '',
     [switch]$ForceNativeAudioBindings,
+    [switch]$EnableP13Probe,
     [ValidateSet('', 'GuitarPro.exe', 'GPCore.dll', 'GPRSE.dll', 'AMAudio.dll', 'AMOverloud.dll')]
     [string]$RejectHostFile = '',
     [ValidateRange(0, 5000)]
@@ -29,7 +30,7 @@ if (-not (Test-Path -LiteralPath (Join-Path $Vst3SdkDir 'pluginterfaces/base/fun
 }
 $Vst3SdkDir = (Resolve-Path -LiteralPath $Vst3SdkDir).Path
 
-if (($RejectHostFile -or $CatalogDelayMs -or $ForceNativeAudioBindings) -and (-not $OutputRoot -or
+if (($RejectHostFile -or $CatalogDelayMs -or $ForceNativeAudioBindings -or $EnableP13Probe) -and (-not $OutputRoot -or
     [IO.Path]::GetFullPath($OutputRoot).TrimEnd('\', '/') -ieq (Join-Path $projectRoot '.tools/native'))) {
     throw 'A negative-test DLL requires a separate -OutputRoot.'
 }
@@ -55,6 +56,7 @@ $includeDirs = @(
     $Vst3SdkDir,
     (Join-Path $Vst3SdkDir 'public.sdk'),
     (Join-Path $PSScriptRoot 'modules'),
+    (Join-Path $PSScriptRoot 'third_party/minhook/include'),
     $buildDir
 )
 $includeArgs = $includeDirs | ForEach-Object { "-I$_" }
@@ -83,6 +85,14 @@ $sources = @(
 )
 $testDefines = @()
 if ($ForceNativeAudioBindings) { $testDefines += '/DGPVST3_FORCE_NATIVE_AUDIO_BINDINGS' }
+if ($EnableP13Probe) { $testDefines += '/DGPVST3_P13_PROBE_BUILD' }
+$sources += @(
+    (Join-Path $PSScriptRoot 'modules/asio_lifecycle_probe.cpp'),
+    (Join-Path $PSScriptRoot 'third_party/minhook/src/buffer.c'),
+    (Join-Path $PSScriptRoot 'third_party/minhook/src/hook.c'),
+    (Join-Path $PSScriptRoot 'third_party/minhook/src/trampoline.c'),
+    (Join-Path $PSScriptRoot 'third_party/minhook/src/hde/hde64.c')
+)
 if ($CatalogDelayMs) { $testDefines += "/DGPVST3_TEST_SCAN_DELAY_MS=$CatalogDelayMs" }
 if ($RejectHostFile) {
     $index = @('GUITARPRO.EXE','GPCORE.DLL','GPRSE.DLL','AMAUDIO.DLL','AMOVERLOUD.DLL').IndexOf($RejectHostFile.ToUpperInvariant())

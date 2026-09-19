@@ -24,15 +24,22 @@ P9 的切换框架、紧凑侧栏、About 窗口和扫描反馈已通过夹具�
 
 P11 已完成周期维护替换：音轨刷新、侧栏挂载、诊断写盘和 scanner poll 均按事件或任务活动触发；实现与验证见 [P11 实现记录](docs/P11_IMPLEMENTATION.md)。
 
+P12 已改为按需实例化与有界 warm-cache，无曲谱时音轨/全局链仅维护插件元数据；P13 独立输入模式可按保存配置恢复，不依赖曲谱。实现与验证见 [P12 实现记录](docs/P12_IMPLEMENTATION.md)。
+
+P13 的独立输入 VST3 链、低延迟监听、输入增益、状态保存和设备恢复已接入普通构建。输入监听贡献在混入 RSE 前分流，原生监听 DSP 继续维护宿主状态；共享 SRC/ring 排空后，独立输入结果叠加到保留的 GP output。音轨、全局和输入链各自拥有插件实例、参数和编辑器。
+
+本机 Studio 2 PRO / Midiplus USB Audio ASIO、实际 192000 Hz / 64 帧（GP 内部 44100 Hz）的物理回环对照中，监听延迟由 78.458 ms 降至 3.177 ms；这是该固定配置与测试插件的测量，不是任意设备或插件的延迟保证。其他采样率/SRC 拓扑目前报告 `host_limited`。P13 固定配置验收已完成，版本 0.10.0；完整证据与范围见 [P13 实现记录](docs/P13_IMPLEMENTATION.md)，要求见 [P13 计划](docs/P13_LOW_LATENCY_ASIO_INPUT_PLAN.md)。
+
 ## 运行边界
 
 | 项目 | 说明 |
 | --- | --- |
 | 已验证宿主 | Guitar Pro 8.1.1.17，Windows x64 |
 | 音频设备 | 使用 Guitar Pro 当前配置的设备和采样率 |
+| 低延迟输入 | 已实测 Studio 2 PRO ASIO 192000 Hz / 64 帧；仅在已核对的 GP 44100 Hz SRC 拓扑上激活，其他配置显示宿主受限 |
 | 插件格式 | 本地 VST3 bundle（由项目内嵌 host 扫描和加载） |
 | 其他 Guitar Pro 版本 | 默认由版本门控拒绝实时接入并保持旁路 |
-| 未完成矩阵 | 不同 ASIO/WASAPI 设备、真实扬声器听感、capture 监听/反馈、其他 GP 版本 |
+| 未完成矩阵 | 其他 ASIO/WASAPI 设备、其他实际采样率/硬件 buffer、任意第三方插件与其他 GP 版本；当前设备拒绝的 buffer 请求不算通过 |
 | 崩溃隔离 | 第三方插件进程内崩溃隔离尚未实现；识别超时只丢弃迟到结果 |
 
 ## 构建
@@ -48,7 +55,7 @@ P11 已完成周期维护替换：音轨刷新、侧栏挂载、诊断写盘和 
 默认构建命令：
 
 ```powershell
-./native/build.ps1 -OutputRoot .tools/native/p8-track-build
+./native/build.ps1 -OutputRoot .tools/native/release-build
 ```
 
 指定 Qt SDK：
@@ -56,10 +63,10 @@ P11 已完成周期维护替换：音轨刷新、侧栏挂载、诊断写盘和 
 ```powershell
 ./native/build.ps1 `
   -QtDir C:/path/to/Qt/5.15.x/msvc2019_64 `
-  -OutputRoot .tools/native/p8-track-build
+  -OutputRoot .tools/native/release-build
 ```
 
-`-ForceNativeAudioBindings` 仅用于 native collector 测试构建，不用于发布 DLL。
+普通构建包含 MinHook 和 ASIO 生命周期保护。`-ForceNativeAudioBindings` 仅用于 native collector 测试；`-EnableP13Probe` 仅用于有界音频观测，实验 DLL 会被发布打包器拒绝。
 
 ## 安装与使用
 
@@ -73,6 +80,8 @@ P11 已完成周期维护替换：音轨刷新、侧栏挂载、诊断写盘和 
 `Install.cmd` 会在发现没有收据的旧同名 DLL 时先把旧文件备份到 `Plugins/guitarpro-vst3-backups`，再完成安装。
 
 音轨链和全局链彼此独立，已启用插件按列表顺序处理，可拖动或使用 `Alt+Up` / `Alt+Down` 调整顺序。双击插件名称打开原生 GUI；关闭 GUI 不会停止效果处理。插件详情中可打开配置并设置“启动时启用插件”，修改在下次启动 Guitar Pro 时生效。
+
+实时输入使用音源区域的“输入 VST3”：先勾选输入插件，再打开“低延迟监听”。只有状态显示“低延迟监听已生效”才表示切换完成；准备和排空期间会有监听空隙。输入配置独立于曲谱与音轨，具体设备条件、静音状态和恢复行为见 [安装与使用](docs/INSTALL.md)。
 
 ## 验证
 
@@ -101,9 +110,12 @@ git diff --check
 - [P10 实现记录](docs/P10_IMPLEMENTATION.md)
 - [P11 UI 性能计划](docs/P11_UI_PERFORMANCE_PLAN.md)
 - [P11 实现记录](docs/P11_IMPLEMENTATION.md)
+- [P13 ASIO 输入低延迟监听计划](docs/P13_LOW_LATENCY_ASIO_INPUT_PLAN.md)
+- [P13 实现记录](docs/P13_IMPLEMENTATION.md)
 - [测试与验证](docs/TESTING.md)
 - [免责声明](DISCLAIMER.md)
 - [VST3 SDK 许可](third_party/vst3sdk/LICENSE.txt)
+- [MinHook 许可](native/third_party/minhook/LICENSE.txt)
 
 ## 免责声明
 

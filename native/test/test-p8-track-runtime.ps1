@@ -52,7 +52,7 @@ function Wait-Operation([string]$request, [string]$expected) {
     if ($state.operation.status -ne $expected) { throw "Operation did not reach ${expected}: $(Json $state)" }
     $state.operation
 }
-function Wait-Track([int]$index) {
+function Wait-Track([int]$index, [string]$ExpectedTrackKey = '') {
     $cursor = Invoke-McpTool $session gp_cursor @{document=$document;axis='track';index=$index}
     $deadline = [DateTime]::UtcNow.AddSeconds(12)
     $expectedDocumentPrefix = [string]$document + '#'
@@ -66,10 +66,11 @@ function Wait-Track([int]$index) {
         try { $observation = Get-Observation } catch { $observation = $null }
         $runtimeContextKey = if ($observation) { [string]$observation.gp_hook.track_context_key } else { '' }
         $contextMatchesDocument = $runtimeContextKey.StartsWith($expectedDocumentPrefix, [StringComparison]::OrdinalIgnoreCase)
+        $contextMatchesIdentity = -not $ExpectedTrackKey -or $runtimeContextKey -eq $ExpectedTrackKey
         if ($selected.Count -gt 0 -and $label -and $label.properties.text -and
-            $label.properties.text.EndsWith("Track $index") -and $contextMatchesDocument) { return $state }
+            $label.properties.text.EndsWith("Track $index") -and $contextMatchesDocument -and $contextMatchesIdentity) { return $state }
     } while ([DateTime]::UtcNow -lt $deadline)
-    throw "Track $index did not become observable: $(Json @{mapping=$state;cursor=$cursor;contexts=$context;observation=$observation;expected_document=$document})"
+    throw "Track $index did not become observable: $(Json @{mapping=$state;cursor=$cursor;contexts=$context;observation=$observation;expected_document=$document;expected_track_key=$ExpectedTrackKey})"
 }
 function Get-Observation() {
     $path = Join-Path $dataDirectory 'p2-observation.json'
@@ -85,8 +86,26 @@ function Wait-Observation([scriptblock]$Predicate, [string]$label = 'observation
     } while ([DateTime]::UtcNow -lt $deadline)
     throw "Timed out waiting for ${label}: $(Json $observation)"
 }
-function Read-Gain([int]$track) {
-    if ($track -ge 0) { Wait-Track $track | Out-Null }
+function Set-EffectChecked([string]$Name, [bool]$Value) {
+    $deadline = [DateTime]::UtcNow.AddSeconds(8)
+    do {
+        $query = Invoke-McpTool $session gp_objects @{query=$Name;limit=10}
+        $targets = @($query.objects | Where-Object object_name -CEQ $Name)
+        if ($targets.Count -eq 1) {
+            if ($targets[0].properties.checked -eq $Value) { return }
+            try {
+                Invoke-McpTool $session gp_set_property @{snapshot=$query.snapshot;id=$targets[0].id;property='checked';value=$Value} | Out-Null
+            } catch {
+                # The sidebar can rebuild between observation and mutation.
+                if ($_.Exception.Message -notlike '*Observed object no longer exists*') { throw }
+            }
+        }
+        Start-Sleep -Milliseconds 100
+    } while ([DateTime]::UtcNow -lt $deadline)
+    throw "Effect checkbox did not retain checked=${Value}: $Name"
+}
+function Read-Gain([int]$track, [string]$ExpectedTrackKey = '') {
+    if ($track -ge 0) { Wait-Track $track $ExpectedTrackKey | Out-Null }
     $prefix = if ($track -ge 0) {'gpvst3Editor_'} else {'gpvst3GlobalEditor_'}
     $deadline = [DateTime]::UtcNow.AddSeconds(5)
     do {
@@ -98,7 +117,15 @@ function Read-Gain([int]$track) {
         Start-Sleep -Milliseconds 150
         $query = Invoke-McpTool $session gp_objects @{query='gpvst3TestProcessor';limit=10}
         $value = @($query.objects | Where-Object { $_.properties.text })[0].properties.text
-        if ($value) { return $value | ConvertFrom-Json }
+        if ($value) {
+            $processor = $value | ConvertFrom-Json
+            if ($track -ge 0) {
+                $trackKey = [string](Get-Observation).gp_hook.track_context_key
+                if ($ExpectedTrackKey -and $trackKey -ne $ExpectedTrackKey) { continue }
+                $processor | Add-Member -NotePropertyName runtime_track_key -NotePropertyValue $trackKey
+            }
+            return $processor
+        }
     } while ([DateTime]::UtcNow -lt $deadline)
     throw "Track $track processor GUI did not publish state."
 }
@@ -559,8 +586,7 @@ try {
                 throw "Track $track changed instance/state after stop/play."
             }
         }
-        $global = Invoke-McpTool $session gp_objects @{query=('gpvst3GlobalEnabled_' + $candidates[0].class_id);limit=10}
-        Invoke-McpTool $session gp_set_property @{snapshot=$global.snapshot;id=$global.objects[0].id;property='checked';value=$true} | Out-Null
+        Set-EffectChecked ('gpvst3GlobalEnabled_' + $candidates[0].class_id) $true
         Start-Sleep -Milliseconds 500
         Read-Gain -1 | Out-Null
         $gain = Invoke-McpTool $session gp_objects @{query='gpvst3TestGain';limit=10}
@@ -588,9 +614,12 @@ try {
         }).Count) { throw 'Final per-track processing/writeback evidence failed.' }
         if ($CheckLifecycle) {
             Invoke-McpTool $session gp_playback @{operation='stop';document=$document} | Out-Null
+            $swapBindingGeneration = [int64](Get-Observation).gp_hook.binding_generation
             Invoke-McpTool $session gp_edit_tracks @{operation='swap';document=$document;track=0;other=1} | Out-Null
-            Start-Sleep -Milliseconds 600
-            $swapped = @(Read-Gain 0; Read-Gain 1)
+            $result.swap_observation = Wait-Observation {
+                param($o) [int64]$o.gp_hook.binding_generation -gt $swapBindingGeneration
+            } 'same-count swap binding refresh'
+            $swapped = @(Read-Gain 0 $trackGains[1].runtime_track_key; Read-Gain 1 $trackGains[0].runtime_track_key)
             $result.swapped = $swapped
             if ($swapped[0].instance -ne $trackGains[1].instance -or $swapped[0].gain -ne 0.5 -or
                 $swapped[1].instance -ne $trackGains[0].instance -or $swapped[1].gain -ne 0.25) {
@@ -629,13 +658,16 @@ try {
             $document = (Wait-Operation $open.request 'opened').document
             Invoke-McpTool $session gp_activate @{document=$document} | Out-Null
             Wait-Track 0 | Out-Null
+            Invoke-McpTool $session gp_playback @{operation='set_loop';document=$document;enabled=$true} | Out-Null
             Invoke-McpTool $session gp_playback @{operation='play';document=$document} | Out-Null
             Start-Sleep -Seconds 1
-            $result.reopen_before_visiting_track_1 = (Wait-Observation { param($o) @($o.gp_hook.track_runtime_evidence).Count -eq 2 -and @($o.gp_hook.track_runtime_evidence | Where-Object { $_.configured_effects -eq 1 -and $_.processed -and $_.error_blocks -eq 0 }).Count -eq 2 } 'reopened track runtime processing').gp_hook.track_runtime_evidence
-            if (@($result.reopen_before_visiting_track_1).Count -ne 2 -or
-                @($result.reopen_before_visiting_track_1 | Where-Object { $_.configured_effects -ne 1 -or -not $_.processed -or $_.error_blocks -gt 0 }).Count) {
-                throw 'Reopening did not automatically restore and process both tracks before visiting their UI.'
+            $result.reopen_before_enabling = (Wait-Observation { param($o) @($o.gp_hook.track_runtime_evidence).Count -eq 2 } 'reopened track bindings').gp_hook.track_runtime_evidence
+            if (@($result.reopen_before_enabling | Where-Object { $_.configured_effects -ne 0 -or $_.processed }).Count) {
+                throw 'Reopening activated a track effect without an explicit selection.'
             }
+            Set-TrackEffect 0 $candidates[0] | Out-Null
+            Set-TrackEffect 1 $trackOneCandidate | Out-Null
+            $result.reopen_after_enabling = (Wait-Observation { param($o) @($o.gp_hook.track_runtime_evidence | Where-Object { $_.configured_effects -eq 1 -and $_.processed -and $_.error_blocks -eq 0 }).Count -eq 2 } 'reopened explicitly enabled track processing').gp_hook.track_runtime_evidence
             $result.reopened_gains = @(Read-Gain 0; Read-Gain 1)
             if ($result.reopened_gains[0].gain -ne 0.25 -or $result.reopened_gains[1].gain -ne 0.5 -or
                 (Read-Gain -1).instance -ne $globalGain.instance) { throw 'Reopening lost track state or changed the global instance.' }
@@ -661,12 +693,17 @@ try {
             $document = (Wait-Operation $open.request 'opened').document
             Invoke-McpTool $session gp_activate @{document=$document} | Out-Null
             Wait-Track 0 | Out-Null
+            Invoke-McpTool $session gp_playback @{operation='set_loop';document=$document;enabled=$true} | Out-Null
             Invoke-McpTool $session gp_playback @{operation='play';document=$document} | Out-Null
             Start-Sleep -Seconds 2
-            $result.restart_before_visiting_track_1 = (Get-Observation).gp_hook
-            if (@($result.restart_before_visiting_track_1.track_runtime_evidence).Count -ne 2 -or
-                @($result.restart_before_visiting_track_1.track_runtime_evidence | Where-Object { $_.configured_effects -ne 1 -or -not $_.processed -or $_.error_blocks -gt 0 }).Count -or
-                -not $result.restart_before_visiting_track_1.global_chain_enabled) { throw 'Process restart did not restore all track and global chains.' }
+            $result.restart_before_enabling = (Wait-Observation { param($o) @($o.gp_hook.track_runtime_evidence).Count -eq 2 } 'restart track bindings').gp_hook
+            if (@($result.restart_before_enabling.track_runtime_evidence | Where-Object { $_.configured_effects -ne 0 -or $_.processed }).Count) {
+                throw 'Process restart activated a track effect without an explicit selection.'
+            }
+            Set-TrackEffect 0 $candidates[0] | Out-Null
+            Set-TrackEffect 1 $trackOneCandidate | Out-Null
+            Set-EffectChecked ('gpvst3GlobalEnabled_' + $candidates[0].class_id) $true
+            $result.restart_after_enabling = (Wait-Observation { param($o) @($o.gp_hook.track_runtime_evidence | Where-Object { $_.configured_effects -eq 1 -and $_.processed -and $_.error_blocks -eq 0 }).Count -eq 2 -and $o.gp_hook.global_chain_enabled } 'restart explicitly enabled processing').gp_hook
             $result.restart_gains = @(Read-Gain 0; Read-Gain 1; Read-Gain -1)
             if ($result.restart_gains[0].gain -ne 0.25 -or $result.restart_gains[1].gain -ne 0.5 -or $result.restart_gains[2].gain -ne 0.75) {
                 throw 'Process restart lost an independent processor state.'

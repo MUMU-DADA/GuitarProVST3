@@ -15,6 +15,7 @@
 #include <cstring>
 #include <filesystem>
 #include <functional>
+#include <limits>
 #include <cstdio>
 #include <mutex>
 #include <condition_variable>
@@ -26,6 +27,7 @@
 
 #include "audio_adapter.h"
 #include "effect_chain.h"
+#include "input_monitor_exchange.h"
 #include "gp_audio_runtime.h"
 #include "state_manager.h"
 #include "vst3_parameters.h"
@@ -36,8 +38,25 @@
 #include <QtCore/QMetaObject>
 #include <QtCore/QThread>
 #include <QtCore/QEventLoop>
+#include <QtCore/QWinEventNotifier>
 #include <QtCore/QByteArray>
 #include "portaudio_capture_abi.h"
+#include "../third_party/minhook/include/MinHook.h"
+#include "asio_lifecycle_probe.h"
+#include "input_drain_probe.h"
+#ifdef GPVST3_P13_PROBE_BUILD
+#include "input_probe.h"
+#include "input_timing_probe.h"
+#include "input_pcm_probe.h"
+#include <QtCore/QJsonObject>
+#include <QtCore/QJsonDocument>
+#include <QtCore/QDir>
+#include <QtCore/QSaveFile>
+#include <QtCore/QCryptographicHash>
+extern "C" __declspec(dllexport) const char *gpvst3P13ProbeBuild() {
+    return "GPVST3_P13_EXPERIMENTAL_DIAGNOSTICS_NOT_FOR_RELEASE";
+}
+#endif
 #include "pluginterfaces/base/funknownimpl.h"
 #include "pluginterfaces/base/ipluginbase.h"
 #include "pluginterfaces/vst/ivstaudioprocessor.h"
@@ -60,6 +79,12 @@ namespace gpvst3::hook {
 
 int streamCallbackHook(const void *input, void *output, unsigned long frames,
                        const void *timeInfo, unsigned long status, void *userData);
+std::int64_t listenerProbeHook(void *self, const float *input, std::uint32_t inputChannels,
+    float *output, std::uint32_t outputChannels, std::int64_t frames, const void *timePoint);
+#ifdef GPVST3_P13_PROBE_BUILD
+std::int64_t rseProbeHook(void *self, const float *input, std::uint32_t inputChannels,
+    float *output, std::uint32_t outputChannels, std::int64_t frames, const void *timePoint);
+#endif
 void reconfigureInputRouterIfNeeded() noexcept;
 bool configureSelectedChain(const std::vector<Vst3SelectionEntry> &selection, std::string *error) noexcept;
 State prepare(const host::Verification &verification, bool enableForSelection) noexcept;
@@ -229,6 +254,7 @@ const char *editorStageName(EditorStage stage) noexcept {
 }
 
 struct RuntimeEffect;
+void notifyInputLatencyChange() noexcept;
 bool succeeded(tresult result) noexcept;
 void mirrorInputParameter(RuntimeEffect *source, ParamID id, ParamValue value) noexcept;
 
@@ -447,6 +473,7 @@ struct RuntimeEffect {
     Vst3SelectionEntry identity;
     Vst3SelectionEntry loadedSelection;
     bool preloaded = false; // Control-thread diagnostic; never enables processing.
+    std::atomic<bool> independentInput{false};
     FUnknownPtr<Steinberg::Vst::IConnectionPoint> componentConnection;
     FUnknownPtr<Steinberg::Vst::IConnectionPoint> controllerConnection;
     std::atomic<std::size_t> parameterEdits{0};
@@ -540,7 +567,8 @@ struct RuntimeEffect {
             component = nullptr;
             factory = nullptr;
         };
-        if (onQtThread() || !QCoreApplication::instance() ||
+        if ((!component && !controller && !processor && !factory && !componentHandler &&
+             !componentConnection && !controllerConnection) || onQtThread() || !QCoreApplication::instance() ||
             !invokeOnQtThreadBlocking(teardownPlugin)) teardownPlugin();
         plugFrame = nullptr;
         parameterChanges.clear();
@@ -1150,15 +1178,20 @@ Steinberg::tresult PLUGIN_API RuntimeComponentHandler::endEdit(ParamID) {
 
 Steinberg::tresult PLUGIN_API RuntimeComponentHandler::restartComponent(Steinberg::int32 flags) {
     if (!owner_ || !owner_->controller) return Steinberg::kResultFalse;
+    bool handled = false;
+    if ((flags & Steinberg::Vst::kLatencyChanged) && owner_->independentInput.load()) {
+        notifyInputLatencyChange();
+        handled = true;
+    }
     if (flags & Steinberg::Vst::kParamValuesChanged) {
         for (int i = 0; i < owner_->controller->getParameterCount(); ++i) {
             Steinberg::Vst::ParameterInfo info{};
             if (succeeded(owner_->controller->getParameterInfo(i, info)))
                 owner_->queueParameter(info.id, owner_->controller->getParamNormalized(info.id));
         }
-        return Steinberg::kResultOk;
+        handled = true;
     }
-    return Steinberg::kNotImplemented;
+    return handled ? Steinberg::kResultOk : Steinberg::kNotImplemented;
 }
 
 bool matchesEffect(const RuntimeEffect &effect, const Vst3SelectionEntry &entry) noexcept {
@@ -1169,6 +1202,154 @@ bool matchesEffect(const RuntimeEffect &effect, const Vst3SelectionEntry &entry)
     return effect.ready.load(std::memory_order_acquire) &&
         (matches(effect.identity) || matches(effect.loadedSelection));
 }
+
+bool g_listenerProbeInstalled = false;
+const std::uint8_t *g_listenerExecutableBase = nullptr;
+#ifdef GPVST3_P13_PROBE_BUILD
+input::probe::Recorder g_inputProbe;
+input::pcmprobe::Recorder g_inputPcmProbe;
+input::timingprobe::Recorder g_inputTimingProbe;
+thread_local input::timingprobe::Recorder::Ticket *g_inputTimingTicket = nullptr;
+input::probe::Recorder g_listenerProbe;
+struct ListenerProbeExtra {
+    std::uintptr_t state = 0;
+    bool enabled = false;
+    bool stateStable = false;
+    float inputPeakBefore = 0;
+    float inputPeakAfter = 0;
+    float outputPeakAfter = 0;
+    std::uint32_t peakNonFiniteMask = 0;
+    std::array<float, input::probe::kSampleFrames * input::probe::kSampleChannels> outputBefore{};
+    std::uint32_t outputBeforeNonFiniteMask = 0;
+    bool sinkApplied = false;
+    bool sinkBusy = false;
+    std::array<float, input::probe::kSampleFrames * input::probe::kSampleChannels> sinkOutput{};
+    std::uint32_t sinkNonFiniteMask = 0;
+};
+std::array<ListenerProbeExtra, input::probe::kCapacity> g_listenerProbeExtra{};
+std::atomic<std::uint64_t> g_listenerProbeSequence{0};
+thread_local std::uint64_t g_probeOuterSequence = 0;
+bool g_listenerProbeRequested = false;
+std::atomic<bool> g_rseProbeInstalled{false};
+const std::uint8_t *g_rseProbeBase = nullptr;
+bool g_listenerSinkRequested = false;
+// Test-only, bounded AudioUnit output diversion. The original capture, DSP,
+// meter updates, return value and caller output are preserved. An overlapping
+// invocation forwards unchanged instead of waiting or sharing writable memory.
+std::array<float, 32768 * 2> g_listenerSink{};
+std::array<float, 32768 * 2> g_listenerCallerBefore{};
+std::array<float, 32768 * 2> g_drainRseSum{};
+std::atomic_flag g_listenerSinkBusy = ATOMIC_FLAG_INIT;
+std::once_flag g_inputProbeOnce;
+std::uint64_t g_inputProbeStart = 0;
+bool g_inputProbeSilence = false;
+bool g_monitorLatencyProbe = false;
+std::atomic<bool> g_monitorLatencyMappingValid{false};
+const std::array<float, portaudio::kMaxFrames * 2> g_inputProbeZeros{};
+
+input::timingprobe::Identity timingIdentity() noexcept {
+    const auto identity = asioprobe::currentCallback();
+    return {identity.generation, identity.rateRevision, identity.actualRate, identity.rateValidated};
+}
+
+class InputTimingScope final {
+public:
+    InputTimingScope(unsigned long frames, unsigned long status) noexcept : previous_(g_inputTimingTicket) {
+        g_inputTimingTicket = nullptr;
+        if (!g_inputTimingProbe.enabled()) return;
+        const auto started = steadyNanoseconds();
+        if (started >= g_inputProbeStart && g_inputTimingProbe.begin(ticket_, started, frames, status, timingIdentity()))
+            g_inputTimingTicket = &ticket_;
+    }
+    ~InputTimingScope() {
+        if (ticket_.active) {
+            const auto identity = timingIdentity();
+            g_inputTimingProbe.finish(ticket_, steadyNanoseconds(), result, identity);
+        }
+        g_inputTimingTicket = previous_;
+    }
+    int result = -1;
+private:
+    input::timingprobe::Recorder::Ticket ticket_;
+    input::timingprobe::Recorder::Ticket *previous_;
+};
+
+// One bounded, uninterrupted experiment, serialized without waiting. The
+// listener and SRC records are attached to this outer callback, including
+// callbacks which consume the ring without invoking either inner function.
+constexpr std::size_t kDrainProbeCapacity = 4096;
+struct DrainProbeRecord {
+    input::drainprobe::Snapshot before{}, after{};
+    input::drain::Snapshot drain{};
+    asioprobe::SrcObservation src{};
+    std::uint64_t sequence = 0, timestamp = 0, ended = 0, consumed = 0;
+    std::uint32_t frames = 0, thread = 0, listenerCalls = 0, listenerSunk = 0;
+    std::uint32_t statusFlags = 0, callerChangedSamples = 0, nonFiniteSamples = 0;
+    double captureEnergy = 0, nativeEnergy = 0, callerEnergy = 0, outputEnergy = 0;
+    double rseEnergy = 0;
+    std::uint32_t rseCalls = 0, rseMismatchSamples = 0, rseComparedSamples = 0, sourceObserverCalls = 0;
+    std::int64_t rseRequestedFrames = 0;
+    float parentGain = 0;
+    bool rseValid = true;
+    std::uint64_t monitorToken = 0;
+    std::uint32_t overlayComparedSamples = 0, overlayMismatchSamples = 0, listenerPeakSamples = 0;
+    double preOverlayEnergy = 0, overlayEnergy = 0, inputPeak = 0, outputPeak = 0;
+    float nativePreGain = 0;
+    bool overlayCommitted = false, overlaySuppressed = false;
+    input::drain::Snapshot productionDrain{};
+    bool srcObserved = false, listenerValid = true, valid = false;
+    int originalResult = -1;
+};
+struct DrainProbeSlot {
+    DrainProbeRecord record{};
+    std::atomic<bool> published{false};
+};
+bool g_drainProbeRequested = false;
+bool g_overlayProbeRequested = false;
+bool g_overlayTransitionProbe = false;
+std::array<float, portaudio::kMaxFrames * 2> g_overlayProbeBefore{};
+std::array<DrainProbeSlot, kDrainProbeCapacity> g_drainProbeRecords{};
+std::atomic_flag g_drainProbeBusy = ATOMIC_FLAG_INIT;
+std::atomic<std::size_t> g_drainProbeCount{0}, g_drainProbeOverlaps{0};
+input::drain::Tracker g_drainTracker;
+bool g_drainProbeInvalid = false;
+thread_local DrainProbeRecord *g_currentDrainRecord = nullptr;
+
+void configureInputProbe() {
+    std::call_once(g_inputProbeOnce, [] {
+        const auto enabled = [](const char *name) {
+            const auto *value = std::getenv(name);
+            return value && std::strcmp(value, "1") == 0;
+        };
+        unsigned long delay = 8000;
+        if (const auto *value = std::getenv("GPVST3_P13_PROBE_DELAY_MS")) {
+            char *end = nullptr;
+            const auto parsed = std::strtoul(value, &end, 10);
+            if (end != value && *end == '\0' && parsed <= 60000) delay = parsed;
+        }
+        g_inputProbeStart = steadyNanoseconds() + static_cast<std::uint64_t>(delay) * 1000000;
+        g_overlayTransitionProbe = enabled("GPVST3_P13_OVERLAY_TRANSITION") && enabled("GPVST3_P13_OVERLAY_PROBE");
+        g_inputProbeSilence = enabled("GPVST3_P13_SILENCE_INPUT") && enabled("GPVST3_P13_COPY_SCORE");
+        g_monitorLatencyProbe = enabled("GPVST3_P13_MONITOR_LATENCY") && enabled("GPVST3_P13_PCM_PROBE") &&
+            enabled("GPVST3_P13_COPY_SCORE") && enabled("GPVST3_P13_PROBE");
+        g_inputProbe.configure({enabled("GPVST3_P13_PROBE"), true});
+        g_inputTimingProbe.configure(enabled("GPVST3_P13_PROBE"), g_inputProbeStart);
+        if (enabled("GPVST3_P13_PROBE")) asioprobe::configureTiming(g_inputProbeStart);
+        g_inputPcmProbe.configure({enabled("GPVST3_P13_PROBE") &&
+            enabled("GPVST3_P13_PCM_PROBE") && enabled("GPVST3_P13_COPY_SCORE") &&
+            !enabled("GPVST3_P13_SILENCE_INPUT") && !enabled("GPVST3_P13_LISTENER_SINK")});
+        g_listenerProbeRequested = enabled("GPVST3_P13_PROBE") && enabled("GPVST3_P13_LISTENER_PROBE");
+        g_listenerSinkRequested = g_listenerProbeRequested && enabled("GPVST3_P13_LISTENER_SINK") &&
+            enabled("GPVST3_P13_COPY_SCORE");
+        g_drainProbeRequested = g_listenerSinkRequested && enabled("GPVST3_P13_DRAIN_PROBE") &&
+            enabled("GPVST3_P13_STREAM_PROBE") && !g_inputProbeSilence;
+        g_overlayProbeRequested = enabled("GPVST3_P13_OVERLAY_PROBE") && enabled("GPVST3_P13_PROBE") &&
+            enabled("GPVST3_P13_COPY_SCORE") && !g_drainProbeRequested && !g_inputProbeSilence;
+        g_listenerExecutableBase = reinterpret_cast<const std::uint8_t *>(GetModuleHandleW(nullptr));
+        g_listenerProbe.configure({g_listenerProbeRequested, true});
+    });
+}
+#endif
 
 // Slot handoffs own the current processing order; the pool owns every loaded
 // instance for the lifetime of its scope, including disabled effects. Access
@@ -1329,6 +1510,61 @@ struct SelectionSlot {
         return static_cast<SelectionSlot *>(context)->processBlock(block);
     }
 };
+
+struct InputMonitorSlot {
+    SelectionSlot selection;
+    EffectPool pool;
+    input::Router router;
+    double rate = 0;
+    std::uint64_t generation = 0, revision = 0;
+    float gain = 0.5f;
+    static bool process(void *context, const audio::BlockView &block) noexcept {
+        auto &slot = *static_cast<InputMonitorSlot *>(context);
+        if (!slot.selection.processBlock(block)) return false;
+        for (std::size_t c = 0; c < block.channelCount; ++c)
+            for (std::size_t f = 0; f < block.frameCount; ++f)
+                block.outputChannels[c][f] *= slot.gain;
+        return true;
+    }
+};
+
+// All owning objects belong exclusively to the input scope. No input mirror,
+// global preload or track binding ever references either pool.
+struct InputMonitorRuntime {
+    input::MonitorExchange exchange;
+    InputMonitorSlot monitorSlots[2];
+    std::vector<Vst3SelectionEntry> desired;
+    state::InputMonitorSettings settings;
+    std::string error;
+    int retained = -1;
+    bool intentLoaded = false; // Qt thread, independent of score lifecycle.
+    std::atomic<int> phase{0}; // off, legacy, preparing, draining, active, muted, host_limited
+    std::atomic<std::uint64_t> callbackPhase{0};
+    std::atomic<bool> nativeSuppressed{false};
+    std::atomic<std::uint64_t> blocks{0}, errors{0}, clipped{0};
+    std::atomic<std::uint64_t> configurationRejectedBlocks{0}, configurationToken{0};
+    std::atomic<int> callbackFault{0}, listenerFaultFlags{0};
+    std::atomic<std::int64_t> listenerReturnedFrames{0}, listenerRequestedFrames{0};
+    std::atomic<std::uint32_t> faultListenerCalls{0}, faultSrcCalls{0};
+    std::atomic<unsigned long> frames{0};
+    std::atomic<std::size_t> driverFrames{0}, processFrames{0}, channels{0};
+    std::atomic<int> actualRate{0};
+    std::atomic<HANDLE> event{nullptr};
+    std::atomic<bool> statusChanged{false};
+    std::atomic<bool> reconfigureRequested{false};
+    std::atomic_flag processing = ATOMIC_FLAG_INIT;
+    void publishCallbackPhase(std::uint64_t token, int value) noexcept {
+        const auto word = input::MonitorExchange::versionOf(token) | static_cast<std::uint64_t>(value);
+        if (callbackPhase.exchange(word) == word) return;
+        statusChanged.store(true, std::memory_order_release);
+        if (const auto handle = event.load(std::memory_order_acquire)) SetEvent(handle);
+    }
+} g_inputMonitor;
+
+void notifyInputLatencyChange() noexcept {
+    g_inputMonitor.statusChanged.store(true, std::memory_order_release);
+    if (const auto handle = g_inputMonitor.event.load(std::memory_order_acquire)) SetEvent(handle);
+}
 
 // One independently prepared VST3 chain per host track.  The object is fixed
 // in the runtime table so the audio callback never follows a map or allocates;
@@ -1503,12 +1739,20 @@ struct Patch {
     std::uint8_t original[32]{};
     std::size_t size = 0;
     bool installed = false;
+    bool managed = false;
+    MH_STATUS lastStatus = MH_OK;
+    bool restartRequired = false;
+    bool ready() const noexcept { return installed && lastStatus == MH_OK && !restartRequired; }
 };
 
 struct Runtime {
     Patch master;
     Patch dsp;
     Patch stream;
+    Patch listenerProbe;
+#ifdef GPVST3_P13_PROBE_BUILD
+    Patch rseProbe;
+#endif
     Patch cursorMove;
     Patch cursorTrack;
     Patch scoreDuplicateTrack;
@@ -1662,6 +1906,10 @@ struct Runtime {
     std::atomic_flag inputProcessing = ATOMIC_FLAG_INIT;
     std::thread selectionWorker;
     bool selectionWorkerStop = false;
+    bool inputSelectionRequestPending = false;
+    std::vector<Vst3SelectionEntry> pendingInputSelection;
+    state::InputMonitorSettings pendingInputSettings;
+    std::uint64_t inputRequestGeneration = 0;
     bool selectionRequestPending = false;
     std::uint64_t selectionRequestGeneration = 0;
     std::vector<Vst3SelectionEntry> pendingSelection;
@@ -1867,12 +2115,170 @@ void wakeSelectionWorker() {
         QMetaObject::invokeMethod(loop, &QEventLoop::quit, Qt::QueuedConnection);
 }
 
+bool configureIndependentInput(const std::vector<Vst3SelectionEntry> &selection,
+                                const state::InputMonitorSettings &settings,
+                                std::uint64_t generation, std::string &error) {
+    using Mode = state::InputMonitorMode;
+    const bool low = settings.mode == Mode::LowLatencyOverlay;
+    if (!low) {
+        std::lock_guard<std::mutex> requestLock(g_runtime.selectionRequestMutex);
+        if (generation != g_runtime.inputRequestGeneration) return false;
+        if (settings.mode == Mode::Legacy || (g_inputMonitor.exchange.watching() &&
+            g_inputMonitor.exchange.legacyFallback())) g_inputMonitor.exchange.legacy();
+        else g_inputMonitor.exchange.off();
+        g_inputMonitor.settings = settings;
+        g_inputMonitor.phase.store(settings.mode == Mode::Legacy ? 1 : 0);
+        g_inputMonitor.error.clear();
+        if (sameSelection(selection, g_inputMonitor.desired)) return true;
+    }
+    if (selection.empty()) {
+        std::lock_guard<std::mutex> requestLock(g_runtime.selectionRequestMutex);
+        if (generation != g_runtime.inputRequestGeneration) return false;
+        const bool actuallySuppressed = g_inputMonitor.nativeSuppressed.load();
+        if (low && actuallySuppressed) g_inputMonitor.exchange.mute();
+        else if (low && g_inputMonitor.exchange.suppressed()) {
+            if (g_inputMonitor.exchange.legacyFallback()) g_inputMonitor.exchange.legacy();
+            else g_inputMonitor.exchange.off();
+        }
+        g_inputMonitor.phase.store(low ? (actuallySuppressed ? 5 : 6) : (settings.mode == Mode::Legacy ? 1 : 0));
+        g_inputMonitor.desired = selection;
+        g_inputMonitor.settings = settings;
+        g_inputMonitor.error = low && !actuallySuppressed ? "input_chain_empty" : "";
+        return true;
+    }
+    double rate = 44100;
+    std::uint64_t streamGeneration = 0, rateRevision = 0;
+    if (low) {
+        auto stream = asioprobe::currentStream();
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+        while ((!stream.bound || !stream.callback.rateValidated) &&
+               stream.binding != asioprobe::BindingState::HostLimited &&
+               std::chrono::steady_clock::now() < deadline) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            stream = asioprobe::currentStream();
+        }
+        rate = stream.callback.actualRate;
+        streamGeneration = stream.callback.generation;
+        rateRevision = stream.callback.rateRevision;
+        if (stream.binding == asioprobe::BindingState::HostLimited) {
+            error = stream.limit == asioprobe::BindingLimit::ProxyCapacityExhausted
+                ? "input_stream_capacity_exhausted_restart_required" : "input_stream_callbacks_unsupported";
+            return false;
+        }
+        if (
+#ifdef GPVST3_P13_PROBE_BUILD
+            g_drainProbeRequested || g_inputProbeSilence ||
+#endif
+            !g_listenerProbeInstalled ||
+            !stream.bound || !stream.lifetimeProtected || !stream.callback.rateValidated || rate != 192000) {
+            error = "input_host_contract_unavailable";
+            return false;
+        }
+    }
+    const int active = g_inputMonitor.exchange.activeIndex();
+    const int target = (active >= 0 ? active : g_inputMonitor.retained) == 0 ? 1 : 0;
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(250);
+    while (!g_inputMonitor.exchange.writable(target)) {
+        if (std::chrono::steady_clock::now() >= deadline) {
+            error = "input_slot_reader_timeout";
+            return false;
+        }
+        std::this_thread::yield();
+    }
+    auto &slot = g_inputMonitor.monitorSlots[target];
+    auto effectiveSelection = selection;
+    std::vector<std::shared_ptr<RuntimeEffect>> reusable;
+    // A monitor gain/mode change must retain parameter edits made since the
+    // last selection request. This API edits order/enabled identity, not state
+    // imports: retained active identities always keep their latest live state.
+    if (g_inputMonitor.retained >= 0) {
+        const auto &previous = g_inputMonitor.monitorSlots[g_inputMonitor.retained].selection;
+        for (auto &entry : effectiveSelection)
+            for (std::size_t i = 0; i < previous.count; ++i)
+                if (previous.effects[i]->identity.module == entry.module &&
+                    previous.effects[i]->identity.classId == entry.classId &&
+                    containsIdentity(g_inputMonitor.desired, entry)) {
+                    entry = previous.effects[i]->captureState();
+                    if (previous.effects[i]->configuredRate.load() == static_cast<int>(rate) &&
+                        previous.effects[i]->configuredBlock.load() >= portaudio::kMaxFrames)
+                        reusable.push_back(previous.effects[i]);
+                    break;
+                }
+    }
+    slot.selection.shutdown();
+    slot.pool.effects.clear();
+    slot.pool.effects = std::move(reusable);
+    if (!slot.selection.prepare(effectiveSelection, rate, portaudio::kMaxFrames, slot.pool, &error) ||
+        !slot.router.prepare(2, portaudio::kMaxFrames)) {
+        if (error.empty()) error = "input_overlay_prepare_failed";
+        return false;
+    }
+    slot.rate = rate;
+    for (std::size_t i = 0; i < slot.selection.count; ++i)
+        slot.selection.effects[i]->independentInput = true;
+    slot.generation = streamGeneration;
+    slot.revision = rateRevision;
+    slot.gain = static_cast<float>(settings.gain);
+    slot.router.setProcessor({&slot, &InputMonitorSlot::process});
+    slot.router.setRoute(input::Route::Overlay);
+    slot.router.setBypassed(false);
+    slot.router.setEnabled(true);
+    slot.router.setStreamRunning(true);
+    {
+        const auto opened = std::atomic_load(&g_openEditorEffect);
+        if (opened && opened->independentInput.load() &&
+            std::none_of(std::begin(slot.selection.effects), std::end(slot.selection.effects),
+                [&](const auto &effect) { return effect == opened; })) {
+            // The old editor cannot remain attached to a retired-rate/state
+            // instance while audio uses the replacement. Keep other scopes'
+            // windows untouched. Do not hold the request lock while invoking Qt.
+            if (!invokeOnQtThreadBlocking([opened] {
+                const auto current = std::atomic_load(&g_openEditorEffect);
+                if (current != opened) return;
+                std::atomic_store(&g_openEditorEffect, std::shared_ptr<RuntimeEffect>{});
+                EditorCallbackScope callbackScope;
+                opened->closeEditor();
+                ui::closeInputEditorForRuntimeChange();
+            })) { error = "input_editor_retire_failed"; return false; }
+        }
+    }
+    std::lock_guard<std::mutex> requestLock(g_runtime.selectionRequestMutex);
+    if (generation != g_runtime.inputRequestGeneration) return false;
+    if (low) {
+        // A reader that saw an older token may briefly reserve this retired
+        // slot before rejecting that token. Keep the prepared payload intact
+        // and retry on the control thread; no new reader can accept it until
+        // publication succeeds.
+        const auto publishDeadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(250);
+        while (!g_inputMonitor.exchange.publish(target)) {
+            if (std::chrono::steady_clock::now() >= publishDeadline) {
+                error = "input_overlay_publish_failed";
+                return false;
+            }
+            std::this_thread::yield();
+        }
+    }
+    slot.selection.markActive();
+    g_inputMonitor.retained = target;
+    g_inputMonitor.desired = effectiveSelection;
+    g_runtime.pendingInputSelection = effectiveSelection;
+    g_inputMonitor.settings = settings;
+    g_inputMonitor.error.clear();
+    g_inputMonitor.phase.store(low ? 3 : (settings.mode == Mode::Legacy ? 1 : 0));
+    return true;
+}
+
 void selectionWorkerLoop() {
     struct ComApartment {
         HRESULT result = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
         ~ComApartment() { if (SUCCEEDED(result)) CoUninitialize(); }
     } comApartment;
     QEventLoop idleLoop;
+    QWinEventNotifier inputEvent(g_inputMonitor.event.load(), &idleLoop);
+    QObject::connect(&inputEvent, &QWinEventNotifier::activated, &idleLoop, [&](HANDLE handle) {
+        ResetEvent(handle);
+        idleLoop.quit();
+    });
     {
         std::lock_guard<std::mutex> lock(g_selectionWorkerLoopMutex);
         g_selectionWorkerLoop = &idleLoop;
@@ -1887,17 +2293,21 @@ void selectionWorkerLoop() {
         Runtime::PreloadRequest preloadRequest;
         std::string preloadScope;
         bool preloadRefresh = false;
+        bool inputRefresh = false;
+        bool inputStatusRefresh = false;
+        state::InputMonitorSettings inputSettings;
         {
             std::unique_lock<std::mutex> lock(g_runtime.selectionRequestMutex);
             while (!g_runtime.selectionWorkerStop && !g_runtime.selectionRequestPending &&
                    g_runtime.pendingTrackSelections.empty() && !g_runtime.trackContextRequestPending &&
-                   g_runtime.pendingPreloads.empty()) {
+                   g_runtime.pendingPreloads.empty() && !g_runtime.inputSelectionRequestPending &&
+                   !g_inputMonitor.statusChanged.load(std::memory_order_acquire)) {
                 lock.unlock();
                 idleLoop.exec();
                 lock.lock();
             }
             if (g_runtime.selectionWorkerStop && !g_runtime.selectionRequestPending &&
-                g_runtime.pendingTrackSelections.empty()) {
+                g_runtime.pendingTrackSelections.empty() && !g_runtime.inputSelectionRequestPending) {
                 std::lock_guard<std::mutex> loopLock(g_selectionWorkerLoopMutex);
                 g_selectionWorkerLoop = nullptr;
                 return;
@@ -1906,7 +2316,15 @@ void selectionWorkerLoop() {
             // track selection.  On a freshly opened score both requests can
             // arrive in the same maintenance turn; taking the selection
             // first used to find no TrackRuntime and silently drop it.
-            if (g_runtime.trackContextRequestPending) {
+            if (g_inputMonitor.statusChanged.exchange(false, std::memory_order_acq_rel)) {
+                inputStatusRefresh = true;
+            } else if (g_runtime.inputSelectionRequestPending) {
+                inputRefresh = true;
+                selection = g_runtime.pendingInputSelection;
+                inputSettings = g_runtime.pendingInputSettings;
+                generation = g_runtime.inputRequestGeneration;
+                g_runtime.inputSelectionRequestPending = false;
+            } else if (g_runtime.trackContextRequestPending) {
                 contextRefresh = true;
                 contextBindings = std::move(g_runtime.pendingBindings);
                 contextDiscovered = g_runtime.pendingDiscovered;
@@ -1932,10 +2350,74 @@ void selectionWorkerLoop() {
                 preloadRefresh = true;
             }
             g_runtime.selectionWorkerBusy.store(true, std::memory_order_release);
-            if (!contextRefresh && !preloadRefresh) {
+            if (!contextRefresh && !preloadRefresh && !inputRefresh && !inputStatusRefresh) {
                 g_runtime.selectionWorkerStartedNanoseconds.store(steadyNanoseconds(), std::memory_order_release);
                 g_runtime.selectionStatus.store(2, std::memory_order_release);
             }
+        }
+        if (inputStatusRefresh) {
+            if (g_inputMonitor.reconfigureRequested.exchange(false)) {
+                std::lock_guard<std::mutex> lock(g_runtime.selectionRequestMutex);
+                if (g_runtime.pendingInputSettings.mode == state::InputMonitorMode::LowLatencyOverlay) {
+                    g_runtime.inputSelectionRequestPending = true;
+                    ++g_runtime.inputRequestGeneration;
+                }
+            }
+            g_runtime.selectionWorkerBusy.store(false, std::memory_order_release);
+            if (const auto notifier = g_selectionNotifier.load(std::memory_order_acquire)) notifier();
+            continue;
+        }
+        if (inputRefresh) {
+            std::lock_guard<std::recursive_mutex> editorLock(g_runtime.editorMutex);
+            std::lock_guard<std::mutex> selectionLock(g_runtime.selectionMutex);
+            std::string error;
+            bool accepted = false;
+            try { accepted = configureIndependentInput(selection, inputSettings, generation, error); }
+            catch (...) { error = "input_prepare_exception"; }
+            if (!accepted && !error.empty()) {
+                const bool hostUnavailable = error == "input_host_contract_unavailable" ||
+                    error == "input_stream_capacity_exhausted_restart_required" ||
+                    error == "input_stream_callbacks_unsupported";
+                bool current = false;
+                {
+                    std::lock_guard<std::mutex> requestLock(g_runtime.selectionRequestMutex);
+                    current = generation == g_runtime.inputRequestGeneration;
+                    if (current) {
+                        const bool actuallySuppressed = g_inputMonitor.nativeSuppressed.load();
+                        if (inputSettings.mode == state::InputMonitorMode::LowLatencyOverlay && actuallySuppressed)
+                            g_inputMonitor.exchange.mute();
+                        else if (inputSettings.mode == state::InputMonitorMode::LowLatencyOverlay && hostUnavailable)
+                            g_inputMonitor.exchange.observe();
+                        else if (g_inputMonitor.exchange.watching()) {
+                            // Plugin preparation failure is terminal for this
+                            // request. Do not let an ordinary callback retry the
+                            // previous chain and erase its error or native route.
+                            if (g_inputMonitor.exchange.legacyFallback()) g_inputMonitor.exchange.legacy();
+                            else g_inputMonitor.exchange.off();
+                        }
+                        g_inputMonitor.error = error;
+                        g_inputMonitor.phase.store(actuallySuppressed ? 5 : 6);
+                        // Host rejection says nothing about the selected
+                        // plugins. Retain that intent for a later valid stream.
+                        g_runtime.pendingInputSelection = hostUnavailable ? selection : g_inputMonitor.desired;
+                    }
+                }
+                if (current && !hostUnavailable)
+                    for (const auto &entry : selection)
+                        if (!containsIdentity(g_inputMonitor.desired, entry)) {
+                            // The UI may enqueue a successful retry while this
+                            // worker waits for Qt. Check its generation on Qt,
+                            // immediately before the saved rejection is applied.
+                            invokeOnQtThreadBlocking([entry, error, generation] {
+                                std::lock_guard<std::mutex> requestLock(g_runtime.selectionRequestMutex);
+                                if (generation == g_runtime.inputRequestGeneration)
+                                    rejectSavedEntry(entry, error, state::ScopeKind::Input);
+                            });
+                        }
+            }
+            g_runtime.selectionWorkerBusy.store(false, std::memory_order_release);
+            if (const auto notifier = g_selectionNotifier.load(std::memory_order_acquire)) notifier();
+            continue;
         }
         if (contextRefresh) {
             refreshTrackContextWorkerImpl(std::move(contextBindings), contextDiscovered);
@@ -1976,7 +2458,7 @@ void selectionWorkerLoop() {
             // Hook installation and host object reads stay on Qt. Only plug-in
             // preparation and runtime publication belong to this worker.
             const bool prepared = selection.empty() ||
-                (trackKey.empty() ? g_runtime.master.installed : g_runtime.dsp.installed);
+                (trackKey.empty() ? g_runtime.master.ready() : g_runtime.dsp.ready());
             if (!prepared) prepareError = "hook_install_failed";
             std::lock_guard<std::mutex> lock(g_runtime.selectionMutex);
             bool stale = false;
@@ -2082,6 +2564,11 @@ void selectionWorkerLoop() {
 void startSelectionWorker() {
     std::lock_guard<std::mutex> lock(g_runtime.selectionRequestMutex);
     if (g_runtime.selectionWorker.joinable()) return;
+    if (!g_inputMonitor.event.load()) {
+        // Keep this process-lifetime event alive even across worker shutdown;
+        // a callback may have loaded its handle immediately before retiring.
+        g_inputMonitor.event.store(CreateEventW(nullptr, TRUE, FALSE, nullptr));
+    }
     g_runtime.selectionWorkerStop = false;
     g_runtime.selectionWorker = std::thread(selectionWorkerLoop);
 }
@@ -2091,6 +2578,8 @@ void stopSelectionWorker() noexcept {
         std::lock_guard<std::mutex> lock(g_runtime.selectionRequestMutex);
         if (!g_runtime.selectionWorker.joinable()) return;
         g_runtime.selectionWorkerStop = true;
+        g_runtime.inputSelectionRequestPending = false;
+        ++g_runtime.inputRequestGeneration;
         g_runtime.selectionRequestPending = false;
         g_runtime.pendingSelection.clear();
         g_runtime.pendingTrackSelections.clear();
@@ -2248,7 +2737,7 @@ void refreshTrackContextWorkerImpl(std::vector<gp_audio::Binding> bindings,
     // Before the first enable, publish scope metadata without entering a
     // plug-in. Qt still has to install the hooks in prepare(), which takes
     // editorMutex; a worker holding it while waiting for Qt would deadlock.
-    const bool hooksInstalled = g_runtime.master.installed && g_runtime.dsp.installed;
+    const bool hooksInstalled = g_runtime.master.ready() && g_runtime.dsp.ready();
     if (hooksInstalled && !g_runtime.projectGlobalRestored && haveSelectedBinding &&
         qEnvironmentVariable("GPVST3_DISABLE_PROJECT_RESTORE") != "1") {
         const auto desiredGlobal = enabledSelectionFromScope(state::ScopeKind::Global);
@@ -2699,7 +3188,7 @@ bool inputFeatureEnabled() noexcept {
 bool configureInputSelection(const std::vector<Vst3SelectionEntry> &selection,
                              std::string *error) noexcept {
     if (error) error->clear();
-    if (!g_runtime.stream.installed || !inputFeatureEnabled()) return true;
+    if (!g_runtime.stream.ready() || !inputFeatureEnabled()) return true;
 
     // Stop accepting new input blocks, then wait for the callback currently
     // inside the router before replacing its processor/context pointers.
@@ -2944,69 +3433,62 @@ void scoreSwapTracksHook(void *self, unsigned first, unsigned second) {
 }
 
 
-void writeJump(std::uint8_t *bytes, const void *destination) noexcept {
-    bytes[0] = 0x48;
-    bytes[1] = 0xB8;
-    const auto address = reinterpret_cast<std::uint64_t>(destination);
-    std::memcpy(bytes + 2, &address, sizeof(address));
-    bytes[10] = 0xFF;
-    bytes[11] = 0xE0;
-}
-
 bool install(Patch &patch, void *target, void *detour, const std::uint8_t *expected,
              std::size_t size, std::size_t tailJumpOffset = 0) noexcept {
-    if (!target || !detour || !expected || patch.installed || size < 12 ||
-        size > sizeof(patch.original) ||
+    if (patch.restartRequired) return false;
+    if (patch.installed) return patch.target == target && patch.ready();
+    Q_UNUSED(tailJumpOffset);
+    if (!target || !detour || !expected || size < 5 || size > sizeof(patch.original) ||
         std::memcmp(target, expected, size) != 0) return false;
-    auto *trampoline = static_cast<std::uint8_t *>(VirtualAlloc(nullptr, size + 12,
-        MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE));
-    if (!trampoline) return false;
-    std::memcpy(patch.original, target, size);
-    std::memcpy(trampoline, target, size);
-    if (tailJumpOffset != 0) {
-        // Only the two exact hash/prologue-locked Score tail wrappers use
-        // relocation. Expand their rel32 jump to an absolute jump; never
-        // copy a position-dependent instruction into the trampoline.
-        if (tailJumpOffset + 5 > size || expected[tailJumpOffset] != 0xE9) {
-            VirtualFree(trampoline, 0, MEM_RELEASE);
-            return false;
-        }
-        std::int32_t displacement = 0;
-        std::memcpy(&displacement, expected + tailJumpOffset + 1, sizeof(displacement));
-        writeJump(trampoline + tailJumpOffset,
-            static_cast<std::uint8_t *>(target) + tailJumpOffset + 5 + displacement);
-    } else writeJump(trampoline + size, static_cast<std::uint8_t *>(target) + size);
-    FlushInstructionCache(GetCurrentProcess(), trampoline, size + 12);
-    DWORD protection = 0;
-    if (!VirtualProtect(target, size, PAGE_EXECUTE_READWRITE, &protection)) {
-        VirtualFree(trampoline, 0, MEM_RELEASE);
-        return false;
+    // Retained lifecycle hooks and callbacks can outlive Qt's plugin owner.
+    // Keep their code and every trampoline valid until process exit.
+    HMODULE pinned = nullptr;
+    if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_PIN,
+            reinterpret_cast<LPCWSTR>(detour), &pinned)) return false;
+    const auto initialized = MH_Initialize();
+    if (initialized != MH_OK && initialized != MH_ERROR_ALREADY_INITIALIZED) return false;
+    if (!patch.managed) {
+        if (MH_CreateHook(target, detour, &patch.trampoline) != MH_OK) return false;
+        patch.target = target;
+        patch.size = size;
+        patch.managed = true;
+        std::memcpy(patch.original, expected, size);
+    } else if (patch.target != target) return false;
+    MH_STATUS status = MH_ERROR_THREAD_BUSY;
+    for (int attempt = 0; attempt < 16 && status == MH_ERROR_THREAD_BUSY; ++attempt) {
+        status = MH_EnableHooksStrict(&target, 1);
+        if (status == MH_ERROR_THREAD_BUSY) std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
-    // Publish the original destination before making the entry point callable.
-    patch.target = target;
-    patch.trampoline = trampoline;
-    patch.size = size;
-    writeJump(static_cast<std::uint8_t *>(target), detour);
-    std::memset(static_cast<std::uint8_t *>(target) + 12, 0x90, size - 12);
-    FlushInstructionCache(GetCurrentProcess(), target, size);
-    DWORD unused = 0;
-    VirtualProtect(target, size, protection, &unused);
-    patch.installed = true;
-    return true;
+    BOOL enabled = FALSE;
+    const auto queried = MH_IsHookEnabled(target, &enabled);
+    if (queried == MH_OK) patch.installed = enabled != FALSE;
+    patch.lastStatus = status == MH_OK ? queried : status;
+    patch.restartRequired = queried != MH_OK || status == MH_ERROR_PATCH_ROLLBACK ||
+        status == MH_ERROR_THREAD_RESUME;
+    // A late OS failure can leave complete detours installed. Keep that actual
+    // state for retirement, but never turn the failed installation into success.
+    return patch.ready();
 }
 
 void remove(Patch &patch) noexcept {
     if (!patch.installed) return;
-    DWORD protection = 0;
-    if (!VirtualProtect(patch.target, patch.size, PAGE_EXECUTE_READWRITE, &protection)) return;
-    std::memcpy(patch.target, patch.original, patch.size);
-    FlushInstructionCache(GetCurrentProcess(), patch.target, patch.size);
-    DWORD unused = 0;
-    VirtualProtect(patch.target, patch.size, protection, &unused);
-    patch.installed = false;
-    patch.size = 0;
-    // An audio call may still be returning through this trampoline. Its tiny
-    // allocation is retained until process exit instead of freeing live code.
+    if (patch.managed) {
+        MH_STATUS status = MH_ERROR_THREAD_BUSY;
+        for (int attempt = 0; attempt < 16 && status == MH_ERROR_THREAD_BUSY; ++attempt) {
+            status = MH_DisableHooksStrict(&patch.target, 1);
+            if (status == MH_ERROR_THREAD_BUSY) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        BOOL enabled = FALSE;
+        const auto queried = MH_IsHookEnabled(patch.target, &enabled);
+        if (queried == MH_OK) patch.installed = enabled != FALSE;
+        patch.lastStatus = status == MH_OK ? queried : status;
+        patch.restartRequired = patch.restartRequired || queried != MH_OK ||
+            status == MH_ERROR_PATCH_ROLLBACK || status == MH_ERROR_THREAD_RESUME;
+        // Preflight/flush failure keeps detours, but a late protection/resume
+        // failure may have disabled them. Track state independently of success.
+        // Never free trampoline code while an earlier call may return into it.
+        return;
+    }
 }
 
 EntryPointObservation observe(HMODULE module, const char *symbol) noexcept {
@@ -3020,6 +3502,78 @@ EntryPointObservation observe(HMODULE module, const char *symbol) noexcept {
 
 void refreshTrackContext() noexcept {
     refreshTrackContextImpl();
+}
+
+bool installListenerProbe() noexcept {
+    auto &patch = g_runtime.listenerProbe;
+    if (patch.installed) return true;
+    const auto *base = reinterpret_cast<const std::uint8_t *>(GetModuleHandleW(nullptr));
+    constexpr std::uint8_t prologue[]{0x48, 0x89, 0x5C, 0x24, 0x18,
+        0x55, 0x56, 0x57, 0x41, 0x54, 0x41, 0x55};
+    auto *original = const_cast<std::uint8_t *>(base + 0x4FDBD0);
+    auto *slot = reinterpret_cast<void *volatile *>(const_cast<std::uint8_t *>(base + 0x25ABB00));
+    if (std::memcmp(original, prologue, sizeof(prologue)) != 0 ||
+        reinterpret_cast<std::uintptr_t>(slot) % alignof(void *) != 0) return false;
+    DWORD protection = 0;
+    if (!VirtualProtect(const_cast<void **>(slot), sizeof(void *), PAGE_READWRITE, &protection))
+        return false;
+    // The listener is already called by the device thread. A single aligned
+    // pointer exchange permits both old and new calls without patching live
+    // instructions. Publish the permanent original before exposing the hook.
+    patch.target = const_cast<void **>(slot);
+    patch.trampoline = original;
+    g_listenerExecutableBase = base;
+    const auto previous = InterlockedCompareExchangePointer(slot,
+        reinterpret_cast<void *>(&listenerProbeHook), original);
+    DWORD unused = 0;
+    VirtualProtect(patch.target, sizeof(void *), protection, &unused);
+    patch.installed = previous == original;
+    return patch.installed;
+}
+
+#ifdef GPVST3_P13_PROBE_BUILD
+bool installRseProbe() noexcept {
+    auto &patch = g_runtime.rseProbe;
+    if (patch.installed) return true;
+    const auto *base = reinterpret_cast<const std::uint8_t *>(GetModuleHandleW(L"GPRSE.dll"));
+    if (!base) return false;
+    constexpr std::uint8_t prologue[]{0x4C, 0x89, 0x4C, 0x24, 0x20, 0x55, 0x53, 0x56};
+    auto *original = const_cast<std::uint8_t *>(base + 0x492B0);
+    auto *slot = reinterpret_cast<void *volatile *>(const_cast<std::uint8_t *>(base + 0x23ADA0));
+    if (std::memcmp(original, prologue, sizeof(prologue)) != 0 ||
+        reinterpret_cast<std::uintptr_t>(slot) % alignof(void *) != 0) return false;
+    DWORD protection = 0;
+    if (!VirtualProtect(const_cast<void **>(slot), sizeof(void *), PAGE_READWRITE, &protection)) return false;
+    g_rseProbeBase = base;
+    patch.target = const_cast<void **>(slot);
+    patch.trampoline = original;
+    const auto previous = InterlockedCompareExchangePointer(slot,
+        reinterpret_cast<void *>(&rseProbeHook), original);
+    DWORD unused = 0;
+    VirtualProtect(patch.target, sizeof(void *), protection, &unused);
+    patch.installed = previous == original;
+    return patch.installed;
+}
+
+#endif
+
+void removeProbeSlot(Patch &patch, void *hook) noexcept {
+    if (!patch.installed) return;
+    DWORD protection = 0;
+    if (!VirtualProtect(patch.target, sizeof(void *), PAGE_READWRITE, &protection)) return;
+    const auto previous = InterlockedCompareExchangePointer(
+        static_cast<void *volatile *>(patch.target), patch.trampoline,
+        hook);
+    DWORD unused = 0;
+    VirtualProtect(patch.target, sizeof(void *), protection, &unused);
+    if (previous == hook) patch.installed = false;
+    // In-flight hooks keep using the permanent original address.
+}
+void removeListenerProbe() noexcept {
+    removeProbeSlot(g_runtime.listenerProbe, reinterpret_cast<void *>(&listenerProbeHook));
+#ifdef GPVST3_P13_PROBE_BUILD
+    removeProbeSlot(g_runtime.rseProbe, reinterpret_cast<void *>(&rseProbeHook));
+#endif
 }
 
 bool editorCallbackActive() noexcept {
@@ -3053,6 +3607,10 @@ State prepare(const host::Verification &verification, bool enableForSelection) n
     const auto gprse = GetModuleHandleW(L"GPRSE.dll");
     const auto amaudio = GetModuleHandleW(L"AMAudio.dll");
     g_runtime.audioModule = amaudio;
+#ifdef GPVST3_P13_PROBE_BUILD
+    // Called only after the complete host hash gate, before callback install.
+    configureInputProbe();
+#endif
     result.masterProcess = observe(gprse, kMasterProcess);
     result.effectsChainProcessDsp = observe(gprse, kEffectsChainProcessDsp);
     g_runtime.effectsChainIndex = reinterpret_cast<EffectsChainIndexFn>(GetProcAddress(gprse, kEffectsChainIndex));
@@ -3132,6 +3690,16 @@ State prepare(const host::Verification &verification, bool enableForSelection) n
         install(
             g_runtime.stream, streamTarget, reinterpret_cast<void *>(&streamCallbackHook),
             kStreamPrologue, kStreamPatchBytes);
+#ifdef GPVST3_P13_PROBE_BUILD
+        if (g_listenerProbeRequested) {
+            g_listenerProbeInstalled = installListenerProbe();
+        }
+        if (g_drainProbeRequested || g_overlayProbeRequested)
+            g_rseProbeInstalled.store(installRseProbe(), std::memory_order_release);
+        if (qEnvironmentVariable("GPVST3_P13_STREAM_PROBE") == "1" && asioprobe::install(amaudio) &&
+            qEnvironmentVariable("GPVST3_P13_RESTART_STREAM") == "1")
+            asioprobe::requestNativeReset();
+#endif
         result.installed = master && dsp;
         if (!result.installed) {
             remove(g_runtime.master);
@@ -3142,6 +3710,8 @@ State prepare(const host::Verification &verification, bool enableForSelection) n
             remove(g_runtime.scoreCreateTrack);
             remove(g_runtime.scoreSwapTracks);
             remove(g_runtime.stream);
+            removeListenerProbe();
+            g_listenerProbeInstalled = false;
         }
         if (result.installed && result.runtimeEffectEnabled) {
             result.runtimeProcessorReady = configureRuntimeChain();
@@ -3280,8 +3850,8 @@ State snapshot() noexcept {
         result.editorIdentity = g_runtime.editorIdentity;
         result.editorError = g_runtime.editorError;
     }
-    result.installed = g_runtime.master.installed && g_runtime.dsp.installed;
-    result.audioOutputCallbackInstalled = g_runtime.stream.installed;
+    result.installed = g_runtime.master.ready() && g_runtime.dsp.ready();
+    result.audioOutputCallbackInstalled = g_runtime.stream.ready();
     result.audioOutputObserved = g_runtime.outputObserved.load(std::memory_order_acquire);
     result.audioOutputWritebackObserved =
         g_runtime.outputWriteObserved.load(std::memory_order_acquire);
@@ -3531,8 +4101,8 @@ State snapshot() noexcept {
 
 bool configureSelectedChain(const std::vector<Vst3SelectionEntry> &selection, std::string *error) noexcept {
     if (error) error->clear();
-    if (!g_runtime.master.installed || selection.size() > SelectionSlot::kMaxEffects) {
-        if (error) *error = !g_runtime.master.installed ? "hook_install_failed" : "runtime_vst3_chain_full";
+    if (!g_runtime.master.ready() || selection.size() > SelectionSlot::kMaxEffects) {
+        if (error) *error = !g_runtime.master.ready() ? "hook_install_failed" : "runtime_vst3_chain_full";
         return false;
     }
     const auto rate = callbackSampleRate();
@@ -3643,6 +4213,14 @@ void shutdown() noexcept {
     g_qtDispatchStopping.store(true, std::memory_order_release);
     g_trackTopologyInvalidated.store(false, std::memory_order_release);
     stopSelectionWorker();
+    g_inputMonitor.exchange.off();
+    for (int index = 0; index < 2; ++index) {
+        while (!g_inputMonitor.exchange.writable(index)) std::this_thread::yield();
+        g_inputMonitor.monitorSlots[index].selection.shutdown();
+        g_inputMonitor.monitorSlots[index].pool.effects.clear();
+    }
+    g_inputMonitor.retained = -1;
+    g_inputMonitor.nativeSuppressed.store(false);
     std::lock_guard<std::recursive_mutex> editorLock(g_runtime.editorMutex);
     const auto openEditor = std::atomic_exchange(&g_openEditorEffect, std::shared_ptr<RuntimeEffect>{});
     if (openEditor) {
@@ -3675,6 +4253,8 @@ void shutdown() noexcept {
     g_runtime.outputFirstBuffer.store(0, std::memory_order_relaxed);
     g_runtime.outputLastBuffer.store(0, std::memory_order_relaxed);
     remove(g_runtime.stream);
+    removeListenerProbe();
+    g_listenerProbeInstalled = false;
     remove(g_runtime.dsp);
     remove(g_runtime.master);
     remove(g_runtime.cursorMove);
@@ -3762,22 +4342,801 @@ std::uint64_t outputHash(const void *output, unsigned long frames) noexcept {
     return hash;
 }
 
+bool readDrainProbeSnapshot(void *owner, unsigned long frames,
+                            input::drainprobe::Snapshot &snapshot) noexcept {
+    const auto identity = asioprobe::currentCallback();
+    portaudio::Configuration config;
+    if (!identity.rateValidated || identity.actualRate != 192000 || !owner ||
+        frames == 0 || frames > portaudio::kMaxFrames ||
+        !portaudio::configuration(g_runtime.audioModule, owner, config) ||
+        config.sampleRate != 44100 || config.outputChannels != 2) return false;
+    const auto *stream = portaudio::read<const void *>(owner, 8);
+    const auto *base = static_cast<const std::uint8_t *>(g_runtime.audioModule);
+    if (!stream || stream != portaudio::read<const void *>(base, 0x2F2620) ||
+        portaudio::read<const void *>(stream, 0x28) != owner ||
+        portaudio::read<std::uint32_t>(stream, 0x178) != frames) return false;
+    const auto *streamInterface = portaudio::read<const void *>(stream, 0x10);
+    if (!streamInterface || portaudio::read<const void *>(streamInterface, 0) != base + 0x6DF60 ||
+        portaudio::read<const void *>(streamInterface, 8) != base + 0x6FE90 ||
+        portaudio::read<const void *>(streamInterface, 16) != base + 0x700A0) return false;
+    return input::drainprobe::readSnapshot(base, owner,
+        {identity.generation, identity.generation, identity.rateRevision,
+         identity.actualRate, identity.rateValidated}, snapshot);
+}
+
+#ifdef GPVST3_P13_PROBE_BUILD
+void observeDrainSource(const float *input, const void *format, std::int64_t frames) noexcept {
+    auto *r = g_currentDrainRecord;
+    if (!r) return;
+    ++r->sourceObserverCalls;
+    const auto *base = static_cast<const std::uint8_t *>(g_runtime.audioModule);
+    const auto *parent = portaudio::read<const void *>(r->before.owner, 0);
+    r->parentGain = parent ? portaudio::read<float>(parent, 0x5C) : 0;
+    if (!input || format != base + 0x2507E8 || frames <= 0 || frames > 32768 ||
+        r->rseCalls == 0 || r->rseRequestedFrames != frames || !parent ||
+        portaudio::read<const void *>(parent, 0) != base + 0x18F7D8 || r->parentGain != 1.0f ||
+        portaudio::read<std::uint8_t>(parent, 0x60) != 0) { r->rseValid = false; return; }
+    for (std::size_t i = 0; i < std::size_t(frames) * 2; ++i) {
+        ++r->rseComparedSamples;
+        if (!std::isfinite(input[i]) || !std::isfinite(g_drainRseSum[i])) { r->rseValid = false; continue; }
+        if (std::memcmp(input + i, g_drainRseSum.data() + i, sizeof(float)) != 0) ++r->rseMismatchSamples;
+        r->rseEnergy += double(g_drainRseSum[i]) * g_drainRseSum[i];
+    }
+}
+
+std::int64_t rseProbeHook(void *self, const float *input, std::uint32_t inputChannels,
+    float *output, std::uint32_t outputChannels, std::int64_t frames, const void *timePoint) {
+    using Fill = std::int64_t (*)(void *, const float *, std::uint32_t, float *,
+        std::uint32_t, std::int64_t, const void *);
+    const auto original = reinterpret_cast<Fill>(g_runtime.rseProbe.trampoline);
+    const auto result = original(self, input, inputChannels, output, outputChannels, frames, timePoint);
+    auto *r = g_currentDrainRecord;
+    if (!r) return result;
+    ++r->rseCalls;
+    if (!self || !output || inputChannels != 2 || outputChannels != 2 || frames <= 0 || frames > 32768 ||
+        result < 0 || result > frames || portaudio::read<const void *>(self, 0) != g_rseProbeBase + 0x23AD98) {
+        r->rseValid = false;
+        return result;
+    }
+    if (r->rseCalls == 1) {
+        r->rseRequestedFrames = frames;
+        std::fill_n(g_drainRseSum.data(), std::size_t(frames) * 2, 0.0f);
+    } else if (r->rseRequestedFrames != frames) { r->rseValid = false; return result; }
+    for (std::size_t i = 0; i < std::size_t(result) * 2; ++i) {
+        if (!std::isfinite(output[i])) r->rseValid = false;
+        g_drainRseSum[i] += output[i];
+    }
+    return result;
+}
+
+class DrainProbeScope final {
+public:
+    DrainProbeScope(void *owner, unsigned long frames, std::uint64_t sequence, unsigned long status) noexcept
+        : owner_(owner), previous_(g_currentDrainRecord) {
+        if ((!g_drainProbeRequested && !g_overlayProbeRequested) || g_drainProbeCount.load(std::memory_order_acquire) >= kDrainProbeCapacity ||
+            steadyNanoseconds() < g_inputProbeStart) return;
+        // Start on the first actually suppressed production callback. This
+        // observer never requests a mode change or changes the native route.
+        if (g_overlayTransitionProbe && !g_inputMonitor.nativeSuppressed.load(std::memory_order_acquire)) return;
+        if (g_drainProbeBusy.test_and_set(std::memory_order_acquire)) {
+            g_drainProbeOverlaps.fetch_add(1, std::memory_order_relaxed);
+            return;
+        }
+        held_ = true;
+        index_ = g_drainProbeCount.load(std::memory_order_relaxed);
+        if (index_ >= kDrainProbeCapacity) return;
+        record_ = &g_drainProbeRecords[index_].record;
+        record_->sequence = sequence;
+        record_->timestamp = steadyNanoseconds();
+        record_->frames = static_cast<std::uint32_t>(frames);
+        record_->thread = GetCurrentThreadId();
+        record_->statusFlags = status;
+        record_->valid = g_rseProbeInstalled.load(std::memory_order_acquire) &&
+            readDrainProbeSnapshot(owner_, frames, record_->before);
+        if (record_->valid && !g_overlayProbeRequested) {
+            record_->srcObserved = asioprobe::beginOutputSrc(
+                record_->before.outputSrc, &observeDrainSource);
+            record_->valid = record_->srcObserved;
+        }
+        if (record_->valid) g_currentDrainRecord = record_;
+    }
+    ~DrainProbeScope() {
+        if (record_ && record_->srcObserved) asioprobe::finishOutputSrc();
+        g_currentDrainRecord = previous_;
+        if (held_) g_drainProbeBusy.clear(std::memory_order_release);
+    }
+    void finish(int result, const float *output) noexcept {
+        if (!record_) return;
+        auto &r = *record_;
+        r.originalResult = result;
+        if (r.srcObserved) r.src = asioprobe::finishOutputSrc();
+        r.srcObserved = false;
+        const bool afterValid = readDrainProbeSnapshot(owner_, r.frames, r.after);
+        r.valid = r.valid && afterValid && result == 0 && output && r.statusFlags == 0 &&
+            input::drainprobe::sameTopology(r.before, r.after) &&
+            input::drainprobe::consumedSamples(r.before, r.after, r.frames, r.consumed) &&
+            r.src.calls <= 1 && r.src.inputFrames >= 0 && r.src.outputFrames >= 0 &&
+            r.listenerValid && r.listenerCalls == r.listenerSunk &&
+            // This binary calls the listener once before each output SRC.
+            r.listenerCalls == r.src.calls && g_drainProbeOverlaps.load(std::memory_order_relaxed) == 0;
+        if (r.valid && output) {
+            for (std::size_t i = 0; i < std::size_t(r.frames) * 2; ++i) {
+                if (std::isfinite(output[i])) r.outputEnergy += double(output[i]) * output[i];
+                else ++r.nonFiniteSamples;
+            }
+        }
+        r.valid = r.valid && r.nonFiniteSamples == 0 && r.callerChangedSamples == 0 &&
+            r.rseValid && r.rseMismatchSamples == 0 && r.sourceObserverCalls == r.src.calls;
+        if (g_overlayProbeRequested) {
+            if (g_overlayTransitionProbe && r.valid && !r.overlayCommitted && output &&
+                r.frames > 0 && r.frames <= portaudio::kMaxFrames) {
+                for (std::size_t i = 0; i < std::size_t(r.frames) * 2; ++i) {
+                    ++r.overlayComparedSamples;
+                    if (std::memcmp(output + i, g_overlayProbeBefore.data() + i, sizeof(float))) ++r.overlayMismatchSamples;
+                }
+            }
+            r.valid = r.valid && r.overlaySuppressed &&
+                (r.overlayCommitted || (g_overlayTransitionProbe && r.productionDrain.state == input::drain::State::Preparing)) &&
+                r.overlayComparedSamples == r.frames * 2 && r.overlayMismatchSamples == 0;
+        }
+        if (index_ == 0) {
+            if (!r.valid || !g_drainTracker.configure(r.before.config)) g_drainProbeInvalid = true;
+        } else {
+            const auto &first = g_drainProbeRecords[0].record;
+            if (r.thread != first.thread || !input::drainprobe::sameTopology(first.before, r.before)) r.valid = false;
+        }
+        if (!r.valid) g_drainProbeInvalid = true;
+        // Retrospective observation only. This experiment never publishes an
+        // overlay; Ready records the first eligible future callback boundary.
+        if (!g_drainProbeInvalid) {
+            bool okay = g_drainTracker.beginCallback(r.before.config, r.sequence,
+                r.frames, r.before.ring.queued, true);
+            if (okay && r.src.calls) okay = g_drainTracker.srcCompleted(
+                static_cast<std::uint64_t>(r.src.inputFrames), static_cast<std::uint64_t>(r.src.outputFrames));
+            if (okay) okay = g_drainTracker.endCallback(r.after.config, r.after.ring.queued, r.consumed);
+            if (!okay) g_drainProbeInvalid = true;
+        }
+        r.drain = g_drainTracker.snapshot();
+        if (g_overlayTransitionProbe)
+            r.valid = r.valid && r.productionDrain.state == r.drain.state &&
+                r.productionDrain.phase == r.drain.phase &&
+                r.overlayCommitted == (r.drain.state == input::drain::State::Ready);
+        r.valid = r.valid && !g_drainProbeInvalid;
+        r.ended = steadyNanoseconds();
+        g_currentDrainRecord = previous_;
+        g_drainProbeRecords[index_].published.store(true, std::memory_order_release);
+        g_drainProbeCount.store(index_ + 1, std::memory_order_release);
+        record_ = nullptr;
+    }
+private:
+    void *owner_ = nullptr;
+    DrainProbeRecord *previous_ = nullptr, *record_ = nullptr;
+    std::size_t index_ = 0;
+    bool held_ = false;
+};
+
+#endif
+
+struct MonitorAudioState {
+    input::drain::Tracker tracker;
+    input::drainprobe::Snapshot initial;
+    std::uint64_t token = 0, slotToken = 0;
+    std::uint64_t requestedGeneration = 0, requestedRevision = 0;
+    std::uint64_t suppressedGeneration = 0, suppressedRevision = 0;
+    bool configured = false, faulted = false;
+    std::array<float, portaudio::kMaxFrames * 2> capture{};
+    std::array<float, 32768 * 2> sink{};
+} g_monitorAudio;
+
+class MonitorCallback final {
+public:
+    MonitorCallback(const void *capture, void *output, unsigned long frames,
+                    void *owner, std::uint64_t sequence, unsigned long status) noexcept
+        : output_(output), owner_(owner), frames_(frames), sequence_(sequence) {
+        g_inputMonitor.exchange.acquire(lease_);
+        requested_ = lease_.suppressNative();
+        if (!requested_ && !lease_.watchStream()) return;
+        held_ = !g_inputMonitor.processing.test_and_set(std::memory_order_acquire);
+        suppress_ = requested_ && g_inputMonitor.nativeSuppressed.load(std::memory_order_acquire);
+        if (!held_) {
+            if (requested_) g_inputMonitor.errors.fetch_add(1);
+            return;
+        }
+        const auto identity = asioprobe::currentCallback();
+        // A suppression decision belongs to one validated native stream.
+        // An unwrapped/new/invalidated stream may have different objects and
+        // topology; it must not inherit the previous stream's listener sink.
+        suppress_ = suppress_ && identity.rateValidated &&
+            identity.generation == g_monitorAudio.suppressedGeneration &&
+            identity.rateRevision == g_monitorAudio.suppressedRevision;
+        g_inputMonitor.nativeSuppressed.store(suppress_, std::memory_order_release);
+        if (lease_.index() >= 0) slot_ = &g_inputMonitor.monitorSlots[lease_.index()];
+        const bool changedStream = slot_ ? (identity.generation != slot_->generation ||
+            identity.rateRevision != slot_->revision || identity.actualRate != slot_->rate) :
+            (identity.generation != g_monitorAudio.suppressedGeneration ||
+             identity.rateRevision != g_monitorAudio.suppressedRevision);
+        if (identity.rateValidated && changedStream &&
+            (identity.generation != g_monitorAudio.requestedGeneration ||
+             identity.rateRevision != g_monitorAudio.requestedRevision)) {
+            g_monitorAudio.requestedGeneration = identity.generation;
+            g_monitorAudio.requestedRevision = identity.rateRevision;
+            g_inputMonitor.reconfigureRequested.store(true);
+            g_inputMonitor.statusChanged.store(true);
+            if (const auto handle = g_inputMonitor.event.load()) SetEvent(handle);
+        }
+        if (!slot_) return;
+        portaudio::Configuration captureConfig;
+        configurationRejected_ = !(capture && output && frames > 0 && frames <= portaudio::kMaxFrames &&
+            identity.rateValidated && identity.generation == slot_->generation &&
+            identity.rateRevision == slot_->revision && identity.actualRate == slot_->rate &&
+            portaudio::configuration(g_runtime.audioModule, owner, captureConfig) &&
+            captureConfig.inputChannels >= 1 && captureConfig.inputChannels <= 2 &&
+            readDrainProbeSnapshot(owner, frames, before_));
+        valid_ = !configurationRejected_ && status == 0;
+        if (!valid_) return;
+        inputChannels_ = captureConfig.inputChannels;
+        before_.config.epoch = g_monitorAudio.token;
+        for (std::size_t i = 0; i < std::size_t(frames) * inputChannels_; ++i) {
+            const auto sample = static_cast<const float *>(capture)[i];
+            if (!std::isfinite(sample)) { valid_ = false; return; }
+            g_monitorAudio.capture[i] = sample;
+        }
+        if (g_monitorAudio.slotToken != lease_.token()) {
+            const bool continuous = suppress_ && g_monitorAudio.configured && !g_monitorAudio.faulted &&
+                input::drainprobe::sameTopology(g_monitorAudio.initial, before_);
+            g_monitorAudio.slotToken = lease_.token();
+            if (!continuous) {
+                g_monitorAudio.tracker.~Tracker();
+                new (&g_monitorAudio.tracker) input::drain::Tracker;
+                g_inputMonitor.callbackFault.store(0);
+                g_inputMonitor.listenerFaultFlags.store(0);
+                g_monitorAudio.token = lease_.token();
+                before_.config.epoch = g_monitorAudio.token;
+                g_monitorAudio.initial = before_;
+                g_monitorAudio.configured = g_monitorAudio.tracker.configure(before_.config);
+                g_monitorAudio.faulted = !g_monitorAudio.configured;
+            }
+        }
+        valid_ = g_monitorAudio.configured && !g_monitorAudio.faulted &&
+            input::drainprobe::sameTopology(g_monitorAudio.initial, before_) &&
+            g_monitorAudio.tracker.beginCallback(before_.config, sequence, frames, before_.ring.queued, true);
+        if (!valid_) return;
+        failureStage_ = 2;
+        observing_ = asioprobe::beginOutputSrc(before_.outputSrc
+#ifdef GPVST3_P13_PROBE_BUILD
+            , g_overlayProbeRequested ? &observeDrainSource : nullptr
+#endif
+        );
+        valid_ = observing_;
+        if (valid_) {
+            failureStage_ = 3;
+            suppress_ = true;
+            g_monitorAudio.suppressedGeneration = identity.generation;
+            g_monitorAudio.suppressedRevision = identity.rateRevision;
+            g_inputMonitor.nativeSuppressed.store(true, std::memory_order_release);
+            g_inputMonitor.actualRate.store(static_cast<int>(slot_->rate));
+            g_inputMonitor.frames.store(frames);
+            g_inputMonitor.driverFrames.store(portaudio::read<std::uint32_t>(before_.stream, 0x178));
+            g_inputMonitor.channels.store(inputChannels_);
+            g_inputMonitor.configurationToken.store(lease_.token(), std::memory_order_release);
+        }
+    }
+    ~MonitorCallback() {
+        if (observing_) asioprobe::finishOutputSrc();
+        if (held_) g_inputMonitor.processing.clear(std::memory_order_release);
+    }
+    bool suppress() const noexcept { return suppress_; }
+    bool requested() const noexcept { return requested_; }
+    bool legacy() const noexcept { return lease_.legacy(); }
+    bool ownsSink() const noexcept { return held_; }
+    void listener(bool valid) noexcept { ++listenerCalls_; listenerValid_ &= valid; }
+    void finish(int result) noexcept {
+        if (!requested_) {
+            if (g_inputMonitor.exchange.current(lease_.token()))
+                g_inputMonitor.nativeSuppressed.store(false, std::memory_order_release);
+            return;
+        }
+        if (!held_) return;
+        if (!slot_) {
+            // An explicitly empty chain (or a failed preparation after prior
+            // activation) is a valid muted configuration, not a per-block DSP
+            // error. Its unobserved drain history cannot be reused on resume.
+            g_monitorAudio.configured = false;
+            g_inputMonitor.publishCallbackPhase(lease_.token(), suppress_ ? 5 : 6);
+            return;
+        }
+        asioprobe::SrcObservation src;
+        if (observing_) { src = asioprobe::finishOutputSrc(); observing_ = false; }
+#ifdef GPVST3_P13_PROBE_BUILD
+        if (g_overlayProbeRequested && g_currentDrainRecord) {
+            g_currentDrainRecord->src = src;
+            g_currentDrainRecord->monitorToken = lease_.token();
+            g_currentDrainRecord->overlaySuppressed = suppress_ && held_;
+        }
+#endif
+        observedSrcCalls_ = src.calls;
+        input::drainprobe::Snapshot after;
+        std::uint64_t consumed = 0;
+        if (!valid_) { fail(); return; }
+        if (result != 0) { failureStage_ = 4; fail(); return; }
+        if (!listenerValid_) { failureStage_ = 5; fail(); return; }
+        if (listenerCalls_ != src.calls) { failureStage_ = 12; fail(); return; }
+        if (src.calls > 1 || src.inputFrames < 0 || src.outputFrames < 0) { failureStage_ = 6; fail(); return; }
+        if (!readDrainProbeSnapshot(owner_, frames_, after)) {
+            configurationRejected_ = true;
+            failureStage_ = 7; fail(); return;
+        }
+        after.config.epoch = g_monitorAudio.token;
+        if (!input::drainprobe::sameTopology(before_, after) ||
+            !input::drainprobe::consumedSamples(before_, after, frames_, consumed)) {
+            configurationRejected_ = true;
+            failureStage_ = 8; fail(); return;
+        }
+        if (src.calls && !g_monitorAudio.tracker.srcCompleted(
+                static_cast<std::uint64_t>(src.inputFrames), static_cast<std::uint64_t>(src.outputFrames))) {
+            failureStage_ = 9; fail(); return;
+        }
+        if (!g_monitorAudio.tracker.endCallback(after.config, after.ring.queued, consumed)) {
+            failureStage_ = 10; fail(); return;
+        }
+#ifdef GPVST3_P13_PROBE_BUILD
+        if (g_overlayProbeRequested && g_currentDrainRecord)
+            g_currentDrainRecord->productionDrain = g_monitorAudio.tracker.snapshot();
+#endif
+        if (g_monitorAudio.tracker.snapshot().state != input::drain::State::Ready) {
+            g_inputMonitor.publishCallbackPhase(lease_.token(), 3);
+            return;
+        }
+#ifdef GPVST3_P13_PROBE_BUILD
+        const auto inputProcessStarted = g_inputTimingTicket ? steadyNanoseconds() : 0;
+#endif
+        const auto processed = slot_->router.processInterleaved({g_monitorAudio.capture.data(), output_,
+            std::size_t(frames_), inputChannels_, 2, slot_->rate, std::size_t(frames_), owner_, sequence_});
+#ifdef GPVST3_P13_PROBE_BUILD
+        if (g_inputTimingTicket) input::timingprobe::Recorder::inputProcessed(*g_inputTimingTicket,
+            inputProcessStarted, steadyNanoseconds(), processed.processed && !processed.error);
+#endif
+        if (!processed.processed || processed.error) { failureStage_ = 11; fail(); return; }
+#ifdef GPVST3_P13_PROBE_BUILD
+        if (g_overlayProbeRequested && g_currentDrainRecord) {
+            auto &r = *g_currentDrainRecord;
+            r.overlayCommitted = true;
+            // This diagnostic is explicitly paired with the unity-gain fixture.
+            // Independent expected samples detect RSE entering the input chain
+            // and any overwrite, duplicate input or post-mix limiting.
+            for (std::size_t f = 0; f < frames_; ++f) for (std::size_t c = 0; c < 2; ++c) {
+                const auto i = f * 2 + c;
+                const float contribution = g_monitorAudio.capture[f * inputChannels_ + (inputChannels_ == 1 ? 0 : c)] * slot_->gain;
+                const float expected = g_overlayProbeBefore[i] + contribution;
+                const auto *actual = static_cast<const float *>(output_) + i;
+                ++r.overlayComparedSamples;
+                if (std::memcmp(&expected, actual, sizeof(float)) != 0) ++r.overlayMismatchSamples;
+                if (!std::isfinite(expected) || !std::isfinite(*actual)) ++r.nonFiniteSamples;
+                r.preOverlayEnergy += double(g_overlayProbeBefore[i]) * g_overlayProbeBefore[i];
+                r.overlayEnergy += double(contribution) * contribution;
+            }
+        }
+#endif
+        bool clipped = false;
+        for (std::size_t i = 0; i < std::size_t(frames_) * 2; ++i)
+            clipped |= std::abs(static_cast<const float *>(output_)[i]) > 1.0f;
+        if (clipped) g_inputMonitor.clipped.fetch_add(1);
+        g_inputMonitor.blocks.fetch_add(1);
+        g_inputMonitor.processFrames.store(frames_);
+        g_inputMonitor.publishCallbackPhase(lease_.token(), 4);
+    }
+private:
+    void fail() noexcept {
+        g_monitorAudio.faulted = true;
+        if (configurationRejected_) {
+            g_inputMonitor.configurationToken.store(0, std::memory_order_release);
+            g_inputMonitor.processFrames.store(0);
+            g_inputMonitor.configurationRejectedBlocks.fetch_add(1);
+            g_inputMonitor.publishCallbackPhase(lease_.token(), suppress_ ? 5 : 6);
+            return;
+        }
+        int noFault = 0;
+        if (g_inputMonitor.callbackFault.compare_exchange_strong(noFault, failureStage_)) {
+            g_inputMonitor.faultListenerCalls.store(listenerCalls_);
+            g_inputMonitor.faultSrcCalls.store(observedSrcCalls_);
+        }
+        g_inputMonitor.errors.fetch_add(1);
+        g_inputMonitor.publishCallbackPhase(lease_.token(), suppress_ ? 5 : 6);
+    }
+    input::MonitorExchange::Lease lease_;
+    InputMonitorSlot *slot_ = nullptr;
+    input::drainprobe::Snapshot before_;
+    void *output_, *owner_;
+    unsigned long frames_;
+    std::uint64_t sequence_;
+    std::uint32_t listenerCalls_ = 0, observedSrcCalls_ = 0;
+    std::size_t inputChannels_ = 0;
+    bool requested_ = false, held_ = false, suppress_ = false, valid_ = false;
+    bool observing_ = false, listenerValid_ = true, configurationRejected_ = false;
+    int failureStage_ = 1;
+};
+thread_local MonitorCallback *g_monitorCallback = nullptr;
+
+std::int64_t listenerProbeHook(void *self, const float *input, std::uint32_t inputChannels,
+    float *output, std::uint32_t outputChannels, std::int64_t frames, const void *timePoint) {
+    using FillBuffer = std::int64_t (*)(void *, const float *, std::uint32_t, float *,
+        std::uint32_t, std::int64_t, const void *);
+    const auto original = reinterpret_cast<FillBuffer>(g_runtime.listenerProbe.trampoline);
+    if (g_monitorCallback && g_monitorCallback->suppress()) {
+        // The native input SRC initially produces zero frames while filling
+        // its history. Forward that legal call once into the sink; zero frames
+        // must neither fault the monitor nor advance its drain counters.
+        const bool valid = g_monitorCallback->ownsSink() && self &&
+            frames >= 0 && frames <= 32768 && (frames == 0 || (input && output)) &&
+            inputChannels == 2 && outputChannels == 2 &&
+            portaudio::read<const void *>(self, 0) == g_listenerExecutableBase + 0x25ABAF8;
+        if (!valid) {
+            g_inputMonitor.listenerRequestedFrames.store(frames);
+            g_inputMonitor.listenerFaultFlags.store((!g_monitorCallback->ownsSink() ? 1 : 0) |
+                (!self ? 2 : 0) | (!input ? 4 : 0) | (!output ? 8 : 0) |
+                (frames < 0 || frames > 32768 ? 16 : 0) | (inputChannels != 2 ? 32 : 0) |
+                (outputChannels != 2 ? 64 : 0) |
+                (self && portaudio::read<const void *>(self, 0) != g_listenerExecutableBase + 0x25ABAF8 ? 128 : 0));
+            g_monitorCallback->listener(false); return 0;
+        }
+#ifdef GPVST3_P13_PROBE_BUILD
+        auto *record = g_overlayProbeRequested ? g_currentDrainRecord : nullptr;
+        if (record && frames > 0) {
+            ++record->listenerCalls;
+            std::copy_n(output, std::size_t(frames) * 2, g_listenerCallerBefore.data());
+        }
+#endif
+        std::fill_n(g_monitorAudio.sink.data(), std::size_t(frames) * 2, 0.0f);
+        const auto result = original(self, input, inputChannels, g_monitorAudio.sink.data(),
+            outputChannels, frames, timePoint);
+        if (result != frames) {
+            g_inputMonitor.listenerReturnedFrames.store(result);
+            g_inputMonitor.listenerRequestedFrames.store(frames);
+            g_inputMonitor.listenerFaultFlags.store(256);
+        }
+        g_monitorCallback->listener(result == frames);
+#ifdef GPVST3_P13_PROBE_BUILD
+        if (record && frames > 0) {
+            const auto *state = portaudio::read<const void *>(self, 8);
+            if (result == frames && state && portaudio::read<std::uint8_t>(state, 0x50) != 0)
+                ++record->listenerSunk;
+            else record->listenerValid = false;
+            if (state) {
+                record->nativePreGain = portaudio::read<float>(state, 0x58);
+                const auto inputPeak = portaudio::read<float>(state, 0x198);
+                const auto outputPeak = portaudio::read<float>(state, 0x19C);
+                if (std::isfinite(inputPeak) && std::isfinite(outputPeak)) {
+                    ++record->listenerPeakSamples;
+                    record->inputPeak = inputPeak; record->outputPeak = outputPeak;
+                } else ++record->nonFiniteSamples;
+            }
+            for (std::size_t i = 0; i < std::size_t(frames) * 2; ++i) {
+                if (std::memcmp(output + i, g_listenerCallerBefore.data() + i, sizeof(float)) != 0)
+                    ++record->callerChangedSamples;
+                if (std::isfinite(input[i]) && std::isfinite(g_monitorAudio.sink[i]) && std::isfinite(output[i])) {
+                    record->captureEnergy += double(input[i]) * input[i];
+                    record->nativeEnergy += double(g_monitorAudio.sink[i]) * g_monitorAudio.sink[i];
+                    record->callerEnergy += double(output[i]) * output[i];
+                } else ++record->nonFiniteSamples;
+            }
+        }
+#endif
+        return result;
+    }
+#ifdef GPVST3_P13_PROBE_BUILD
+    auto *drainRecord = g_currentDrainRecord;
+    if (drainRecord) ++drainRecord->listenerCalls;
+    if (!drainRecord && (!g_listenerProbe.enabled() || g_listenerProbe.claimed() >= input::probe::kCapacity))
+        return original(self, input, inputChannels, output, outputChannels, frames, timePoint);
+    input::probe::Recorder::Ticket ticket;
+    const auto started = steadyNanoseconds();
+    // The external callback establishes caller ownership. Independent unit
+    // invocations are forwarded unchanged and never assumed to own scratch.
+    const bool valid = g_probeOuterSequence != 0 && self && frames > 0 && frames <= 32768 &&
+        inputChannels >= 1 && inputChannels <= 2 && outputChannels >= 1 && outputChannels <= 2 &&
+        portaudio::read<const void *>(self, 0) == g_listenerExecutableBase + 0x25ABAF8;
+    if (valid && started >= g_inputProbeStart) {
+        input::probe::Metadata m;
+        m.sequence = g_listenerProbeSequence.fetch_add(1, std::memory_order_relaxed) + 1;
+        m.parentSequence = g_probeOuterSequence;
+        m.timestampNanoseconds = started;
+        m.frames = static_cast<std::size_t>(frames);
+        m.sampleRate = 44100; // Verified GP internal SRC destination; not hardware rate.
+        m.inputChannels = inputChannels;
+        m.outputChannels = outputChannels;
+        m.thread = GetCurrentThreadId();
+        m.inputAddress = reinterpret_cast<std::uintptr_t>(input);
+        m.outputAddress = reinterpret_cast<std::uintptr_t>(output);
+        m.ownerAddress = reinterpret_cast<std::uintptr_t>(self);
+        m.configurationValid = true;
+        ticket = g_listenerProbe.claim(m);
+        if (ticket) {
+            auto &extra = g_listenerProbeExtra[ticket.index()];
+            const auto *state = portaudio::read<const void *>(self, 8);
+            extra.state = reinterpret_cast<std::uintptr_t>(state);
+            if (state) {
+                extra.enabled = portaudio::read<std::uint8_t>(state, 0x50) != 0;
+                const auto peak = portaudio::read<float>(state, 0x198);
+                if (std::isfinite(peak)) extra.inputPeakBefore = peak;
+                else extra.peakNonFiniteMask |= 1;
+            }
+            if (output) {
+                const auto count = (std::min)(std::size_t(frames), input::probe::kSampleFrames) * outputChannels;
+                for (std::size_t i = 0; i < count; ++i) {
+                    if (std::isfinite(output[i])) extra.outputBefore[i] = output[i];
+                    else extra.outputBeforeNonFiniteMask |= std::uint32_t{1} << i;
+                }
+            }
+            g_listenerProbe.captureInput(ticket, input, true);
+        }
+    }
+    struct SinkGuard {
+        bool held = false;
+        ~SinkGuard() { if (held) g_listenerSinkBusy.clear(std::memory_order_release); }
+    } sinkGuard;
+    float *originalOutput = output;
+    const auto *listenerState = valid ? portaudio::read<const void *>(self, 8) : nullptr;
+    const bool listenerEnabled = listenerState && portaudio::read<std::uint8_t>(listenerState, 0x50) != 0;
+    bool sunk = false;
+    if (((drainRecord && g_drainProbeRequested) || (ticket && g_listenerSinkRequested && !g_drainProbeRequested)) &&
+        valid && input && output && inputChannels == 2 && outputChannels == 2 && listenerEnabled) {
+        sinkGuard.held = !g_listenerSinkBusy.test_and_set(std::memory_order_acquire);
+        if (ticket) g_listenerProbeExtra[ticket.index()].sinkBusy = !sinkGuard.held;
+        if (sinkGuard.held) {
+            if (drainRecord) std::copy_n(output, static_cast<std::size_t>(frames) * outputChannels,
+                                         g_listenerCallerBefore.data());
+            std::fill_n(g_listenerSink.data(), static_cast<std::size_t>(frames) * outputChannels, 0.0f);
+            originalOutput = g_listenerSink.data();
+            sunk = true;
+            if (ticket) g_listenerProbeExtra[ticket.index()].sinkApplied = true;
+        }
+    }
+    const auto originalStarted = ticket ? steadyNanoseconds() : 0;
+    const auto result = original(self, input, inputChannels, originalOutput, outputChannels, frames, timePoint);
+    if (drainRecord) {
+        if (sunk && result == frames && listenerState == portaudio::read<const void *>(self, 8) &&
+            portaudio::read<std::uint8_t>(listenerState, 0x50) != 0) ++drainRecord->listenerSunk;
+        else drainRecord->listenerValid = false;
+        if (sunk && result == frames) {
+            for (std::size_t i = 0; i < std::size_t(frames) * outputChannels; ++i) {
+                if (std::memcmp(output + i, g_listenerCallerBefore.data() + i, sizeof(float)) != 0)
+                    ++drainRecord->callerChangedSamples;
+                if (std::isfinite(input[i]) && std::isfinite(g_listenerSink[i]) && std::isfinite(output[i])) {
+                    drainRecord->captureEnergy += double(input[i]) * input[i];
+                    drainRecord->nativeEnergy += double(g_listenerSink[i]) * g_listenerSink[i];
+                    drainRecord->callerEnergy += double(output[i]) * output[i];
+                } else ++drainRecord->nonFiniteSamples;
+            }
+        }
+    }
+    if (ticket) {
+        const auto originalEnded = steadyNanoseconds();
+        auto &extra = g_listenerProbeExtra[ticket.index()];
+        if (extra.sinkApplied && result == frames) {
+            const auto count = (std::min)(std::size_t(frames), input::probe::kSampleFrames) * outputChannels;
+            for (std::size_t i = 0; i < count; ++i) {
+                if (std::isfinite(g_listenerSink[i])) extra.sinkOutput[i] = g_listenerSink[i];
+                else extra.sinkNonFiniteMask |= std::uint32_t{1} << i;
+            }
+        }
+        const auto *state = portaudio::read<const void *>(self, 8);
+        extra.stateStable = state && reinterpret_cast<std::uintptr_t>(state) == extra.state;
+        if (extra.stateStable) {
+            const auto inputPeak = portaudio::read<float>(state, 0x198);
+            const auto outputPeak = portaudio::read<float>(state, 0x19C);
+            if (std::isfinite(inputPeak)) extra.inputPeakAfter = inputPeak;
+            else extra.peakNonFiniteMask |= 2;
+            if (std::isfinite(outputPeak)) extra.outputPeakAfter = outputPeak;
+            else extra.peakNonFiniteMask |= 4;
+        }
+        const auto ended = steadyNanoseconds();
+        g_listenerProbe.complete(ticket, {originalEnded, ended, originalEnded - originalStarted,
+            ended - started, result == frames ? 0 : -1}, output, result == frames);
+    }
+    return result;
+#else
+    return original(self, input, inputChannels, output, outputChannels, frames, timePoint);
+#endif
+}
+
 int streamCallbackHook(const void *input, void *output, unsigned long frames,
                        const void *timeInfo, unsigned long status, void *userData) {
+#ifdef GPVST3_P13_PROBE_BUILD
+    InputTimingScope timingScope(frames, status);
+#endif
     const auto original = reinterpret_cast<StreamCallback>(g_runtime.stream.trampoline);
+    const auto outputSequence = g_runtime.outputCalls.fetch_add(1, std::memory_order_relaxed) + 1;
+    const void *monitorInput = input;
+#ifdef GPVST3_P13_PROBE_BUILD
+    // Measurement only: capture channel 1 is the external source; channel 2
+    // is the physical right-output return. Record both raw channels but feed
+    // only the source, duplicated to stereo, to both monitoring paths. The
+    // return must never feed back into the listener. Normal builds do not
+    // contain this experiment or change the user's channel mapping.
+    std::array<float, portaudio::kMaxFrames * 2> measurementInput{};
+    bool measurementMappingValid = false;
+    if (g_monitorLatencyProbe) {
+        portaudio::Configuration config;
+        const auto identity = asioprobe::currentCallback();
+        const bool validFormat = frames > 0 && frames <= portaudio::kMaxFrames &&
+            portaudio::configuration(g_runtime.audioModule, userData, config) && config.inputChannels <= 2;
+        // During the normal UI transition the native gain remains zero. For a
+        // supported buffer, unknown topology fails silent instead of forwarding
+        // a return channel. The collector requires confirmed mapping before
+        // it raises the native monitor gain.
+        if (validFormat) monitorInput = measurementInput.data();
+        if (validFormat && identity.rateValidated && input && config.inputChannels == 2) {
+            const auto *stream = portaudio::read<const void *>(userData, 8);
+            const auto *buffers = portaudio::read<const std::uint8_t *>(stream, 0x180);
+            const auto *base = static_cast<const std::uint8_t *>(g_runtime.audioModule);
+            measurementMappingValid = stream && buffers &&
+                stream == portaudio::read<const void *>(base, 0x2F2620) &&
+                portaudio::read<const void *>(stream, 0x28) == userData &&
+                portaudio::read<std::int32_t>(stream, 0x198) == 2 &&
+                portaudio::read<std::int32_t>(stream, 0x19C) == 2 &&
+                portaudio::read<std::int32_t>(buffers, 0) == 1 && portaudio::read<std::int32_t>(buffers, 4) == 0 &&
+                portaudio::read<std::int32_t>(buffers + 24, 0) == 1 && portaudio::read<std::int32_t>(buffers + 24, 4) == 1 &&
+                portaudio::read<std::int32_t>(buffers + 48, 0) == 0 && portaudio::read<std::int32_t>(buffers + 48, 4) == 0 &&
+                portaudio::read<std::int32_t>(buffers + 72, 0) == 0 && portaudio::read<std::int32_t>(buffers + 72, 4) == 1;
+            if (measurementMappingValid)
+                for (std::size_t i = 0; i < frames; ++i)
+                    measurementInput[i * 2] = measurementInput[i * 2 + 1] = static_cast<const float *>(input)[i * 2];
+        }
+        g_monitorLatencyMappingValid.store(measurementMappingValid);
+    }
+    struct OuterProbeScope {
+        std::uint64_t previous;
+        explicit OuterProbeScope(std::uint64_t sequence) : previous(g_probeOuterSequence) { g_probeOuterSequence = sequence; }
+        ~OuterProbeScope() { g_probeOuterSequence = previous; }
+    } outerProbeScope(outputSequence);
+    input::probe::Recorder::Ticket probeTicket;
+    input::pcmprobe::Recorder::Ticket pcmTicket;
+    asioprobe::CallbackIdentity callbackIdentity;
+    std::uint64_t probeStarted = 0;
+    std::uint64_t probeOriginalEnded = 0;
+    std::uint64_t probeOriginalStarted = 0;
+    bool probeConfigurationValid = false;
+    bool probeSilenced = false;
+    std::size_t probeOutputChannels = 0;
+    std::array<float, input::probe::kSampleFrames * input::probe::kSampleChannels> probeOutput{};
+    if ((g_inputProbe.enabled() && g_inputProbe.claimed() < input::probe::kCapacity) ||
+        (g_inputPcmProbe.enabled() &&
+         g_inputPcmProbe.framesReserved() < input::pcmprobe::kFrameCapacity &&
+         g_inputPcmProbe.claimed() < input::pcmprobe::kRecordCapacity)) {
+        probeStarted = steadyNanoseconds();
+        if (probeStarted >= g_inputProbeStart) {
+            portaudio::Configuration config;
+            probeConfigurationValid = frames > 0 && frames <= portaudio::kMaxFrames &&
+                portaudio::configuration(g_runtime.audioModule, userData, config);
+            probeOutputChannels = config.outputChannels;
+            probeSilenced = g_inputProbeSilence && probeConfigurationValid && input && output;
+            input::probe::Metadata metadata;
+            metadata.sequence = outputSequence;
+            callbackIdentity = asioprobe::currentCallback();
+            metadata.streamGeneration = callbackIdentity.generation;
+            metadata.rateRevision = callbackIdentity.rateRevision;
+            metadata.actualSampleRate = callbackIdentity.actualRate;
+            metadata.actualRateValidated = callbackIdentity.rateValidated;
+            metadata.timestampNanoseconds = probeStarted;
+            metadata.status = status;
+            metadata.frames = frames;
+            metadata.sampleRate = config.sampleRate;
+            metadata.inputChannels = config.inputChannels;
+            metadata.outputChannels = config.outputChannels;
+            metadata.inputDevice = config.inputDevice;
+            metadata.outputDevice = config.outputDevice;
+            if (probeConfigurationValid) {
+                // AMAudio.dll 8.1.1.17 embeds PortAudio 396fe4b6. The ASIO
+                // callback reads this same active stream global and frame
+                // field. No inference from preferences or callback frames.
+                const auto *stream = portaudio::read<const void *>(userData, 8);
+                const auto *streamInterface = portaudio::read<const void *>(stream, 0x10);
+                const auto *base = static_cast<const std::uint8_t *>(g_runtime.audioModule);
+                if (stream == portaudio::read<const void *>(g_runtime.audioModule, 0x2F2620) &&
+                    streamInterface &&
+                    portaudio::read<const void *>(streamInterface, 0) == base + 0x6DF60 &&
+                    portaudio::read<const void *>(streamInterface, 8) == base + 0x6FE90 &&
+                    portaudio::read<const void *>(streamInterface, 16) == base + 0x700A0 &&
+                    portaudio::read<const void *>(stream, 0x28) == userData) {
+                    const auto driverFrames = portaudio::read<std::uint32_t>(stream, 0x178);
+                    if (driverFrames > 0 && driverFrames <= 65536) {
+                        metadata.hostApiType = 3; // paASIO (PortAudio PaHostApiTypeId).
+                        metadata.driverFrames = driverFrames;
+                        metadata.driverInputLatency = portaudio::read<std::int32_t>(stream, 0x190);
+                        metadata.driverOutputLatency = portaudio::read<std::int32_t>(stream, 0x194);
+                        const auto inputCount = portaudio::read<std::int32_t>(stream, 0x198);
+                        const auto outputCount = portaudio::read<std::int32_t>(stream, 0x19C);
+                        const auto *buffers = portaudio::read<const std::uint8_t *>(stream, 0x180);
+                        const auto *channels = portaudio::read<const std::uint8_t *>(stream, 0x188);
+                        bool validChannels = buffers && channels && inputCount == int(config.inputChannels) &&
+                            outputCount == int(config.outputChannels);
+                        for (int i = 0; validChannels && i < inputCount + outputCount; ++i) {
+                            const bool isInput = i < inputCount;
+                            const auto selector = portaudio::read<std::int32_t>(buffers + i * 24, 4);
+                            validChannels = selector >= 0 && selector < 65536 &&
+                                portaudio::read<std::int32_t>(buffers + i * 24, 0) == int(isInput) &&
+                                portaudio::read<std::int32_t>(channels + i * 52, 0) == selector &&
+                                portaudio::read<std::int32_t>(channels + i * 52, 4) == int(isInput);
+                            if (validChannels) {
+                                if (isInput) metadata.driverInputSelectors[std::size_t(i)] = selector;
+                                else metadata.driverOutputSelectors[std::size_t(i - inputCount)] = selector;
+                            }
+                        }
+                        metadata.driverChannelsValidated = validChannels;
+                    }
+                }
+            }
+            metadata.thread = GetCurrentThreadId();
+            metadata.inputAddress = reinterpret_cast<std::uintptr_t>(input);
+            metadata.outputAddress = reinterpret_cast<std::uintptr_t>(output);
+            metadata.ownerAddress = reinterpret_cast<std::uintptr_t>(userData);
+            metadata.configurationValid = probeConfigurationValid;
+            if (probeConfigurationValid && input && output) {
+                metadata.pointersAlias = metadata.inputAddress <= metadata.outputAddress
+                    ? metadata.outputAddress - metadata.inputAddress < frames * config.inputChannels * sizeof(float)
+                    : metadata.inputAddress - metadata.outputAddress < frames * config.outputChannels * sizeof(float);
+            }
+            metadata.experiment = probeSilenced;
+            metadata.monitorReferenceIsInput1 = measurementMappingValid;
+            // Backend/driver frames remain unknown when the ASIO identity
+            // gate failed. A generation is known only inside a bound proxy.
+            probeTicket = g_inputProbe.claim(metadata);
+            g_inputProbe.captureInput(probeTicket, input, probeConfigurationValid);
+            pcmTicket = g_inputPcmProbe.begin(metadata, input, probeConfigurationValid);
+        }
+    }
+#endif
     const auto outputAddress = reinterpret_cast<std::uintptr_t>(output);
     auto firstBuffer = g_runtime.outputFirstBuffer.load(std::memory_order_relaxed);
     if (firstBuffer == 0)
         g_runtime.outputFirstBuffer.compare_exchange_strong(firstBuffer, outputAddress,
                                                               std::memory_order_relaxed);
     g_runtime.outputLastBuffer.store(outputAddress, std::memory_order_relaxed);
-    g_runtime.outputCalls.fetch_add(1, std::memory_order_relaxed);
     // Output hashes prove the callback writeback once. They are not part of
     // audio processing, so stop scanning the realtime buffer after that
     // evidence has been claimed.
-    const bool needOutputHashes = !g_runtime.outputEvidenceClaimed.load(std::memory_order_relaxed);
+    const bool needOutputHashes =
+#ifdef GPVST3_P13_PROBE_BUILD
+        !g_inputProbe.enabled() &&
+#endif
+        !g_runtime.outputEvidenceClaimed.load(std::memory_order_relaxed);
     const auto before = needOutputHashes ? outputHash(output, frames) : 0;
+    MonitorCallback monitor(monitorInput, output, frames, userData, outputSequence, status);
+    struct MonitorContext {
+        MonitorCallback *previous;
+        explicit MonitorContext(MonitorCallback &current) : previous(g_monitorCallback) { g_monitorCallback = &current; }
+        ~MonitorContext() { g_monitorCallback = previous; }
+    } monitorContext(monitor);
+#ifdef GPVST3_P13_PROBE_BUILD
+    DrainProbeScope drainScope(userData, frames, outputSequence, status);
+    if (probeTicket || pcmTicket) probeOriginalStarted = steadyNanoseconds();
+    const auto result = original(probeTicket && probeSilenced ? g_inputProbeZeros.data() : monitorInput,
+                                 output, frames, timeInfo, status, userData);
+    if (probeTicket || pcmTicket) probeOriginalEnded = steadyNanoseconds();
+    if (probeTicket && probeConfigurationValid && output && result == 0)
+        std::copy_n(static_cast<const float *>(output),
+            (std::min)(std::size_t(frames), input::probe::kSampleFrames) * probeOutputChannels,
+            probeOutput.data());
+    if (g_overlayProbeRequested && g_currentDrainRecord && output && frames <= portaudio::kMaxFrames)
+        std::copy_n(static_cast<const float *>(output), std::size_t(frames) * 2, g_overlayProbeBefore.data());
+    monitor.finish(result);
+    drainScope.finish(result, static_cast<const float *>(output));
+    if (probeTicket || pcmTicket) {
+        const auto overlayEnded = steadyNanoseconds();
+        const auto completedIdentity = asioprobe::currentCallback();
+        const bool sameCallbackIdentity = completedIdentity.generation == callbackIdentity.generation &&
+            completedIdentity.rateRevision == callbackIdentity.rateRevision &&
+            completedIdentity.rateValidated == callbackIdentity.rateValidated &&
+            completedIdentity.actualRate == callbackIdentity.actualRate;
+        if (pcmTicket) g_inputPcmProbe.complete(pcmTicket,
+            {probeOriginalEnded, overlayEnded,
+             probeOriginalEnded - probeOriginalStarted, overlayEnded - probeStarted, result},
+            output, probeConfigurationValid && result == 0 && sameCallbackIdentity);
+    }
+#else
     const auto result = original(input, output, frames, timeInfo, status, userData);
+    monitor.finish(result);
+#endif
     const auto inputState = g_runtime.inputRouter.snapshot();
     portaudio::Configuration configuration;
     const bool configurationValid = frames > 0 &&
@@ -3800,7 +5159,9 @@ int streamCallbackHook(const void *input, void *output, unsigned long frames,
     const bool preparedConfiguration = configurationValid &&
         static_cast<int>(configuration.sampleRate) ==
             g_runtime.inputConfiguredRate.load(std::memory_order_acquire);
-    if (preparedConfiguration && inputState.enabled &&
+    if (
+        monitor.legacy() && !monitor.suppress() &&
+        preparedConfiguration && inputState.enabled &&
         inputState.route != input::Route::Disabled) {
         g_runtime.inputCapturePathLocated.store(true, std::memory_order_release);
         g_runtime.inputCaptureCalls.fetch_add(1, std::memory_order_relaxed);
@@ -3808,7 +5169,7 @@ int streamCallbackHook(const void *input, void *output, unsigned long frames,
             input, output, static_cast<std::size_t>(frames), configuration.inputChannels,
             configuration.outputChannels, configuration.sampleRate,
             static_cast<std::size_t>(frames),
-            userData, static_cast<std::uint64_t>(g_runtime.outputCalls.load(std::memory_order_relaxed)),
+            userData, static_cast<std::uint64_t>(outputSequence),
             input::InterleavedSampleFormat::Float32};
         const bool needInputOrderHash =
             !g_runtime.inputOrderEvidenceClaimed.load(std::memory_order_relaxed);
@@ -3855,12 +5216,562 @@ int streamCallbackHook(const void *input, void *output, unsigned long frames,
     }
     g_runtime.outputFrames.store(frames, std::memory_order_relaxed);
     g_runtime.outputThread.store(GetCurrentThreadId(), std::memory_order_relaxed);
+#ifdef GPVST3_P13_PROBE_BUILD
+    timingScope.result = result;
+    if (probeTicket) {
+        const auto ended = steadyNanoseconds();
+        // Never sample pre-callback output, or legacy-router output as native.
+        g_inputProbe.complete(probeTicket,
+            {probeOriginalEnded, ended, probeOriginalEnded - probeOriginalStarted,
+             ended - probeStarted, result}, probeOutput.data(),
+            probeConfigurationValid && output && result == 0);
+    }
+#endif
     return result;
 }
 
 void setTotalBypass(bool bypassed) noexcept {
     g_runtime.chain.setBypassed(bypassed);
     g_runtime.inputRouter.setBypassed(bypassed);
+}
+
+#ifdef GPVST3_P13_PROBE_BUILD
+QJsonObject inputStreamProbeSnapshot() { return asioprobe::snapshot(); }
+
+QJsonObject inputTimingProbeSnapshot() {
+    const auto value = g_inputTimingProbe.snapshot(steadyNanoseconds());
+    const auto histogram = [](const input::timingprobe::HistogramSnapshot &samples) {
+        const auto percentile = [&](unsigned percent) {
+            const auto upper = samples.percentileUpper(percent);
+            return upper ? QJsonValue(qint64(upper)) : QJsonValue();
+        };
+        QJsonArray buckets;
+        for (const auto count : samples.buckets) buckets.append(qint64(count));
+        return QJsonObject{{"count", QString::number(samples.count)},
+            {"bucket_width_ns", qint64(input::timingprobe::kBucketNanoseconds)},
+            {"overflow_at_ns", qint64(input::timingprobe::kHistogramBuckets * input::timingprobe::kBucketNanoseconds)},
+            {"overflow", QString::number(samples.overflow)}, {"buckets", buckets},
+            {"p50_exclusive_upper_ns", percentile(50)}, {"p95_exclusive_upper_ns", percentile(95)},
+            {"maximum_ns", QString::number(samples.maximum)}};
+    };
+    return {{"schema", 1}, {"enabled", value.enabled}, {"stopped", value.stopped}, {"acceptance", "not_evaluated"},
+        {"scope", "hook_entry_to_exit_including_experimental_instrumentation; input_process_is_router_only; not_complete_driver_deadline_or_xrun_measurement"},
+        {"coherent_snapshot", value.coherent},
+        {"window_start_ns", QString::number(value.windowStart)}, {"window_end_ns", QString::number(value.windowEnd)},
+        {"maximum_window_ns", QString::number(input::timingprobe::kWindowNanoseconds)},
+        {"maximum_callbacks", QString::number(input::timingprobe::kCallbackLimit)},
+        {"time_bound_reached", value.timeBoundReached}, {"callback_bound_reached", value.callbackBoundReached},
+        {"first_started_ns", QString::number(value.firstStarted)}, {"last_ended_ns", QString::number(value.lastEnded)},
+        {"admitted_callbacks", QString::number(value.admitted)}, {"completed_callbacks", QString::number(value.completed)},
+        {"overlapping_callbacks_skipped", QString::number(value.overlappingCallbacks)},
+        {"status_flag_callbacks", QString::number(value.statusCallbacks)}, {"status_flags_or", QString::number(value.statusFlags)},
+        {"callback_result_errors", QString::number(value.resultErrors)}, {"invalid_clock_callbacks", QString::number(value.invalidClocks)},
+        {"budget_scope", "callback_frames_divided_by_per_callback_validated_ASIO_rate; excludes_driver_work_outside_this_hook"},
+        {"budget_validated_callbacks", QString::number(value.validatedBudgets)},
+        {"budget_unvalidated_callbacks", QString::number(value.unvalidatedBudgets)},
+        {"callback_budget_exceedances", QString::number(value.callbackBudgetExceeded)},
+        {"input_process_budget_exceedances", QString::number(value.inputBudgetExceeded)},
+        {"input_process_calls", QString::number(value.inputCalls)}, {"input_process_failures", QString::number(value.inputFailures)},
+        {"validated_identity_changes", QString::number(value.identityChanges)},
+        {"minimum_validated_rate", value.minimumRate}, {"maximum_validated_rate", value.maximumRate},
+        {"minimum_validated_frames", qint64(value.minimumFrames)}, {"maximum_validated_frames", qint64(value.maximumFrames)},
+        {"callback", histogram(value.callback)}, {"input_process", histogram(value.inputProcess)}};
+}
+
+QJsonObject stopInputTimingProbe() {
+    g_inputTimingProbe.stop();
+    asioprobe::stopTiming();
+    QJsonObject hook, driver;
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    do {
+        const bool hookIdle = g_inputTimingProbe.stop();
+        const bool driverIdle = asioprobe::stopTiming();
+        hook = inputTimingProbeSnapshot();
+        driver = asioprobe::timingSnapshot();
+        hook.insert("quiesced", hookIdle);
+        driver.insert("quiesced", driverIdle);
+        if (hookIdle && driverIdle && hook.value("coherent_snapshot").toBool() && driver.value("coherent_snapshot").toBool()) break;
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    } while (std::chrono::steady_clock::now() < deadline);
+    return {{"callback_timing", hook}, {"driver_callback_timing", driver}};
+}
+
+QJsonObject exportInputPcmProbe(double actualRate, int rateResult) {
+    using namespace input::pcmprobe;
+    static QJsonObject completed;
+    if (!completed.isEmpty()) return completed;
+    QJsonObject result{{"enabled", g_inputPcmProbe.enabled()}, {"complete", false},
+        {"claimed", qint64(g_inputPcmProbe.claimed())},
+        {"published", qint64(g_inputPcmProbe.published())},
+        {"frames_reserved", qint64(g_inputPcmProbe.framesReserved())}};
+    if (!g_inputPcmProbe.enabled() ||
+        (g_inputPcmProbe.framesReserved() < kFrameCapacity && g_inputPcmProbe.claimed() < kRecordCapacity))
+        return result;
+    const auto count = g_inputPcmProbe.claimed();
+    if (g_inputPcmProbe.published() != count) return result;
+
+    const QDir directory(state::dataDirectory());
+    QSaveFile captureFile(directory.filePath("p13-pcm-capture.f32"));
+    QSaveFile outputFile(directory.filePath("p13-pcm-output.f32"));
+    if (!captureFile.open(QIODevice::WriteOnly) || !outputFile.open(QIODevice::WriteOnly)) {
+        result.insert("error", "pcm_file_open_failed");
+        return result;
+    }
+    QCryptographicHash captureHash(QCryptographicHash::Sha256), outputHash(QCryptographicHash::Sha256);
+    QJsonArray records;
+    qint64 captureOffset = 0, outputOffset = 0;
+    for (std::size_t i = 0; i < count; ++i) {
+        Snapshot value;
+        if (!g_inputPcmProbe.snapshot(i, value)) {
+            result.insert("error", "pcm_unpublished_record");
+            return result;
+        }
+        const auto &record = value.record;
+        const auto &m = record.metadata;
+        const auto captureBytes = qint64(value.captureSamples * sizeof(float));
+        const auto outputBytes = qint64(value.postOriginalSamples * sizeof(float));
+        if ((captureBytes && captureFile.write(reinterpret_cast<const char *>(value.capture), captureBytes) != captureBytes) ||
+            (outputBytes && outputFile.write(reinterpret_cast<const char *>(value.postOriginal), outputBytes) != outputBytes)) {
+            result.insert("error", "pcm_file_write_failed");
+            return result;
+        }
+        if (captureBytes) captureHash.addData(reinterpret_cast<const char *>(value.capture), int(captureBytes));
+        if (outputBytes) outputHash.addData(reinterpret_cast<const char *>(value.postOriginal), int(outputBytes));
+        records.append(QJsonObject{{"index", qint64(i)}, {"sequence", QString::number(m.sequence)},
+            {"timestamp_ns", QString::number(m.timestampNanoseconds)},
+            {"frame_offset", qint64(record.frameOffset)}, {"saved_frames", qint64(record.savedFrames)},
+            {"callback_frames", qint64(m.frames)}, {"truncated", record.truncated},
+            {"changes", qint64(record.changes)}, {"status_flags", QString::number(m.status)},
+            {"original_result", record.completion.callbackResult}, {"configuration_valid", m.configurationValid},
+            {"owner", QString::number(m.ownerAddress, 16)}, {"generation", QString::number(m.streamGeneration)},
+            {"rate_revision", QString::number(m.rateRevision)},
+            {"actual_rate_validated", m.actualRateValidated}, {"actual_callback_rate", m.actualSampleRate},
+            {"monitor_reference_is_input1", m.monitorReferenceIsInput1},
+            {"thread", qint64(m.thread)}, {"requested_sample_rate", m.sampleRate},
+            {"host_api_type", m.hostApiType}, {"driver_frames", qint64(m.driverFrames)},
+            {"driver_channels_validated", m.driverChannelsValidated},
+            {"driver_input_selectors", QJsonArray{m.driverInputSelectors[0], m.driverInputSelectors[1]}},
+            {"driver_output_selectors", QJsonArray{m.driverOutputSelectors[0], m.driverOutputSelectors[1]}},
+            {"input_device", m.inputDevice}, {"output_device", m.outputDevice},
+            {"input_channels", qint64(m.inputChannels)}, {"output_channels", qint64(m.outputChannels)},
+            {"capture_byte_offset", captureOffset}, {"capture_bytes", captureBytes},
+            {"output_byte_offset", outputOffset}, {"output_bytes", outputBytes},
+            {"capture_status", int(record.capture.status)}, {"output_status", int(record.postOriginal.status)},
+            {"capture_nonfinite", qint64(record.capture.nonFiniteCount)},
+            {"output_nonfinite", qint64(record.postOriginal.nonFiniteCount)}});
+        captureOffset += captureBytes;
+        outputOffset += outputBytes;
+    }
+    if (!captureFile.commit() || !outputFile.commit()) {
+        result.insert("error", "pcm_file_commit_failed");
+        return result;
+    }
+    result.insert("schema", 1);
+    result.insert("complete", true);
+    result.insert("format", "float32_little_endian_interleaved_per_record");
+    result.insert("capture_file", "p13-pcm-capture.f32");
+    result.insert("output_file", "p13-pcm-output.f32");
+    result.insert("output_stage", "after_original_and_input_overlay_before_legacy_router");
+    result.insert("capture_stage", "raw_device_capture_before_measurement_mapping");
+    result.insert("monitor_latency_measurement", g_monitorLatencyProbe);
+    result.insert("capture_sha256", QString::fromLatin1(captureHash.result().toHex()));
+    result.insert("output_sha256", QString::fromLatin1(outputHash.result().toHex()));
+    result.insert("busy_drops", QString::number(g_inputPcmProbe.busyDrops()));
+    result.insert("abandoned", QString::number(g_inputPcmProbe.abandoned()));
+    result.insert("actual_asio_sample_rate", actualRate > 0 ? QJsonValue(actualRate) : QJsonValue());
+    result.insert("actual_rate_query_result", rateResult);
+    result.insert("actual_rate_query_source", "ASIOGetSampleRate_thunk_0x6A540_ASIOError");
+    result.insert("rate_scope", "control_thread_observation_after_recording_not_generation_bound");
+    result.insert("acceptance", "not_evaluated");
+    result.insert("records", records);
+    QSaveFile manifest(directory.filePath("p13-pcm.json"));
+    const auto bytes = QJsonDocument(result).toJson();
+    if (!manifest.open(QIODevice::WriteOnly) || manifest.write(bytes) != bytes.size() || !manifest.commit()) {
+        result.insert("complete", false);
+        result.insert("error", "pcm_manifest_commit_failed");
+        return result;
+    }
+    completed = result;
+    return result;
+}
+
+QJsonObject drainProbeSnapshot() {
+    static QJsonObject completed;
+    if (!completed.isEmpty()) return completed;
+    QJsonArray records;
+    QJsonArray topology;
+    std::size_t valid = 0, ready = 0;
+    const auto count = g_drainProbeCount.load(std::memory_order_acquire);
+    for (std::size_t i = 0; i < count; ++i) {
+        if (!g_drainProbeRecords[i].published.load(std::memory_order_acquire)) continue;
+        const auto &r = g_drainProbeRecords[i].record;
+        if (r.valid) ++valid;
+        if (r.valid && r.drain.state == input::drain::State::Ready) ++ready;
+        if (i == 0) {
+            for (std::size_t channel = 0; channel < 2; ++channel) {
+                const auto &t = r.before.config.channel[channel];
+                const auto &c = r.before.channels[channel];
+                topology.append(QJsonObject{{"channel", int(channel)},
+                    {"convolver_count", int(t.convolverCount)}, {"up", int(t.upFactor)}, {"down", int(t.downFactor)},
+                    {"input_len", int(t.inputLen)}, {"previous_input_len", int(t.previousInputLen)},
+                    {"block_len2", int(t.blockLen2)}, {"latency", int(t.latency)},
+                    {"kernel_len", c.kernelLength}, {"block_len_bits", c.blockLengthBits},
+                    {"input_delay", int(t.inputDelay)}, {"up_shift", int(t.upShift)}, {"down_shift", int(t.downShift)},
+                    {"consume_latency", t.consumesLatency}, {"latency_fraction", c.latencyFraction},
+                    {"in_data_left", c.inDataLeft}, {"latency_left", c.latencyLeft},
+                    {"buffer_left", c.bufferLeft}, {"write_position", c.writePosition}, {"read_position", c.readPosition}});
+            }
+        }
+        records.append(QJsonObject{{"index", qint64(i)}, {"sequence", QString::number(r.sequence)},
+            {"timestamp_ns", QString::number(r.timestamp)}, {"callback_ns", QString::number(r.ended-r.timestamp)},
+            {"thread", qint64(r.thread)}, {"frames", int(r.frames)}, {"valid", r.valid},
+            {"status_flags", qint64(r.statusFlags)}, {"caller_changed_samples", qint64(r.callerChangedSamples)},
+            {"nonfinite_samples", qint64(r.nonFiniteSamples)}, {"capture_energy", r.captureEnergy},
+            {"native_energy", r.nativeEnergy}, {"caller_energy", r.callerEnergy}, {"output_energy", r.outputEnergy},
+            {"rse_calls", int(r.rseCalls)}, {"rse_valid", r.rseValid}, {"rse_energy", r.rseEnergy},
+            {"parent_gain", std::isfinite(r.parentGain) ? QJsonValue(r.parentGain) : QJsonValue()},
+            {"rse_compared_samples", qint64(r.rseComparedSamples)}, {"rse_mismatch_samples", qint64(r.rseMismatchSamples)},
+            {"source_observer_calls", int(r.sourceObserverCalls)},
+            {"monitor_token", QString::number(r.monitorToken)},
+            {"production_drain_state", int(r.productionDrain.state)}, {"production_drain_phase", int(r.productionDrain.phase)},
+            {"overlay_suppressed", r.overlaySuppressed}, {"overlay_committed", r.overlayCommitted},
+            {"overlay_compared_samples", int(r.overlayComparedSamples)}, {"overlay_mismatch_samples", int(r.overlayMismatchSamples)},
+            {"pre_overlay_energy", r.preOverlayEnergy}, {"overlay_energy", r.overlayEnergy},
+            {"listener_peak_samples", int(r.listenerPeakSamples)}, {"listener_input_peak", r.inputPeak},
+            {"listener_output_peak", r.outputPeak},
+            {"native_pre_gain", std::isfinite(r.nativePreGain) ? QJsonValue(r.nativePreGain) : QJsonValue()},
+            {"generation", QString::number(r.before.context.generation)},
+            {"rate_revision", QString::number(r.before.context.rateRevision)},
+            {"actual_rate", r.before.context.actualRate}, {"rate_validated", r.before.context.rateValidated},
+            {"before_error", int(r.before.error)}, {"after_error", int(r.after.error)},
+            {"output_src", QString::number(reinterpret_cast<std::uintptr_t>(r.before.outputSrc), 16)},
+            {"ring_storage", QString::number(reinterpret_cast<std::uintptr_t>(r.before.ring.storage), 16)},
+            {"queued_before", qint64(r.before.ring.queued)}, {"queued_after", qint64(r.after.ring.queued)},
+            {"read_before", qint64(r.before.ring.readIndex)}, {"read_after", qint64(r.after.ring.readIndex)},
+            {"write_before", qint64(r.before.ring.writeIndex)}, {"write_after", qint64(r.after.ring.writeIndex)},
+            {"consumed_samples", qint64(r.consumed)}, {"src_calls", int(r.src.calls)},
+            {"src_input_frames", qint64(r.src.inputFrames)}, {"src_output_frames", qint64(r.src.outputFrames)},
+            {"listener_calls", int(r.listenerCalls)}, {"listener_sunk", int(r.listenerSunk)},
+            {"listener_valid", r.listenerValid}, {"original_result", r.originalResult},
+            {"drain_state", int(r.drain.state)}, {"drain_phase", int(r.drain.phase)}, {"drain_error", int(r.drain.error)},
+            {"convolver_target", qint64(r.drain.convolverTarget)}, {"convolver_frames", qint64(r.drain.convolverFrames)},
+            {"interpolator_target", qint64(r.drain.interpolatorTarget)}, {"interpolator_frames", qint64(r.drain.interpolatorFrames)},
+            {"old_ring_samples", qint64(r.drain.oldRingSamples)}});
+    }
+    QJsonObject result{{"requested", g_drainProbeRequested || g_overlayProbeRequested},
+        {"overlay_probe", g_overlayProbeRequested}, {"transition_probe", g_overlayTransitionProbe}, {"capacity", int(kDrainProbeCapacity)},
+        {"rse_probe_installed", g_rseProbeInstalled.load(std::memory_order_acquire)},
+        {"complete", records.size() == int(kDrainProbeCapacity)}, {"published", records.size()},
+        {"valid_records", qint64(valid)}, {"ready_records", qint64(ready)},
+        {"overlaps", qint64(g_drainProbeOverlaps.load())}, {"initial_topology", topology},
+        {"records", records}, {"acceptance", "not_evaluated"},
+        {"scope", g_overlayProbeRequested ? "production_overlay_observation; unity_gain_fixture_expected; original_listener_called_and_internal_peaks_read; UI_meter_and_recording_not_proven" :
+            "retrospective_counted_drain_experiment; no_overlay; no_shared_state_reset; native_DSP_runs; suppression_ends_after_window"}};
+    if (result.value("complete").toBool()) completed = result;
+    return result;
+}
+
+QJsonObject inputProbeSnapshot() {
+    using namespace input::probe;
+    // This function runs on the Qt/control thread. GP's ASIO extension can
+    // retain PaStreamInfo.sampleRate=44100 while leaving the driver's rate
+    // unchanged. Query the driver here, never in the realtime callback.
+    double actualAsioRate = std::numeric_limits<double>::quiet_NaN();
+    int asioRateResult = -1;
+    if (!asioprobe::currentRate(actualAsioRate, asioRateResult) &&
+        g_inputProbe.enabled() && g_runtime.audioModule &&
+        portaudio::read<const void *>(g_runtime.audioModule, 0x2F2620)) {
+        using GetAsioSampleRate = int (*)(double *);
+        const auto getRate = reinterpret_cast<GetAsioSampleRate>(
+            static_cast<std::uint8_t *>(g_runtime.audioModule) + 0x6A540);
+        asioRateResult = getRate(&actualAsioRate);
+        if (asioRateResult != 0 || !std::isfinite(actualAsioRate) ||
+            actualAsioRate < 8000 || actualAsioRate > 768000) actualAsioRate = 0;
+    }
+    const auto sampleJson = [](const Samples &samples) {
+        const char *status = "unvalidated";
+        switch (samples.status) {
+        case SampleStatus::Disabled: status = "disabled"; break;
+        case SampleStatus::Missing: status = "missing"; break;
+        case SampleStatus::InvalidFormat: status = "invalid_format"; break;
+        case SampleStatus::Captured: status = "captured"; break;
+        default: break;
+        }
+        QJsonArray values;
+        for (std::size_t i = 0; i < samples.frames * samples.channels; ++i)
+            values.append(samples.values[i]);
+        return QJsonObject{{"status", status}, {"frames", samples.frames},
+            {"channels", samples.channels}, {"non_finite_mask", qint64(samples.nonFiniteMask)},
+            {"values", values}};
+    };
+    QJsonArray records;
+    std::vector<double> callbackTimes, originalTimes;
+    int deadlineMisses = 0;
+    int statusFlags = 0;
+    for (std::size_t index = 0; index < g_inputProbe.claimed(); ++index) {
+        Record record;
+        if (!g_inputProbe.snapshot(index, record)) continue;
+        const auto &m = record.metadata;
+        const auto &c = record.completion;
+        callbackTimes.push_back(static_cast<double>(c.callbackNanoseconds));
+        originalTimes.push_back(static_cast<double>(c.originalNanoseconds));
+        // A non-ASIO or unobserved current rate cannot establish a deadline.
+        if (m.hostApiType == 3 && actualAsioRate > 0 &&
+            c.callbackNanoseconds > m.frames * 1e9 / actualAsioRate) ++deadlineMisses;
+        if (m.status != 0) ++statusFlags;
+        records.append(QJsonObject{
+            {"index", qint64(index)}, {"sequence", QString::number(m.sequence)},
+            {"timestamp_ns", QString::number(m.timestampNanoseconds)},
+            {"stream_generation", m.streamGeneration ? QJsonValue(QString::number(m.streamGeneration)) : QJsonValue()},
+            {"status_flags", qint64(m.status)}, {"frames", qint64(m.frames)},
+            {"sample_rate", m.sampleRate}, {"sample_rate_source", "PaStreamInfo_requested_rate"},
+            {"input_channels", qint64(m.inputChannels)},
+            {"output_channels", qint64(m.outputChannels)}, {"input_device", m.inputDevice},
+            {"output_device", m.outputDevice},
+            {"host_api_type", m.hostApiType < 0 ? QJsonValue() : QJsonValue(m.hostApiType)},
+            {"driver_frames", m.driverFrames ? QJsonValue(int(m.driverFrames)) : QJsonValue()},
+            {"driver_input_latency_samples", m.driverInputLatency < 0 ? QJsonValue() : QJsonValue(m.driverInputLatency)},
+            {"driver_output_latency_samples", m.driverOutputLatency < 0 ? QJsonValue() : QJsonValue(m.driverOutputLatency)},
+            {"thread", qint64(m.thread)}, {"configuration_valid", m.configurationValid},
+            {"pointers_alias", m.pointersAlias}, {"silence_experiment", m.experiment},
+            {"input_address", QString::number(m.inputAddress, 16)},
+            {"output_address", QString::number(m.outputAddress, 16)},
+            {"owner_address", QString::number(m.ownerAddress, 16)},
+            {"original_ns", QString::number(c.originalNanoseconds)},
+            {"callback_ns", QString::number(c.callbackNanoseconds)},
+            {"original_result", c.callbackResult}, {"capture", sampleJson(record.capture)},
+            {"post_original", sampleJson(record.postOriginal)}});
+    }
+    const auto distribution = [](std::vector<double> values) {
+        if (values.empty()) return QJsonObject{};
+        std::sort(values.begin(), values.end());
+        return QJsonObject{{"p50_ns", values[(values.size() - 1) / 2]},
+            {"p95_ns", values[static_cast<std::size_t>(std::ceil(values.size() * 0.95)) - 1]},
+            {"max_ns", values.back()}};
+    };
+    QJsonArray listenerRecords;
+    for (std::size_t index = 0; index < g_listenerProbe.claimed(); ++index) {
+        Record record;
+        if (!g_listenerProbe.snapshot(index, record)) continue;
+        const auto &extra = g_listenerProbeExtra[index]; // Covered by recorder release/acquire.
+        const auto &m = record.metadata;
+        QJsonArray before, sink;
+        for (std::size_t i = 0; i < (std::min)(m.frames, kSampleFrames) * m.outputChannels; ++i) {
+            before.append(extra.outputBefore[i]);
+            if (extra.sinkApplied) sink.append(extra.sinkOutput[i]);
+        }
+        listenerRecords.append(QJsonObject{{"index", qint64(index)},
+            {"sequence", QString::number(m.sequence)}, {"callback_sequence", QString::number(m.parentSequence)},
+            {"timestamp_ns", QString::number(m.timestampNanoseconds)}, {"frames", qint64(m.frames)},
+            {"input_channels", qint64(m.inputChannels)}, {"output_channels", qint64(m.outputChannels)},
+            {"internal_sample_rate", m.sampleRate}, {"thread", qint64(m.thread)},
+            {"unit_address", QString::number(m.ownerAddress, 16)}, {"state_address", QString::number(extra.state, 16)},
+            {"unit_enabled_at_entry", extra.enabled}, {"state_pointer_stable", extra.stateStable},
+            {"input_peak_before", extra.inputPeakBefore}, {"input_peak_after", extra.inputPeakAfter},
+            {"output_peak_after", extra.outputPeakAfter}, {"peak_nonfinite_mask", qint64(extra.peakNonFiniteMask)},
+            {"output_before", before}, {"output_before_nonfinite_mask", qint64(extra.outputBeforeNonFiniteMask)},
+            {"sink_applied", extra.sinkApplied}, {"sink_busy", extra.sinkBusy},
+            {"sink_output", sink}, {"sink_nonfinite_mask", qint64(extra.sinkNonFiniteMask)},
+            {"input", sampleJson(record.capture)}, {"output_after", sampleJson(record.postOriginal)},
+            {"original_ns", QString::number(record.completion.originalNanoseconds)},
+            {"observed_ns", QString::number(record.completion.callbackNanoseconds)},
+            {"returned_full_frames", record.completion.callbackResult == 0}});
+    }
+    const bool listenerComplete = !g_listenerProbeRequested ||
+        (g_listenerProbeInstalled && listenerRecords.size() == int(kCapacity));
+    const auto pcm = exportInputPcmProbe(actualAsioRate, asioRateResult);
+    const bool pcmComplete = !g_inputPcmProbe.enabled() || pcm.value("complete").toBool();
+    const auto drain = drainProbeSnapshot();
+    const bool drainComplete = (!g_drainProbeRequested && !g_overlayProbeRequested) || drain.value("complete").toBool();
+    return {{"schema", 1}, {"scope", "P13-0_experiment"}, {"acceptance", "not_evaluated"},
+        {"input_monitor", inputMonitorSnapshot()},
+        {"monitor_latency_mapping_valid", g_monitorLatencyMappingValid.load()},
+        {"enabled", g_inputProbe.enabled()}, {"capacity", int(kCapacity)},
+        {"claimed", qint64(g_inputProbe.claimed())}, {"published", records.size()},
+        {"complete", records.size() == int(kCapacity) && listenerComplete && pcmComplete && drainComplete}, {"silence_requested", g_inputProbeSilence},
+        {"drain_probe", drain},
+        {"stream_lifecycle_probe", asioprobe::snapshot()},
+        {"pcm_probe", QJsonObject{{"enabled", g_inputPcmProbe.enabled()}, {"complete", pcm.value("complete")},
+            {"manifest", "p13-pcm.json"}, {"claimed", pcm.value("claimed")},
+            {"published", pcm.value("published")}, {"error", pcm.value("error")}}},
+        {"listener_probe", QJsonObject{{"requested", g_listenerProbeRequested},
+            {"sink_requested", g_listenerSinkRequested},
+            {"installed", g_listenerProbeInstalled}, {"published", listenerRecords.size()},
+            {"complete", listenerRecords.size() == int(kCapacity)}, {"records", listenerRecords},
+            {"scope", "bounded_experiment; output_before/after are caller buffers; optional sink diverts only listener output for recorded calls; native DSP and meters still run; shared SRC/ring history is not cleared; peak getters can reset concurrently"}}},
+        {"actual_asio_sample_rate", actualAsioRate > 0 ? QJsonValue(actualAsioRate) : QJsonValue()},
+        {"actual_asio_sample_rate_query_result", asioRateResult},
+        {"actual_asio_sample_rate_query_source", "ASIOGetSampleRate_thunk_0x6A540_ASIOError"},
+        {"actual_rate_observation_scope", "current_driver_control_thread_query_not_atomic_with_records"},
+        {"callback_timing", distribution(std::move(callbackTimes))},
+        {"original_timing", distribution(std::move(originalTimes))},
+        {"conditional_callback_budget_exceedances", actualAsioRate > 0 ? QJsonValue(deadlineMisses) : QJsonValue()},
+        {"callback_budget_scope", "current_control_rate_assumed_constant_during_window; not_complete_device_deadline"},
+        {"callbacks_with_status_flags", statusFlags},
+        {"timing_includes_probe_overhead", true},
+        {"timing_excludes_recorder_publication", true},
+        {"notes", "Requested stream rate can differ from actual ASIO rate. Driver frames are read independently; generation is known only for bound lifecycle proxies. Short samples are not full PCM or physical loopback latency evidence."},
+        {"records", records}};
+}
+#endif
+
+void prepareIndependentInputBackend(bool hasSelection, state::InputMonitorMode mode) {
+    if (!hasSelection || mode != state::InputMonitorMode::LowLatencyOverlay) return;
+    if (!g_runtime.stream.ready()) prepare(g_verification, true);
+    if (g_initial.hostSupported && g_runtime.stream.ready()) {
+        if (!g_listenerProbeInstalled) g_listenerProbeInstalled = installListenerProbe();
+        // The ordinary host reset preserves its device configuration and
+        // obtains a lifecycle-owned stream. No second stream is opened.
+        if (asioprobe::install(g_runtime.audioModule)) {
+            const auto stream = asioprobe::currentStream();
+            if (!stream.bound && stream.binding != asioprobe::BindingState::HostLimited)
+                asioprobe::requestNativeReset();
+        }
+    }
+}
+
+bool requestInputVst3Selection(const std::vector<Vst3SelectionEntry> &selection,
+                                std::string *error) noexcept {
+    if (error) error->clear();
+    if (!onQtThread() || selection.size() > SelectionSlot::kMaxEffects) {
+        if (error) *error = "input_selection_invalid";
+        return false;
+    }
+    state::InputMonitorMode mode;
+    {
+        std::lock_guard<std::mutex> requestLock(g_runtime.selectionRequestMutex);
+        mode = g_runtime.pendingInputSettings.mode;
+    }
+    prepareIndependentInputBackend(!selection.empty(), mode);
+    startSelectionWorker();
+    {
+        std::lock_guard<std::mutex> lock(g_runtime.selectionRequestMutex);
+        g_runtime.pendingInputSelection = selection;
+        g_runtime.inputSelectionRequestPending = true;
+        ++g_runtime.inputRequestGeneration;
+    }
+    wakeSelectionWorker();
+    return true;
+}
+
+bool requestInputMonitorSettings(const state::InputMonitorSettings &settings,
+                                  std::string *error) noexcept {
+    if (error) error->clear();
+    if (!onQtThread()) { if (error) *error = "input_control_thread_required"; return false; }
+    QJsonObject chain;
+    QString detail;
+    if (!state::loadChain(chain) || !state::setInputMonitorSettings(chain, settings, &detail)) {
+        if (error) *error = detail.isEmpty() ? "input_settings_load_failed" : detail.toStdString();
+        return false;
+    }
+    bool hasInputSelection = false;
+    {
+        std::lock_guard<std::mutex> requestLock(g_runtime.selectionRequestMutex);
+        hasInputSelection = !g_runtime.pendingInputSelection.empty();
+    }
+    prepareIndependentInputBackend(hasInputSelection, settings.mode);
+    if (!state::writeChain(chain)) { if (error) *error = "input_settings_save_failed"; return false; }
+    startSelectionWorker();
+    {
+        std::lock_guard<std::mutex> lock(g_runtime.selectionRequestMutex);
+        g_runtime.pendingInputSettings = settings;
+        g_runtime.inputSelectionRequestPending = true;
+        ++g_runtime.inputRequestGeneration;
+    }
+    wakeSelectionWorker();
+    return true;
+}
+
+QJsonObject inputMonitorSnapshot() {
+    std::unique_lock<std::mutex> lock(g_runtime.selectionMutex, std::try_to_lock);
+    if (!lock.owns_lock()) return {{"state", "preparing"}};
+    state::InputMonitorSettings requested;
+    bool pending = false;
+    {
+        std::lock_guard<std::mutex> requestLock(g_runtime.selectionRequestMutex);
+        requested = g_runtime.pendingInputSettings;
+        pending = g_runtime.inputSelectionRequestPending;
+    }
+    const char *modes[]{"off", "legacy", "low_latency_overlay"};
+    const char *phases[]{"off", "legacy", "preparing", "draining", "active", "muted", "host_limited"};
+    const auto callbackPhase = g_inputMonitor.callbackPhase.load();
+    const int reportedPhase = callbackPhase != 0 && input::MonitorExchange::versionOf(callbackPhase) == g_inputMonitor.exchange.version()
+        ? int(callbackPhase & 7) : g_inputMonitor.phase.load();
+    const auto phase = !g_inputMonitor.exchange.suppressed() &&
+        requested.mode != state::InputMonitorMode::LowLatencyOverlay
+        ? (requested.mode == state::InputMonitorMode::Legacy ? 1 : 0) : reportedPhase;
+    // Measurements belong to the callback configuration that produced them.
+    // A retained slot alone does not validate a new/unsupported stream.
+    const auto configurationToken = g_inputMonitor.configurationToken.load(std::memory_order_acquire);
+    const bool configurationValidated = !pending && configurationToken != 0 &&
+        g_inputMonitor.exchange.current(configurationToken) && phase >= 3 && phase <= 5;
+    const QString details[]{QStringLiteral("输入扩展已关闭"), QStringLiteral("兼容输入路由"),
+        QStringLiteral("正在准备输入插件"), QStringLiteral("正在排空原生监听缓存"),
+        QStringLiteral("独立输入监听已生效"), QStringLiteral("输入监听已静音；GP 播放继续"),
+        QStringLiteral("当前宿主输入边界尚未通过验证")};
+    std::uint64_t latency = 0;
+    const int index = g_inputMonitor.retained;
+    if (index >= 0)
+        for (const auto &effect : g_inputMonitor.monitorSlots[index].selection.effects)
+            if (effect && effect->processor) latency += effect->processor->getLatencySamples();
+    return {{"state", pending ? "preparing" : phases[phase]},
+        {"mode", modes[static_cast<int>(requested.mode)]}, {"gain", requested.gain},
+        {"detail", details[phase]}, {"error", QString::fromStdString(g_inputMonitor.error)},
+        {"configuration_validated", configurationValidated},
+        {"sample_rate", configurationValidated ? g_inputMonitor.actualRate.load() : 0},
+        {"buffer_frames", configurationValidated ? qint64(g_inputMonitor.frames.load()) : 0},
+        {"driver_buffer_frames", configurationValidated ? qint64(g_inputMonitor.driverFrames.load()) : 0},
+        {"process_frames", configurationValidated ? qint64(g_inputMonitor.processFrames.load()) : 0},
+        {"input_channels", configurationValidated ? qint64(g_inputMonitor.channels.load()) : 0},
+        {"prepared_capacity", qint64(portaudio::kMaxFrames)},
+        {"plugin_latency_samples", QString::number(latency)},
+        {"input_native_effect_bypass", g_inputMonitor.nativeSuppressed.load()},
+        {"processed_blocks", QString::number(g_inputMonitor.blocks.load())},
+        {"callback_fault_stage", g_inputMonitor.callbackFault.load()},
+        {"listener_fault_flags", g_inputMonitor.listenerFaultFlags.load()},
+        {"listener_returned_frames", qint64(g_inputMonitor.listenerReturnedFrames.load())},
+        {"listener_requested_frames", qint64(g_inputMonitor.listenerRequestedFrames.load())},
+        {"fault_listener_calls", int(g_inputMonitor.faultListenerCalls.load())},
+        {"fault_src_calls", int(g_inputMonitor.faultSrcCalls.load())},
+        {"error_blocks", QString::number(g_inputMonitor.errors.load())},
+        {"configuration_rejected_blocks", QString::number(g_inputMonitor.configurationRejectedBlocks.load())},
+        {"clipped_blocks", QString::number(g_inputMonitor.clipped.load())}};
+}
+
+std::vector<Vst3SelectionEntry> captureInputVst3States() {
+    std::unique_lock<std::recursive_mutex> editorLock(g_runtime.editorMutex, std::try_to_lock);
+    if (!editorLock.owns_lock()) return {};
+    std::unique_lock<std::mutex> lock(g_runtime.selectionMutex, std::try_to_lock);
+    if (!lock.owns_lock() || g_inputMonitor.retained < 0) return {};
+    std::vector<Vst3SelectionEntry> result;
+    auto &slot = g_inputMonitor.monitorSlots[g_inputMonitor.retained].selection;
+    for (std::size_t i = 0; i < slot.count; ++i) result.push_back(slot.effects[i]->captureState());
+    return result;
+}
+
+bool openInputVst3Editor(const Vst3SelectionEntry &entry, void *parentWindow) noexcept {
+    if (!parentWindow || g_inEditorCallback || !onQtThread()) return false;
+    std::unique_lock<std::recursive_mutex> editorLock(g_runtime.editorMutex, std::try_to_lock);
+    if (!editorLock.owns_lock()) return false;
+    std::unique_lock<std::mutex> lock(g_runtime.selectionMutex, std::try_to_lock);
+    if (!lock.owns_lock() || g_inputMonitor.retained < 0) return false;
+    auto &slot = g_inputMonitor.monitorSlots[g_inputMonitor.retained].selection;
+    for (std::size_t i = 0; i < slot.count; ++i) {
+        const auto effect = slot.effects[i];
+        if (effect->identity.module != entry.module || effect->identity.classId != entry.classId) continue;
+        lock.unlock();
+        EditorCallbackScope callbackScope;
+        closeVst3Editors();
+        g_runtime.editorRequestGeneration.fetch_add(1);
+        g_runtime.editorIdentity = "input\n" + entry.module + "\n" + entry.classId;
+        const bool opened = effect->openEditor(static_cast<HWND>(parentWindow));
+        g_runtime.editorStage.store(effect->editorStage.load());
+        g_runtime.editorResultCode.store(effect->editorResultCode.load());
+        g_runtime.editorError = effect->getEditorError();
+        if (opened) std::atomic_store(&g_openEditorEffect, effect);
+        return opened;
+    }
+    return false;
 }
 
 bool setVst3Selection(const std::vector<Vst3SelectionEntry> &selection, std::string *error) noexcept {
@@ -3871,7 +5782,7 @@ bool setVst3Selection(const std::vector<Vst3SelectionEntry> &selection, std::str
     g_runtime.selectionStatus.store(2, std::memory_order_release);
     // P7 controls are called on the Qt control thread. Install before taking
     // selectionMutex because prepare() also locks it to restore a saved chain.
-    if (!g_runtime.master.installed && !selection.empty()) {
+    if (!g_runtime.master.ready() && !selection.empty()) {
         const auto prepared = prepare(g_verification, true);
         if (!prepared.installed) {
             if (error) *error = prepared.reason;
@@ -3879,7 +5790,7 @@ bool setVst3Selection(const std::vector<Vst3SelectionEntry> &selection, std::str
         }
     }
     std::lock_guard<std::mutex> lock(g_runtime.selectionMutex);
-    if (!g_runtime.master.installed && selection.empty()) {
+    if (!g_runtime.master.ready() && selection.empty()) {
         g_runtime.requestedSelection.clear();
         return true;
     }
@@ -3908,7 +5819,7 @@ bool requestGlobalVst3Selection(const std::vector<Vst3SelectionEntry> &selection
         if (error) *error = "runtime_vst3_chain_full";
         return false;
     }
-    if (!selection.empty() && !g_runtime.master.installed) {
+    if (!selection.empty() && !g_runtime.master.ready()) {
         updateAudioLayerState();
         const auto prepared = prepare(g_verification, true);
         if (!prepared.installed) { if (error) *error = prepared.reason; return false; }
@@ -3940,6 +5851,12 @@ void saveVst3States() {
     if (!editorLock.owns_lock()) return;
     std::unique_lock<std::mutex> lock(g_runtime.selectionMutex, std::try_to_lock);
     if (!lock.owns_lock()) return;
+    if (g_inputMonitor.retained >= 0) {
+        std::vector<Vst3SelectionEntry> entries;
+        auto &slot = g_inputMonitor.monitorSlots[g_inputMonitor.retained].selection;
+        for (std::size_t i = 0; i < slot.count; ++i) entries.push_back(slot.effects[i]->captureState());
+        persistRuntimeEntries(entries, state::ScopeKind::Input);
+    }
     const auto active = g_runtime.chain.snapshot().activeSlot;
     if (active >= 0 && g_runtime.selectionMode.load(std::memory_order_acquire)) {
         std::vector<Vst3SelectionEntry> entries;
@@ -3974,6 +5891,24 @@ void setVst3Catalog(const QJsonArray &catalog) {
     }
     // Catalog delivery updates metadata; background preloading and explicit
     // activation are both serialized by the selection worker.
+    if (!g_inputMonitor.intentLoaded) {
+        QJsonObject chain;
+        if (state::loadChain(chain)) {
+            g_inputMonitor.intentLoaded = true;
+            state::InputMonitorSettings settings;
+            state::readInputMonitorSettings(chain, settings);
+            const auto selection = enabledSelectionFromScope(state::ScopeKind::Input);
+            {
+                std::lock_guard<std::mutex> lock(g_runtime.selectionRequestMutex);
+                if (g_runtime.inputRequestGeneration == 0) {
+                    g_runtime.pendingInputSettings = settings;
+                    g_runtime.pendingInputSelection = selection;
+                }
+            }
+            if (chain.value("input").toObject().contains("monitor_mode"))
+                requestInputMonitorSettings(settings);
+        }
+    }
     refreshTrackContextImpl();
 }
 
@@ -4051,7 +5986,7 @@ void preloadSavedSelections() noexcept {
     }
     // Install dormant dispatch before the worker starts. Later UI requests
     // never block in prepare() behind a preload's call into Qt.
-    if (!g_runtime.master.installed && !prepare(g_verification, true).installed) return;
+    if (!g_runtime.master.ready() && !prepare(g_verification, true).installed) return;
     updateAudioLayerState();
     const double rate = callbackSampleRate();
     startSelectionWorker();
@@ -4084,7 +6019,7 @@ bool consumeSelectionStateChanges() noexcept {
 bool vst3SelectionPending() noexcept {
     std::lock_guard<std::mutex> lock(g_runtime.selectionRequestMutex);
     return g_runtime.selectionWorkerBusy.load(std::memory_order_acquire) ||
-        g_runtime.selectionRequestPending || !g_runtime.pendingTrackSelections.empty() ||
+        g_runtime.selectionRequestPending || g_runtime.inputSelectionRequestPending || !g_runtime.pendingTrackSelections.empty() ||
         g_runtime.trackContextRequestPending || !g_runtime.pendingPreloads.empty();
 }
 
@@ -4119,7 +6054,7 @@ bool requestTrackVst3SelectionAtGeneration(const std::string &trackKey,
         return false;
     }
     // Install the host hook before handing plug-in initialization to the worker.
-    if (!selection.empty() && !g_runtime.dsp.installed) {
+    if (!selection.empty() && !g_runtime.dsp.ready()) {
         const auto prepared = prepare(g_verification, true);
         if (!prepared.installed) {
             if (error) *error = prepared.reason;

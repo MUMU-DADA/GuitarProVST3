@@ -15,6 +15,11 @@
 #include <QtCore/QMetaObject>
 #include <QtCore/QPointer>
 #include <atomic>
+#ifdef GPVST3_P13_PROBE_BUILD
+#include <QtCore/QJsonDocument>
+#include <QtCore/QDir>
+#include <QtCore/QSaveFile>
+#endif
 
 namespace {
 
@@ -420,6 +425,7 @@ QJsonObject hookStatus(const gpvst3::hook::State &value) {
         {"input_capture_path_located", value.inputCapturePathLocated},
         {"input_capture_observed", value.inputCaptureObserved},
         {"input_route_enabled", value.inputRouteEnabled},
+        {"input_monitor", gpvst3::hook::inputMonitorSnapshot()},
         {"input_after_original_blocks", qint64(value.inputAfterOriginalBlocks)},
         {"input_post_original_hash", QString::number(value.inputPostOriginalHash, 16)},
         {"input_post_route_hash", QString::number(value.inputPostRouteHash, 16)},
@@ -476,6 +482,26 @@ namespace gpvst3::bootstrap {
 
 void shutdown() noexcept {
     g_stopping.store(true, std::memory_order_release);
+#ifdef GPVST3_P13_PROBE_BUILD
+    if (qEnvironmentVariable("GPVST3_P13_PROBE") == "1") {
+        try {
+            QSaveFile file(QDir(state::dataDirectory()).filePath("p13-runtime-final.json"));
+            auto final = hook::stopInputTimingProbe();
+            final.insert("schema", 1);
+            final.insert("acceptance", "not_evaluated");
+            final.insert("input_monitor", hook::inputMonitorSnapshot());
+            const auto bytes = QJsonDocument(final).toJson();
+            if (file.open(QIODevice::WriteOnly) && file.write(bytes) == bytes.size()) file.commit();
+        } catch (...) {}
+    }
+    if (qEnvironmentVariable("GPVST3_P13_STREAM_PROBE") == "1") {
+        try {
+            QSaveFile file(QDir(state::dataDirectory()).filePath("p13-stream-lifecycle-final.json"));
+            const auto bytes = QJsonDocument(hook::inputStreamProbeSnapshot()).toJson();
+            if (file.open(QIODevice::WriteOnly) && file.write(bytes) == bytes.size()) file.commit();
+        } catch (...) {}
+    }
+#endif
     if (g_scanTimer) g_scanTimer->stop();
     if (g_trackFallbackTimer) g_trackFallbackTimer->stop();
     gp_audio::setRefreshNotifier(nullptr);
@@ -516,6 +542,9 @@ QJsonObject initialize(const host::Verification &verification) {
         ui::setVst3TrackControls(&hook::captureTrackVst3States, &hook::openTrackVst3Editor,
                                  &hook::activeTrackVst3States);
         ui::setVst3EditorControl(&hook::openVst3Editor, &hook::closeVst3Editors, &hook::scaleVst3Editor);
+        ui::setVst3InputControls(&hook::requestInputVst3Selection, &hook::captureInputVst3States,
+                                &hook::openInputVst3Editor, &hook::requestInputMonitorSettings,
+                                &hook::inputMonitorSnapshot);
     } else {
         ui::setRealtimeBypassControl(nullptr);
         ui::setVst3SelectionControl(nullptr);
@@ -526,8 +555,36 @@ QJsonObject initialize(const host::Verification &verification) {
         ui::setVst3StateControl(nullptr);
         ui::setVst3TrackControls(nullptr, nullptr);
         ui::setVst3EditorControl(nullptr, nullptr, nullptr);
+        ui::setVst3InputControls(nullptr, nullptr, nullptr, nullptr, nullptr);
     }
     const auto hookState = hook::snapshot();
+#ifdef GPVST3_P13_PROBE_BUILD
+    if (enabled && qEnvironmentVariable("GPVST3_P13_PROBE") == "1") {
+        // A bounded experiment window, never a production maintenance poll.
+        auto *probeTimer = new QTimer(QCoreApplication::instance());
+        probeTimer->setInterval(1000);
+        QObject::connect(probeTimer, &QTimer::timeout, probeTimer, [probeTimer, remaining = 90]() mutable {
+            if (g_stopping.load(std::memory_order_acquire)) {
+                probeTimer->stop();
+                probeTimer->deleteLater();
+                return;
+            }
+            const auto probe = gpvst3::hook::inputProbeSnapshot();
+            QSaveFile file(QDir(gpvst3::state::dataDirectory()).filePath("p13-input-probe.json"));
+            bool written = false;
+            if (file.open(QIODevice::WriteOnly)) {
+                const auto bytes = QJsonDocument(probe).toJson();
+                if (file.write(bytes) == bytes.size()) written = file.commit();
+                else file.cancelWriting();
+            }
+            if (--remaining <= 0 || (written && (probe.value("complete").toBool() || !probe.value("enabled").toBool()))) {
+                probeTimer->stop();
+                probeTimer->deleteLater();
+            }
+        });
+        probeTimer->start();
+    }
+#endif
     vst3::State vst3;
     if (enabled) {
         vst3::setRecognitionControl(&vst3::identifyBundle);

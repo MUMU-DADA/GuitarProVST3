@@ -2,6 +2,84 @@
 
 测试使用已安装的 Guitar Pro 8.1.1.17 进程加载仓库 DLL，不复制、覆盖或安装测试宿主。测试数据、缓存、临时 DLL 和日志写入被忽略的 `.tools/` 或 `artifacts/`。
 
+## P13 输入监听验证
+
+普通构建包含独立 input 链、listener 分流、共享 SRC/ring 排空与 ASIO 生命周期保护。实验构建另外提供短样本、连续 PCM、逐样本共存观察和有界计时；两者必须分别验证，实验 DLL 不可发布。构建前检查 `git status`；真实宿主测试串行运行，collector 只操作自身创建的 Guitar Pro 进程，已有用户进程时拒绝启动。
+
+### 离线专项
+
+```powershell
+./native/test/test-p4-router.ps1
+./native/test/test-p13-drain.ps1
+./native/test/test-p13-input-exchange.ps1
+./native/test/test-p13-input-state.ps1
+./native/test/test-p13-input-runtime.ps1
+./native/test/test-p13-input-ui.ps1
+./native/test/test-p13-asio-lifecycle.ps1
+./native/test/test-p13-minhook-strict.ps1
+./native/test/test-p13-probe.ps1
+./native/test/test-p13-drain-probe.ps1
+./native/test/test-p13-pcm-probe.ps1
+./native/test/test-p13-timing-probe.ps1
+python -m unittest discover -s native/test -p 'test_analyze_p13_*.py'
+```
+
+Python 分析器需要 NumPy。各 PowerShell 入口支持独立 `-OutputRoot`，Qt 相关入口可传 `-QtDir`。这些专项覆盖 overlay/旧路由、可变帧、容量和别名、故障整块回退、排空计数、并发发布、state/editor 隔离、stream 生命周期、严格 hook 安装回滚和观测完整性；它们不等同于真实宿主音频验证。
+
+### 普通构建与三链宿主矩阵
+
+```powershell
+./native/build.ps1 -OutputRoot .tools/native/p13-production
+./native/test/build-p7-gain-fixture.ps1 -OutputRoot .tools/native/p13-gain-fixture
+./native/test/collect-p13-host.ps1 -ProductionRuntime -PluginPath .tools/native/p13-production/plugins/imageformats/guitarpro_vst3_autoload.dll -InputOverlayFixture '.tools/native/p13-gain-fixture/P7 Gain Fixture.vst3' -EnableNativeListener -RseVst3 -InputOverlaySwitches 5 -CaptureSeconds 15
+./native/test/collect-p13-host.ps1 -ProductionRuntime -PluginPath .tools/native/p13-production/plugins/imageformats/guitarpro_vst3_autoload.dll -InputOverlayFixture '.tools/native/p13-gain-fixture/P7 Gain Fixture.vst3' -EnableNativeListener -RseVst3 -ScopeMatrix -CaptureSeconds 5
+./native/test/collect-p13-host.ps1 -ProductionRuntime -PluginPath .tools/native/p13-production/plugins/imageformats/guitarpro_vst3_autoload.dll -InputOverlayFixture '.tools/native/p13-gain-fixture/P7 Gain Fixture.vst3' -EnableNativeListener -DeviceMatrix -CaptureSeconds 5
+```
+
+`-RseVst3` 检查 input、track、global 均实际处理；`-ScopeMatrix` 使用三个独立 fixture editor 设置不同 gain，检查启停、切谱、清空 input 和恢复。`-DeviceMatrix` 保存并恢复设备配置，区分成功切流、宿主拒绝后恢复，以及 Standard→ASIO 自动恢复；拒绝某个 buffer 不算该 buffer 的运行证据。不要把切流期间的配置拒绝计数误写为稳态插件错误。
+
+仍需用上述普通 DLL 运行 `test-p8-track-runtime.ps1 -CheckLifecycle`，覆盖音轨交换/增删/撤销/另存/重开/重启。该入口的 `-Vst3Root` 传完整绝对路径，避免重启子进程后相对路径失效。无 input 的 P8 回归只能证明旧链路，没有同时运行 input 时不能用于三链共存结论。
+
+### 实验观察与计时
+
+```powershell
+./native/build.ps1 -EnableP13Probe -OutputRoot .tools/native/p13-probe
+./native/test/collect-p13-host.ps1 -PluginPath .tools/native/p13-probe/plugins/imageformats/guitarpro_vst3_autoload.dll
+./native/test/analyze-p13-probe.ps1 -CollectionPath artifacts/<本次目录>/collection.json
+./native/test/collect-p13-host.ps1 -PluginPath .tools/native/p13-probe/plugins/imageformats/guitarpro_vst3_autoload.dll -InputOverlayFixture '.tools/native/p13-gain-fixture/P7 Gain Fixture.vst3' -EnableNativeListener -RseVst3 -StreamLifecycleProbe -RestartAsioStream -OverlayCoexistenceProbe -InputOverlaySwitches 5 -CaptureSeconds 15 -ProbeDelayMilliseconds 20000
+./native/test/collect-p13-host.ps1 -PluginPath .tools/native/p13-probe/plugins/imageformats/guitarpro_vst3_autoload.dll -InputOverlayFixture '.tools/native/p13-gain-fixture/P7 Gain Fixture.vst3' -EnableNativeListener -RseVst3 -StreamLifecycleProbe -RestartAsioStream -InputOverlaySwitches 5 -CaptureSeconds 120 -ProbeDelayMilliseconds 20000
+```
+
+普通采集默认不改设备或替换输入。显式 `-RestartAsioStream`、`-DeviceMatrix` 和回环测量会在测试宿主中调整配置，并在退出前恢复、读回确认。`-NativeEffectsMatrix` 可与 RSE/input 测试组合，开启原生输入效果链并采集实际 UI 电平，结束时恢复原状态；检查 `native_effects` 和对应音频观察，不把有限的内部 peak 字段等同于电平动态验收。
+
+普通构建的 `-NativeListenerSwitches -EnableNativeListener -RseVst3` 验证 overlay 激活期间修改原生 Line-In，再关闭/开启 overlay 不会覆盖用户当前 native 选择。独立冷启动专项 `test-p13-input-startup.ps1 -PluginPath <普通DLL> -FixturePath <P7 Gain Fixture.vst3>` 使用隔离 sidecar，验证两次已保存 input 自动恢复，显式保存 Off 后第三次启动保持零处理，以及参数与增益保留和正常退出；不修改设备配置。input runtime 专项还通过真实 VST3 的 `kLatencyChanged` 通知验证串行延迟求和及 UI observer 更新。
+
+`-OverlayCoexistenceProbe` 要求 unity gain 的 input fixture；逐样本比较最终 output 与本块原 output 加 capture 贡献，并比较送入 output SRC 的样本与 RSE unit 求和，另核对 drain Ready 子窗口。更换非 unity 插件后不能复用同一预期公式。有界长计时以 `data/p13-runtime-final.json` 中的实际起止、`quiesced/coherent`、admitted/completed、身份、预算及通知计数为准；`-CaptureSeconds 120` 不代表已采足 120 秒计时。P50/P95 为 histogram 桶上界，max 为实测值；驱动未发送 overload 通知不证明不存在所有物理 xrun。
+
+在共存命令中去掉 `-InputOverlaySwitches`，增加 `-OverlayTransitionProbe -NativeEffectsMatrix -NativeTailProbe -InspectAudioUnits`，可验证首个抑制块至真正 Ready 的切换以及 native pre-gain 归零后的混响残留。观测器只读生产路由并与独立计数逐块比较，原生增益和效果链 UI 在 finally 中恢复。`-RapidInputSwitches 5` 则用于普通构建的播放中立即取消，记录过渡态并等待实际 Off/旁通恢复，不以过期诊断文件判断失败。切谱测试须等待新 transport/count-in 和 track 处理开始。
+
+### 物理监听延迟
+
+此专项需要持续可识别的输入 1 音源，以及 Analog Out 2→Analog In 2 的物理线。本 collector 的测量模式将 input 1 复制为监听声源，input 2 仅用于采集返回；接线、通道 selector、实际 rate/generation 和配置恢复必须全部核对。依次采集，不能并行启动两个宿主：
+
+```powershell
+./native/test/collect-p13-host.ps1 -PluginPath .tools/native/p13-probe/plugins/imageformats/guitarpro_vst3_autoload.dll -PcmProbe -StreamLifecycleProbe -RestartAsioStream -EnableNativeListener -MonitorLatency native
+./native/test/collect-p13-host.ps1 -PluginPath .tools/native/p13-probe/plugins/imageformats/guitarpro_vst3_autoload.dll -PcmProbe -StreamLifecycleProbe -RestartAsioStream -EnableNativeListener -MonitorLatency overlay -InputOverlayFixture '.tools/native/p13-gain-fixture/P7 Gain Fixture.vst3'
+python native/test/analyze-p13-monitor.py artifacts/<native目录> artifacts/<overlay目录> --output artifacts/p13-monitor-delay-comparison.json
+```
+
+结果口径为同步 input 1 参考到 DAC、物理线、ADC、input 2 的监听返回，包含软件监听路径；`analyze-p13-pcm.py` 的设备 output→input 回环估计是另一种口径。信号太弱、停顿、相关峰歧义、分段 lag 不稳定、身份/配置不同或恢复不完整都不能作为延迟改善证据。空白曲谱延迟专项不证明 RSE 共存；削波记录不能用于未削波保真声明。
+
+### 发布门禁
+
+```powershell
+./native/test/test-p6-package.ps1 -PluginPath .tools/native/p13-production/plugins/imageformats/guitarpro_vst3_autoload.dll
+./native/package.ps1 -Version 0.10.0 -PluginPath .tools/native/p13-production/plugins/imageformats/guitarpro_vst3_autoload.dll
+git diff --check
+```
+
+还需核对普通 DLL 不含实验 marker/环境入口，实验 DLL 被打包器拒绝且未创建 staging，以及最终发布 DLL 的真实宿主回归、安装归属收据和卸载安全。collector 的 `collected_unvalidated` 和 analyzer 的 `p13_acceptance=false` 是刻意保留的证据边界：单次工具运行不代替完整门禁。驱动实际 rate、GP 请求 rate、driver block、callback frames、CPU 耗时、插件延迟与物理监听延迟分别记录；实际结果和剩余限制见 [P13 实现记录](P13_IMPLEMENTATION.md)。
+
 ## 构建
 
 ```powershell
@@ -95,7 +173,7 @@ P12 使用生产 DLL 和 P7 Gain Fixture 验证按需运行时、selection/bindi
 
 宿主回归仍需匹配 Guitar Pro 8.1.1.17、MCP bridge 和音频设备；未运行的真实 cursor hook 计数、ASIO/WASAPI 听感和长时 CPU A/B 不由夹具 PASS 代替。
 
-完整预加载与保留实例回归由 `test-p8-runtime.ps1` 覆盖。真实 UI 可用下面的入口验证三个插件逐一启停和输入监听默认关闭；`Vst3Module` 也支持与 `ClassId` 一一对应的多个模块路径。曲谱和 sidecar 写入测试副本，原始文件不变。
+按需准备、保留实例和 warm-cache 回归由 `test-p8-runtime.ps1` 覆盖；当前不再要求完整清单预加载。历史 `test-preload-mcp.ps1` 入口保留用于三个插件逐一启停和输入监听默认关闭验证，不把脚本名当作当前启动策略；`Vst3Module` 支持与 `ClassId` 一一对应的多个模块路径。曲谱和 sidecar 写入测试副本，原始文件不变。
 
 ```powershell
 ./native/test/test-preload-mcp.ps1 -ScorePath C:/path/to/score.gp -PluginPath .tools/native/preload-final-build3/plugins/imageformats/guitarpro_vst3_autoload.dll -Vst3Module '.tools/native/p8-order-test/P8 Order Fixture.vst3' -ClassId @('41302010605080701122334455667788','42302010605080701122334455667788','43302010605080701122334455667788')

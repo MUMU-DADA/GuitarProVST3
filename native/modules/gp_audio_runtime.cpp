@@ -701,16 +701,28 @@ bool checkStructureChanged() noexcept {
     if (!changed) {
         const auto score = g_activeScore.lock();
         if (score) {
-            // Score/Track wrappers may be replaced by Guitar Pro during a
-            // cursor move while their logical track count is unchanged. The
-            // count is the stable topology signal here; pointer identity is
-            // refreshed only after an explicit Score edit or document event.
-            const auto count = score->tracks().size();
+            // New wrapper addresses alone do not prove a topology change:
+            // Guitar Pro also replaces wrappers during cursor movement.
+            // A retained native Track appearing at a different index does
+            // prove a reorder, including a deferred same-count swap after
+            // its Score hook has returned.
+            const auto &tracks = score->tracks();
+            const auto count = tracks.size();
             const auto knownCount = static_cast<std::size_t>(std::count_if(g_nativeTracks.begin(), g_nativeTracks.end(),
                 [&](const NativeTrack &known) {
                     return known.document.toStdString() == g_activeDocumentId && !known.lifetime.expired();
                 }));
             changed = count != knownCount;
+            if (!changed) {
+                for (std::size_t index = 0; index < tracks.size() && !changed; ++index)
+                    for (const auto &known : g_nativeTracks)
+                        if (tracks[index] && known.document.toStdString() == g_activeDocumentId &&
+                            known.index != static_cast<int>(index) &&
+                            known.lifetime.lock() == tracks[index]) {
+                            changed = true;
+                            break;
+                        }
+            }
         }
     }
     if (changed) markExplicitTopologyDirty();

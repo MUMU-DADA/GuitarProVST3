@@ -17,6 +17,7 @@
 #include <condition_variable>
 #include <thread>
 #include <atomic>
+#include <cmath>
 
 namespace gpvst3::state {
 namespace {
@@ -204,6 +205,12 @@ void compactScope(QJsonObject &scope) {
 }
 
 void compactChain(QJsonObject &chain) {
+    if (chain.value("input").isObject()) {
+        auto input = chain.value("input").toObject();
+        normalizeScope(input);
+        compactScope(input);
+        chain.insert("input", input);
+    }
     auto global = chain.value("global").toObject();
     normalizeScope(global);
     compactScope(global);
@@ -231,6 +238,13 @@ void compactChain(QJsonObject &chain) {
 }
 
 void migrateToSchema2(QJsonObject &chain) {
+    // Input is application configuration, never derived from the legacy,
+    // global or score chains. Keep the optional scope independent of migration.
+    if (chain.value("input").isObject()) {
+        auto input = chain.value("input").toObject();
+        normalizeScope(input);
+        chain.insert("input", input);
+    }
     if (chain.value("schema").toInt() == kSchema && chain.value("global").isObject()) {
         auto global = chain.value("global").toObject();
         normalizeScope(global);
@@ -329,6 +343,8 @@ bool disableAllEffectsAtStartup() {
         return scope;
     };
     chain.insert("global", clearScope(chain.value("global").toObject()));
+    if (chain.value("input").isObject())
+        chain.insert("input", clearScope(chain.value("input").toObject()));
     auto scores = chain.value("scores").toObject();
     for (auto score = scores.begin(); score != scores.end(); ++score) {
         auto scoreObject = score.value().toObject();
@@ -368,6 +384,8 @@ bool migrateDesiredEnabledIntent() {
         return scope;
     };
     chain.insert("global", migrateScope(chain.value("global").toObject()));
+    if (chain.value("input").isObject())
+        chain.insert("input", migrateScope(chain.value("input").toObject()));
     auto scores = chain.value("scores").toObject();
     for (auto score = scores.begin(); score != scores.end(); ++score) {
         auto scoreObject = score.value().toObject();
@@ -426,14 +444,9 @@ bool loadChain(QJsonObject &chain, QString *error) {
 bool writeChain(const QJsonObject &input) {
     QJsonObject chain = input;
     if (!chain.value("effects").isArray()) chain.insert("effects", QJsonArray{});
-    bool legacyView = false;
-    for (const auto &value : chain.value("effects").toArray())
-        legacyView |= value.toObject().contains("plugin_path");
-    if (legacyView) {
-        chain.insert("schema", kLegacySchema);
-        chain.remove("global");
-        chain.remove("scores");
-    }
+    // Migrated effects retain legacy aliases for older readers. Those aliases
+    // do not turn an existing schema-2 document back into schema 1: its global,
+    // track and input scopes remain authoritative when input settings are saved.
     migrateToSchema2(chain);
     normalizeEffects(chain);
     compactChain(chain);
@@ -456,6 +469,63 @@ bool writeChain(const QJsonObject &input) {
     }
     chain.insert("saved_at", QDateTime::currentDateTimeUtc().toString(Qt::ISODate));
     return writeJson(sidecarPath(), chain);
+}
+
+bool readInputMonitorSettings(const QJsonObject &chain, InputMonitorSettings &settings,
+                              QString *error) {
+    settings = {};
+    if (error) error->clear();
+    const auto fail = [error](const char *reason) {
+        if (error) *error = QString::fromLatin1(reason);
+        return false;
+    };
+    const auto value = chain.value("input");
+    if (value.isUndefined()) return true;
+    if (!value.isObject()) return fail("invalid_input_scope");
+    const auto input = value.toObject();
+    InputMonitorSettings requested;
+    const auto mode = input.value("monitor_mode");
+    if (!mode.isUndefined()) {
+        if (!mode.isString()) return fail("invalid_input_monitor_mode");
+        const auto name = mode.toString();
+        if (name == QStringLiteral("off")) requested.mode = InputMonitorMode::Off;
+        else if (name == QStringLiteral("legacy")) requested.mode = InputMonitorMode::Legacy;
+        else if (name == QStringLiteral("low_latency_overlay")) requested.mode = InputMonitorMode::LowLatencyOverlay;
+        else return fail("invalid_input_monitor_mode");
+    }
+    const auto gain = input.value("input_gain");
+    if (!gain.isUndefined()) {
+        if (!gain.isDouble() || !std::isfinite(gain.toDouble()) || gain.toDouble() < 0.0 ||
+            gain.toDouble() > 4.0) return fail("invalid_input_gain");
+        requested.gain = gain.toDouble();
+    }
+    settings = requested;
+    return true;
+}
+
+bool setInputMonitorSettings(QJsonObject &chain, const InputMonitorSettings &settings,
+                             QString *error) {
+    if (error) error->clear();
+    const auto fail = [error](const char *reason) {
+        if (error) *error = QString::fromLatin1(reason);
+        return false;
+    };
+    QString mode;
+    switch (settings.mode) {
+    case InputMonitorMode::Off: mode = QStringLiteral("off"); break;
+    case InputMonitorMode::Legacy: mode = QStringLiteral("legacy"); break;
+    case InputMonitorMode::LowLatencyOverlay: mode = QStringLiteral("low_latency_overlay"); break;
+    default: return fail("invalid_input_monitor_mode");
+    }
+    if (!std::isfinite(settings.gain) || settings.gain < 0.0 || settings.gain > 4.0)
+        return fail("invalid_input_gain");
+    const auto value = chain.value("input");
+    if (!value.isUndefined() && !value.isObject()) return fail("invalid_input_scope");
+    auto input = value.toObject();
+    input.insert("monitor_mode", mode);
+    input.insert("input_gain", settings.gain);
+    chain.insert("input", input);
+    return true;
 }
 
 QString currentScoreKey() {
@@ -517,6 +587,11 @@ QString runtimeTrackId() {
 
 QJsonArray scopeEffects(const QJsonObject &input, ScopeKind scope, const ScoreKey &score,
                         const TrackKey &track) {
+    if (scope == ScopeKind::Input) {
+        auto inputScope = input.value("input").toObject();
+        normalizeScope(inputScope);
+        return inputScope.value("effects").toArray();
+    }
     QJsonObject chain = input;
     migrateToSchema2(chain);
     if (scope == ScopeKind::Global) return chain.value("global").toObject().value("effects").toArray();
@@ -530,6 +605,14 @@ QJsonArray scopeEffects(const QJsonObject &input, ScopeKind scope, const ScoreKe
 void setScopeEffects(QJsonObject &chain, ScopeKind scope, const QJsonArray &effects,
                      const ScoreKey &score, const TrackKey &track, int trackIndex,
                      const QString &trackName) {
+    if (scope == ScopeKind::Input) {
+        auto input = chain.value("input").toObject();
+        input.insert("effects", effects);
+        normalizeScope(input);
+        compactScope(input);
+        chain.insert("input", input);
+        return;
+    }
     migrateToSchema2(chain);
     QJsonObject scopeObject{{"effects", effects}};
     normalizeScope(scopeObject);

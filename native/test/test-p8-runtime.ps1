@@ -9,8 +9,9 @@ if ($LASTEXITCODE) { throw 'P8 order fixture build failed.' }
 $sdk = Join-Path $root 'third_party/vst3sdk'
 $sources = @((Join-Path $PSScriptRoot 'p8_runtime_test.cpp')) + @('audio_adapter','effect_chain','input_router','state_manager' | ForEach-Object { Join-Path $root "native/modules/$_.cpp" }) +
     @("$sdk/pluginterfaces/base/coreiids.cpp", "$sdk/pluginterfaces/base/funknown.cpp", "$sdk/pluginterfaces/base/ustring.cpp", "$sdk/public.sdk/source/common/memorystream.cpp", "$sdk/public.sdk/source/vst/vstinitiids.cpp")
+$sources += @((Join-Path $root 'native/modules/asio_lifecycle_probe.cpp')) + @('buffer.c','hook.c','trampoline.c','hde/hde64.c' | ForEach-Object { Join-Path $root "native/third_party/minhook/src/$_" })
 $dll = Join-Path $OutputRoot 'p8_runtime_test.dll'
-& cl /nologo /LD /std:c++17 /EHsc /MD /O2 /utf-8 /D_CRT_SECURE_NO_WARNINGS "/I$QtDir/include" "/I$QtDir/include/QtCore" "/I$sdk" @sources "/Fo$OutputRoot/" "/Fe$dll" /link "/LIBPATH:$QtDir/lib" Qt5Core.lib Qt5Gui.lib Qt5Widgets.lib Ole32.lib User32.lib "/IMPLIB:$OutputRoot/runtime-test.lib"
+& cl /nologo /LD /std:c++17 /EHsc /MD /O2 /utf-8 /D_CRT_SECURE_NO_WARNINGS "/I$QtDir/include" "/I$QtDir/include/QtCore" "/I$sdk" "/I$root/native/third_party/minhook/include" @sources "/Fo$OutputRoot/" "/Fe$dll" /link "/LIBPATH:$QtDir/lib" Qt5Core.lib Qt5Gui.lib Qt5Widgets.lib Ole32.lib User32.lib "/IMPLIB:$OutputRoot/runtime-test.lib"
 if ($LASTEXITCODE) { throw 'P8 runtime fixture build failed.' }
 & (Join-Path $PSScriptRoot 'build-p8-standalone-driver.ps1') -QtDir $QtDir
 . (Join-Path $PSScriptRoot 'host-session.ps1')

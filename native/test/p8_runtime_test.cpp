@@ -332,6 +332,7 @@ bool hasActiveDocument() noexcept { return !testBindings.empty(); }
 namespace gpvst3::ui {
 void resizeNativeEditor(void *, int, int) {}
 double nativeEditorScale(void *) { return 1; }
+void closeInputEditorForRuntimeChange() {}
 }
 
 namespace {

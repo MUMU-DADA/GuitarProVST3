@@ -8,7 +8,19 @@
 - **实时线程**：Guitar Pro 的 Master、音轨 DSP、PortAudio callback。只读取已发布的实例/参数/缓冲区，不创建 Qt 对象、不扫描磁盘。
 - **editor 线程**：每个打开的 VST3 view 使用独立持久线程执行可能阻塞的 editor contract；Qt 主线程继续泵事件。
 - **实线**：音频或控制数据实际流转；**虚线**：诊断、状态或证据流。
-- `global` 与 `track` 是两套独立范围；live-input 是 global 选择的独立实例副本，不与 Master 实例共享 `RuntimeEffect`。
+- `global`、`track`、P13 `input` 是三套独立范围。下文原有 live-input copy 图仅描述显式 P4 兼容路由，它是 global 选择的独立实例副本；P13 不参与该参数/state 镜像。
+
+## P13 独立输入入口
+
+普通构建新增“输入 VST3”窗口和独立 `input` 持久化范围。ASIO 生命周期代理提供 generation、rate revision 与实际 rate；`MonitorExchange` 在块边界发布槽位、原生监听分流和故障状态。listener 接收原 capture 并继续维护 DSP/电平，其末端输出进入独占 sink；共享 output SRC/ring 按有限历史排空后，input VST3 的结果才叠加到原 GP/RSE output。RSE 的原有 Master/track/global 顺序保持。
+
+```text
+真实 ASIO capture → 独立 input VST3 → 输入增益 ─────┐
+RSE → 原生音轨/track VST3 → Master/global → SRC ──┴→ 设备输出
+原生 input listener → 独立 sink（保持 DSP、电平更新）
+```
+
+首次准备失败保留原路由，已激活后处理失败丢弃输入贡献；关闭时停止 overlay 并恢复原生监听路由。新流重新核对合同，受限流不继承旧抑制。普通构建只接受已经核对的 192000 Hz ASIO 与 GP 内部 44100 Hz SRC 拓扑；真实设备范围、尾音/逐样本/延迟和发布证据见 [P13 实现记录](P13_IMPLEMENTATION.md)。以下 P4 图示中的 global→input 同步与 dry fallback 不适用于该模式。
 
 ## 1. 系统边界与三条介入面
 
@@ -270,7 +282,7 @@ flowchart LR
     BYPASS --> QUEUED
 ```
 
-当前实现中，global 成功后先 `configureSelectedChain`，再 `configureInputSelection`；两条链使用同一 worker 但不是单个原子提交。若 global 成功而 input 准备失败，状态字段和各链旁路结果必须以 `p2-observation.json` 为准。
+P4 兼容路由中，global 成功后先 `configureSelectedChain`，再 `configureInputSelection`；两条链使用同一 worker 但不是单个原子提交。若 global 成功而 legacy input 准备失败，状态字段和各链旁路结果必须以 `p2-observation.json` 为准。P13 独立 input 请求和配置不走该关联。
 
 ### UI 挂载和用户动作
 
@@ -394,7 +406,7 @@ flowchart TD
 
 track runtime 只在 `self` 与已发布 binding 匹配时处理。切换音轨、增删音轨、保存/另存、重开或 host 对象重建都会进入 control tick，先保存旧 runtime，再以新的 `trackKey` 重建 dispatch；未解析的上下文安全旁路。
 
-## 9. live-input / PortAudio 介入路径
+## 9. P4 兼容 live-input / PortAudio 介入路径
 
 ```mermaid
 flowchart TD

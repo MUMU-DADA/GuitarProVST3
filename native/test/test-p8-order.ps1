@@ -118,7 +118,7 @@ try {
     $session = New-McpSession -SessionFile $sessionPath
     $seed = Join-Path $run 'seed.gp'
     Copy-Item -LiteralPath (Join-Path $McpRoot 'test/testdata/minimal.gp') -Destination $seed
-    Wait-Operation (Invoke-McpTool $session gp_open @{path=$seed}).request 'opened' | Out-Null
+    $seedDocument=(Wait-Operation (Invoke-McpTool $session gp_open @{path=$seed}).request 'opened').document
     $document = (Wait-Operation (Invoke-McpTool $session gp_new @{template='Steel Guitar'}).request 'created').document
     Invoke-McpTool $session gp_activate @{document=$document} | Out-Null
     Wait-Operation (Invoke-McpTool $session gp_insert_tab @{document=$document;track=0;string=0;bar=0;text='0-2-5-7';mode='replace';denominator=4}).request 'applied' | Out-Null
@@ -153,6 +153,9 @@ try {
         Trigger ((Prefix $scope) + 'MoveUp')
         Start-Sleep -Milliseconds 250
     }
+    Invoke-McpTool $session gp_playback @{operation='stop';document=$document} | Out-Null
+    Wait-Operation (Invoke-McpTool $session gp_close @{document=$document;unsaved='discard'}).request 'closed' | Out-Null
+    Wait-Operation (Invoke-McpTool $session gp_close @{document=$seedDocument;unsaved='discard'}).request 'closed' | Out-Null
     Request-Gpvst3McpHostExit $session $process
     try { Close-McpSession $session } catch {}
     $session = $null
@@ -160,6 +163,9 @@ try {
     Stop-Gpvst3TestHost $process -RunDirectory $firstRun; $process = $null
     if ((Get-Content (Join-Path $firstRun 'shutdown.json') -Raw | ConvertFrom-Json).forced) { throw 'Order test first process did not exit normally.' }
     $restartRun = Join-Path $run 'restart'; $environment.GPVST3_DATA_DIR = $run
+    # Keep observations from the two processes separate. status.json carries
+    # catalog/identity data and is not a current runtime snapshot.
+    Move-Item -LiteralPath (Join-Path $run 'p2-observation.json') -Destination (Join-Path $firstRun 'p2-observation.json')
     $process = Start-Gpvst3TestHost -HostDirectory $HostDirectory -PluginPath $PluginPath -RunDirectory $restartRun -McpRoot $McpRoot -Environment $environment
     $sessionPath = Join-Path $restartRun 'mcp/native-session.json'
     $deadline = [DateTime]::UtcNow.AddSeconds(30)
@@ -171,23 +177,32 @@ try {
     $session = New-McpSession -SessionFile $sessionPath
     $document = (Wait-Operation (Invoke-McpTool $session gp_open @{path=$scorePath}).request 'opened').document
     Invoke-McpTool $session gp_activate @{document=$document} | Out-Null
-    $restartSaved = Get-Content -LiteralPath (Join-Path $run 'effect-chain.json') -Raw | ConvertFrom-Json
-    $restartEffects = @($restartSaved.global.effects)
-    foreach ($score in $restartSaved.scores.PSObject.Properties.Value) {
-        foreach ($track in $score.tracks.PSObject.Properties.Value) { $restartEffects += @($track.effects) }
+    Invoke-McpTool $session gp_playback @{operation='set_loop';document=$document;enabled=$true} | Out-Null
+    $deadline = [DateTime]::UtcNow.AddSeconds(10)
+    do {
+        Start-Sleep -Milliseconds 150
+        $restartObservation = Get-Content -LiteralPath (Join-Path $run 'p2-observation.json') -Raw | ConvertFrom-Json
+        $restartHook = $restartObservation.gp_hook
+    } while ((@($restartHook.track_runtime_evidence).Count -ne 1 -or
+        -not $restartHook.global_chain_enabled -or
+        @($restartHook.instances | Where-Object { $_.scope -eq 'global' -and $_.active }).Count -ne 3) -and
+        [DateTime]::UtcNow -lt $deadline)
+    if (@($restartHook.track_runtime_evidence).Count -ne 1 -or
+        @($restartHook.track_runtime_evidence | Where-Object { $_.configured_effects -ne 0 -or $_.processed }).Count -or
+        -not $restartHook.global_chain_enabled -or
+        @($restartHook.instances | Where-Object { $_.scope -eq 'global' -and $_.active }).Count -ne 3) {
+        throw 'Restart did not preserve the P12 global-restore/explicit-track-activation contract.'
     }
-    if (@($restartEffects | Where-Object enabled).Count -ne 0 -or
-        $restartStatus.gp_hook.runtime_processor_ready -or $restartStatus.gp_hook.runtime_effect_instances -ne 0) {
-        throw 'Restart automatically enabled a persisted VST3 processor.'
-    }
-    $result.restart_disabled_effects = $restartEffects.Count
-    # Startup intentionally leaves every persisted VST3 entry disabled. Re
-    # enable the chains explicitly before checking post-restart processing.
+    $result.restart_before_enabling = $restartHook
+    # P12 preserves saved intent/order; global restores with the project,
+    # while track processing requires a new explicit runtime request.
+    $expectedRestartOrder = @($candidates[2].name,$candidates[0].name,$candidates[1].name) -join '|'
     foreach ($scope in @('track','global')) {
-        foreach ($index in @(2,0,1)) {
-            $candidate = $candidates[$index]
-            Set-Property ((Prefix $scope) + 'Enabled_' + $candidate.class_id) 'checked' $true
-        }
+        if ((Read-Order $scope) -ne $expectedRestartOrder) { throw "Restart lost saved $scope order." }
+    }
+    foreach ($index in @(2,0,1)) {
+        $candidate = $candidates[$index]
+        Set-Property ((Prefix 'track') + 'Enabled_' + $candidate.class_id) 'checked' $true
     }
     Start-Sleep -Seconds 1
     $result.restart_orders = @(Assert-AudioOrder 'track' @(2,0,1); Assert-AudioOrder 'global' @(2,0,1))
@@ -219,7 +234,11 @@ catch {
 }
 finally {
     if ($session) {
-        try { Invoke-McpTool $session gp_playback @{operation='stop';document=$document} | Out-Null; Request-Gpvst3McpHostExit $session $process } catch { Write-Warning $_.Exception.Message }
+        try {
+            Invoke-McpTool $session gp_playback @{operation='stop';document=$document} | Out-Null
+            Wait-Operation (Invoke-McpTool $session gp_close @{document=$document;unsaved='discard'}).request 'closed' | Out-Null
+            Request-Gpvst3McpHostExit $session $process
+        } catch { Write-Warning $_.Exception.Message }
         try { Close-McpSession $session } catch {}
     }
     try { Stop-Gpvst3TestHost $process -RunDirectory $run }

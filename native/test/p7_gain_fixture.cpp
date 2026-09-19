@@ -1,4 +1,4 @@
-// Test VST3, loaded only inside Guitar Pro. Its native Qt IPlugView sends
+// Test VST3, loaded by Guitar Pro or the isolated runtime harness. Its Qt IPlugView sends
 // performEdit; the processor independently measures input/output energy.
 #include "pluginterfaces/base/funknownimpl.h"
 #include "pluginterfaces/base/ibstream.h"
@@ -39,8 +39,11 @@ std::atomic<unsigned long long> processSequence{0};
 class Gain final : public U::Implements<U::Directly<IComponent, IAudioProcessor, IEditController>> {
 public:
     int operation = -1;
+    const bool latencyReporting = qEnvironmentVariableIsSet("GPVST3_TEST_LATENCY_REPORTING");
+    std::atomic<uint32> reportedLatency{0};
     explicit Gain(int stage = -1) : operation(stage) {
         if (stage >= 0) { controlValue = stage == 0 ? 0.125 : (stage == 1 ? 0.5 : 0.25); gain.store(controlValue); }
+        if (latencyReporting) reportedLatency.store(stage == 0 ? 17U : (stage == 1 ? 29U : 43U));
     }
     IPtr<IComponentHandler> handler;
     double controlValue = 1.0;
@@ -92,7 +95,9 @@ public:
         value = SpeakerArr::kStereo; return index == 0 ? kResultOk : kInvalidArgument;
     }
     tresult PLUGIN_API canProcessSampleSize(int32 size) override { return size == kSample32 ? kResultOk : kResultFalse; }
-    uint32 PLUGIN_API getLatencySamples() override { return 0; }
+    // Reporting-only fixture: these values exercise the host's diagnostics,
+    // not a physical delay line or measured audio latency.
+    uint32 PLUGIN_API getLatencySamples() override { return reportedLatency.load(); }
     tresult PLUGIN_API setupProcessing(ProcessSetup &setup) override { sampleRate.store(setup.sampleRate); return canProcessSampleSize(setup.symbolicSampleSize); }
     tresult PLUGIN_API setProcessing(TBool) override { return kResultOk; }
     tresult PLUGIN_API process(ProcessData &data) override {
@@ -128,8 +133,13 @@ public:
     }
     uint32 PLUGIN_API getTailSamples() override { return 0; }
     tresult PLUGIN_API setComponentState(IBStream *stream) override { return setState(stream); }
-    int32 PLUGIN_API getParameterCount() override { return 1; }
+    int32 PLUGIN_API getParameterCount() override { return latencyReporting ? 2 : 1; }
     tresult PLUGIN_API getParameterInfo(int32 index, ParameterInfo &info) override {
+        if (index == 1 && latencyReporting) {
+            info = {}; info.id = 2; info.defaultNormalizedValue = reportedLatency.load() / 1000.0;
+            const char *name = "Reported latency"; for (int i = 0; name[i]; ++i) info.title[i] = name[i];
+            return kResultOk;
+        }
         if (index != 0) return kInvalidArgument;
         info = {}; info.id = 1; info.defaultNormalizedValue = 1; info.flags = ParameterInfo::kCanAutomate;
         const char *name = "Gain"; for (int i = 0; name[i]; ++i) info.title[i] = name[i];
@@ -139,8 +149,17 @@ public:
     tresult PLUGIN_API getParamValueByString(ParamID, TChar *, ParamValue &) override { return kNotImplemented; }
     ParamValue PLUGIN_API normalizedParamToPlain(ParamID, ParamValue value) override { return value; }
     ParamValue PLUGIN_API plainParamToNormalized(ParamID, ParamValue value) override { return value; }
-    ParamValue PLUGIN_API getParamNormalized(ParamID) override { return controlValue; }
+    ParamValue PLUGIN_API getParamNormalized(ParamID id) override {
+        return id == 2 && latencyReporting ? reportedLatency.load() / 1000.0 : controlValue;
+    }
     tresult PLUGIN_API setParamNormalized(ParamID id, ParamValue value) override {
+        // Test control for a plugin-owned latency change. The real component
+        // handler must propagate kLatencyChanged without a selection request.
+        if (id == 2 && latencyReporting) {
+            if (!std::isfinite(value) || value < 0 || value > 1) return kInvalidArgument;
+            reportedLatency.store(static_cast<uint32>(std::llround(value * 1000.0)));
+            return handler ? handler->restartComponent(kLatencyChanged) : kResultFalse;
+        }
         if (id != 1) return kInvalidArgument;
         controlValue = value; return kResultOk;
     }

@@ -36,6 +36,7 @@ const char *routeName(Route route) noexcept {
     switch (route) {
     case Route::InputInsert: return "input_insert";
     case Route::BusMix: return "bus_mix";
+    case Route::Overlay: return "overlay";
     case Route::Disabled: break;
     }
     return "disabled";
@@ -193,6 +194,92 @@ bool Router::interleave(const audio::PlanarBuffer &source, void *target,
     return true;
 }
 
+bool Router::processOverlayCapture(const CaptureView &capture) noexcept {
+    if (!processor_.process || channelCapacity_ == 0 || channelCapacity_ > 2 ||
+        capture.channelCount == 0 || capture.channelCount > channelCapacity_ ||
+        capture.frameCount == 0 || capture.frameCount > frameCapacity_ ||
+        !std::isfinite(capture.sampleRate) || capture.sampleRate <= 0.0 ||
+        !finiteOutput(capture.channels, capture.channelCount, capture.frameCount))
+        return false;
+    // Copy all borrowed capture before processing or touching host output.
+    // Mono capture feeds both processor channels; stereo retains its order.
+    for (std::size_t channel = 0; channel < channelCapacity_; ++channel) {
+        const auto source = capture.channels[capture.channelCount == 1 ? 0 : channel];
+        auto *destination = mixScratch_.inputChannels()[channel];
+        if (source != destination)
+            std::memmove(destination, source, capture.frameCount * sizeof(float));
+        std::fill_n(mixScratch_.outputChannels()[channel], capture.frameCount, 0.0F);
+    }
+    const audio::BlockView block{mixScratch_.inputChannels(), nullptr,
+        mixScratch_.outputChannels(), nullptr, channelCapacity_, capture.frameCount,
+        capture.sampleRate, capture.blockSize};
+    return processor_.process(processor_.context, block) &&
+        finiteOutput(mixScratch_.outputChannels(), channelCapacity_, capture.frameCount);
+}
+
+Router::Result Router::overlayPlanar(const CaptureView &capture,
+                                     const OutputView &output) noexcept {
+    const auto fail = [this]() noexcept {
+        errorBlocks_.fetch_add(1, std::memory_order_relaxed);
+        return Result{false, false, false, true};
+    };
+    if (output.channelCount == 0 || output.channelCount > channelCapacity_ ||
+        !validOutput(output, output.channelCount)) return fail();
+    // Distinct output channels cannot describe overlapping storage: even a
+    // two-pass calculation cannot commit two different values to one sample.
+    if (output.channelCount == 2) {
+        const auto a = reinterpret_cast<std::uintptr_t>(output.channels[0]);
+        const auto b = reinterpret_cast<std::uintptr_t>(output.channels[1]);
+        const auto distance = a < b ? b - a : a - b;
+        if (distance < capture.frameCount * sizeof(float)) return fail();
+    }
+    if (!processOverlayCapture(capture)) return fail();
+    for (std::size_t channel = 0; channel < output.channelCount; ++channel)
+        for (std::size_t frame = 0; frame < capture.frameCount; ++frame) {
+            const auto contribution = output.channelCount == 1 && channelCapacity_ == 2
+                ? mixScratch_.outputChannels()[0][frame] * 0.5F +
+                    mixScratch_.outputChannels()[1][frame] * 0.5F
+                : mixScratch_.outputChannels()[channel][frame];
+            const auto combined = output.channels[channel][frame] + contribution;
+            if (!std::isfinite(combined)) return fail();
+            interleavedGeneratedScratch_.outputChannels()[channel][frame] = combined;
+        }
+    for (std::size_t channel = 0; channel < output.channelCount; ++channel)
+        std::memcpy(output.channels[channel], interleavedGeneratedScratch_.outputChannels()[channel],
+                    capture.frameCount * sizeof(float));
+    inputProcessedBlocks_.fetch_add(1, std::memory_order_relaxed);
+    return {true, false, true, false};
+}
+
+Router::Result Router::overlayInterleaved(const CaptureView &capture,
+                                          const InterleavedView &view) noexcept {
+    const auto fail = [this]() noexcept {
+        errorBlocks_.fetch_add(1, std::memory_order_relaxed);
+        return Result{false, false, false, true};
+    };
+    if (!processOverlayCapture(capture)) return fail();
+    auto *output = static_cast<float *>(view.output);
+    // Map only the input contribution, then add the original GP sample once.
+    // Stage the entire finite sum before the first borrowed-output write.
+    for (std::size_t channel = 0; channel < view.outputChannelCount; ++channel)
+        for (std::size_t frame = 0; frame < view.frameCount; ++frame) {
+            const auto contribution = view.outputChannelCount == 1 && channelCapacity_ == 2
+                ? mixScratch_.outputChannels()[0][frame] * 0.5F +
+                    mixScratch_.outputChannels()[1][frame] * 0.5F
+                : mixScratch_.outputChannels()[channel][frame];
+            const auto combined = output[frame * view.outputChannelCount + channel] + contribution;
+            if (!std::isfinite(combined)) return fail();
+            interleavedGeneratedScratch_.outputChannels()[channel][frame] = combined;
+        }
+    for (std::size_t frame = 0; frame < view.frameCount; ++frame)
+        for (std::size_t channel = 0; channel < view.outputChannelCount; ++channel)
+            output[frame * view.outputChannelCount + channel] =
+                interleavedGeneratedScratch_.outputChannels()[channel][frame];
+    inputProcessedBlocks_.fetch_add(1, std::memory_order_relaxed);
+    interleavedOutputWritten_.store(true, std::memory_order_release);
+    return {true, false, true, false};
+}
+
 Router::Result Router::processInterleaved(const InterleavedView &view) noexcept {
     Result result;
     if (view.format != InterleavedSampleFormat::Float32 || view.inputChannelCount == 0 ||
@@ -235,13 +322,20 @@ Router::Result Router::processInterleaved(const InterleavedView &view) noexcept 
     interleavedInputObserved_.store(true, std::memory_order_release);
     const CaptureView originalCapture{interleavedCaptureScratch_.inputChannels(),
         view.inputChannelCount, view.frameCount, view.sampleRate, view.blockSize};
+    const auto route = route_.load(std::memory_order_acquire);
     if (!enabled_.load(std::memory_order_acquire) || bypassed_.load(std::memory_order_acquire) ||
         !streamRunning_.load(std::memory_order_acquire) ||
-        route_.load(std::memory_order_acquire) == Route::Disabled) {
+        route == Route::Disabled) {
         observeLevel(originalCapture);
         captureBlocks_.fetch_add(1, std::memory_order_relaxed);
         bypassBlocks_.fetch_add(1, std::memory_order_relaxed);
         return {true, true, false, false};
+    }
+    if (route == Route::Overlay) {
+        observeLevel(originalCapture);
+        captureBlocks_.fetch_add(1, std::memory_order_relaxed);
+        interleavedBlocks_.fetch_add(1, std::memory_order_relaxed);
+        return overlayInterleaved(originalCapture, view);
     }
     const auto processingChannels = channelCapacity_;
     for (std::size_t channel = 0; channel < processingChannels; ++channel) {
@@ -255,7 +349,7 @@ Router::Result Router::processInterleaved(const InterleavedView &view) noexcept 
             std::fill(destination, destination + view.frameCount, 0.0F);
     }
     GeneratedView generated;
-    if (route_.load(std::memory_order_acquire) == Route::BusMix) {
+    if (route == Route::BusMix) {
         if (!deinterleave(view.output, view.frameCount, view.outputChannelCount,
                           interleavedGeneratedScratch_)) {
             interleavedMissingBlocks_.fetch_add(1, std::memory_order_relaxed);
@@ -276,12 +370,13 @@ Router::Result Router::processInterleaved(const InterleavedView &view) noexcept 
         std::fill(interleavedOutputScratch_.outputChannels()[channel],
                   interleavedOutputScratch_.outputChannels()[channel] + view.frameCount,
                   0.0F);
-    result = process(capture, generated, output);
+    result = processConfigured(capture, generated, output, route, true);
     // process() already observes the same captured samples. Avoid a second
     // full-block RMS/peak pass on the realtime callback.
     interleavedBlocks_.fetch_add(1, std::memory_order_relaxed);
-    if (result.completed && interleave(interleavedOutputScratch_, view.output,
-                                       view.frameCount, view.outputChannelCount))
+    const bool wrote = result.completed && interleave(interleavedOutputScratch_, view.output,
+                                                      view.frameCount, view.outputChannelCount);
+    if (wrote)
         interleavedOutputWritten_.store(true, std::memory_order_release);
     else if (result.completed)
         result.completed = false;
@@ -290,6 +385,16 @@ Router::Result Router::processInterleaved(const InterleavedView &view) noexcept 
 
 Router::Result Router::process(const CaptureView &capture, const GeneratedView &generated,
                                const OutputView &output) noexcept {
+    const auto route = route_.load(std::memory_order_acquire);
+    const bool active = enabled_.load(std::memory_order_acquire) &&
+                        !bypassed_.load(std::memory_order_acquire) &&
+                        streamRunning_.load(std::memory_order_acquire) &&
+                        route != Route::Disabled;
+    return processConfigured(capture, generated, output, route, active);
+}
+
+Router::Result Router::processConfigured(const CaptureView &capture, const GeneratedView &generated,
+                                         const OutputView &output, Route route, bool active) noexcept {
     Result result;
     observeLevel(capture);
     if (capture.frameCount == 0 || capture.frameCount > frameCapacity_ ||
@@ -298,14 +403,9 @@ Router::Result Router::process(const CaptureView &capture, const GeneratedView &
         return result;
     }
     captureBlocks_.fetch_add(1, std::memory_order_relaxed);
-    const auto route = route_.load(std::memory_order_acquire);
-    const bool active = enabled_.load(std::memory_order_acquire) &&
-                        !bypassed_.load(std::memory_order_acquire) &&
-                        streamRunning_.load(std::memory_order_acquire) &&
-                        route != Route::Disabled;
     if (!active) {
         result.bypassed = true;
-        result.completed = passthrough(capture, generated, output);
+        result.completed = route == Route::Overlay || passthrough(capture, generated, output);
         if (!result.completed) droppedBlocks_.fetch_add(1, std::memory_order_relaxed);
         else bypassBlocks_.fetch_add(1, std::memory_order_relaxed);
         return result;
@@ -334,6 +434,8 @@ Router::Result Router::process(const CaptureView &capture, const GeneratedView &
         if (result.completed) bypassBlocks_.fetch_add(1, std::memory_order_relaxed);
         return result;
     }
+
+    if (route == Route::Overlay) return overlayPlanar(capture, output);
 
     if (!validOutput(output, channelCapacity_) || !copyCapture(capture)) {
         droppedBlocks_.fetch_add(1, std::memory_order_relaxed);

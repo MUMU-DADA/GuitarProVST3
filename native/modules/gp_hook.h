@@ -7,9 +7,21 @@
 
 #include "input_router.h"
 #include "host_lock.h"
+#include "state_manager.h"
 #include <QtCore/QJsonArray>
+#ifdef GPVST3_P13_PROBE_BUILD
+#include <QtCore/QJsonObject>
+#endif
 
 namespace gpvst3::hook {
+
+#ifdef GPVST3_P13_PROBE_BUILD
+// Control-thread only. Experimental diagnostics are excluded from releases.
+QJsonObject inputProbeSnapshot();
+QJsonObject inputStreamProbeSnapshot();
+QJsonObject inputTimingProbeSnapshot();
+QJsonObject stopInputTimingProbe();
+#endif
 
 void setVst3Catalog(const QJsonArray &catalog);
 void preloadSavedSelections() noexcept;
@@ -290,6 +302,13 @@ bool requestTrackVst3SelectionAtGeneration(const std::string &trackKey,
                                             const std::vector<Vst3SelectionEntry> &selection,
                                             std::string *error = nullptr) noexcept;
 std::vector<Vst3SelectionEntry> captureGlobalVst3States();
+bool requestInputVst3Selection(const std::vector<Vst3SelectionEntry> &selection,
+                                std::string *error = nullptr) noexcept;
+bool requestInputMonitorSettings(const state::InputMonitorSettings &settings,
+                                  std::string *error = nullptr) noexcept;
+QJsonObject inputMonitorSnapshot();
+std::vector<Vst3SelectionEntry> captureInputVst3States();
+bool openInputVst3Editor(const Vst3SelectionEntry &entry, void *parentWindow) noexcept;
 std::vector<Vst3SelectionEntry> captureTrackVst3States(const std::string &trackKey);
 bool activeTrackVst3States(const std::string &trackKey,
                            std::vector<Vst3SelectionEntry> &result) noexcept;

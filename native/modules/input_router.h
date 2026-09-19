@@ -56,6 +56,10 @@ enum class Route : std::uint8_t {
     Disabled,
     InputInsert,
     BusMix,
+    // Process capture in the independent input chain and add the result to
+    // the already rendered host output. This route never owns or rewrites
+    // the generated stream.
+    Overlay,
 };
 
 const char *routeName(Route route) noexcept;
@@ -115,8 +119,8 @@ public:
     Router(const Router &) = delete;
     Router &operator=(const Router &) = delete;
 
-    // Called on the control/worker thread. The audio callback only uses the
-    // resulting fixed-capacity scratch storage.
+    // prepare/setProcessor require callbacks to be drained by the owner.
+    // process calls are serialized and use the fixed-capacity scratch storage.
     bool prepare(std::size_t channelCount, std::size_t frameCapacity) noexcept;
     std::size_t channelCapacity() const noexcept { return channelCapacity_; }
     std::size_t frameCapacity() const noexcept { return frameCapacity_; }
@@ -139,6 +143,8 @@ public:
     Snapshot snapshot() const noexcept;
 
 private:
+    Result processConfigured(const CaptureView &capture, const GeneratedView &generated,
+                             const OutputView &output, Route route, bool active) noexcept;
     static float readAtomicFloat(const std::atomic<std::uint32_t> &value) noexcept;
     static void writeAtomicFloat(std::atomic<std::uint32_t> &target, float value) noexcept;
     static void updatePeak(std::atomic<std::uint32_t> &target, float value) noexcept;
@@ -150,6 +156,9 @@ private:
                       std::size_t channels, audio::PlanarBuffer &target) noexcept;
     bool interleave(const audio::PlanarBuffer &source, void *target,
                     std::size_t frames, std::size_t channels) noexcept;
+    bool processOverlayCapture(const CaptureView &capture) noexcept;
+    Result overlayPlanar(const CaptureView &capture, const OutputView &output) noexcept;
+    Result overlayInterleaved(const CaptureView &capture, const InterleavedView &view) noexcept;
 
     std::size_t channelCapacity_ = 0;
     std::size_t frameCapacity_ = 0;

@@ -1,4 +1,5 @@
 .tools/
 .cache/
+__pycache__/
 artifacts/
 gp8-vst3-research-20260909/
