@@ -17,6 +17,7 @@ constexpr std::uint64_t kWindowNanoseconds = 120000000000ULL;
 constexpr std::uint64_t kCallbackLimit = 1000000;
 constexpr std::size_t kHistogramBuckets = 4096;
 constexpr std::uint64_t kBucketNanoseconds = 1000;
+constexpr std::size_t kPairedCallbackCapacity = 256;
 
 struct Identity {
     std::uint64_t generation = 0, revision = 0;
@@ -42,6 +43,19 @@ struct HistogramSnapshot {
     }
 };
 
+// Immutable once release-published. Retain the same callback's stages,
+// rather than subtracting independently aggregated percentiles.
+struct PairedCallback {
+    std::uint64_t sequence = 0, started = 0, ended = 0, frames = 0, status = 0;
+    Identity identity;
+    std::uint64_t nativeStarted = 0, nativeEnded = 0;
+    std::uint64_t inputStarted = 0, inputEnded = 0, inputCalls = 0;
+    std::uint64_t callbackCycles = 0, nativeCycles = 0, inputCycles = 0;
+    std::uint64_t monitorToken = 0;
+    std::uint32_t thread = 0, firstCpu = 0, lastCpu = 0;
+    bool nativeEnabled = false, dry = false, cyclesValid = false;
+};
+
 struct Snapshot {
     HistogramSnapshot callback, inputProcess;
     std::uint64_t windowStart = 0, windowEnd = 0, firstStarted = 0, lastEnded = 0;
@@ -52,6 +66,10 @@ struct Snapshot {
     std::uint64_t inputCalls = 0, inputFailures = 0, identityChanges = 0;
     std::uint64_t minimumFrames = 0, maximumFrames = 0;
     double minimumRate = 0, maximumRate = 0;
+    std::array<PairedCallback, kPairedCallbackCapacity> paired{};
+    std::size_t pairedCount = 0;
+    std::array<PairedCallback, kPairedCallbackCapacity> consecutive{};
+    std::size_t consecutiveCount = 0;
     bool enabled = false, stopped = false, timeBoundReached = false, callbackBoundReached = false, coherent = false;
 };
 
@@ -64,6 +82,7 @@ public:
         std::uint64_t started = 0, frames = 0, status = 0;
         std::uint64_t inputNanoseconds = 0, inputCalls = 0, inputFailures = 0;
         Identity identity;
+        PairedCallback pair;
         bool active = false, invalidClock = false;
         const Recorder *owner = nullptr;
     };
@@ -108,10 +127,19 @@ public:
         ticket.frames = frames;
         ticket.status = status;
         ticket.identity = identity;
+        ticket.pair = {};
         ticket.active = true;
         ticket.owner = this;
-        if (admitted_.fetch_add(1, std::memory_order_relaxed) == 0) firstStarted_.store(started);
+        ticket.pair.sequence = admitted_.fetch_add(1, std::memory_order_relaxed);
+        if (ticket.pair.sequence == 0) firstStarted_.store(started);
         return true;
+    }
+
+    static void nativeProcessed(Ticket &ticket, std::uint64_t start, std::uint64_t end) noexcept {
+        if (!ticket.active) return;
+        if (end < start || start < ticket.started || ticket.pair.nativeStarted) ticket.invalidClock = true;
+        ticket.pair.nativeStarted = start;
+        ticket.pair.nativeEnded = end;
     }
 
     static void inputProcessed(Ticket &ticket, std::uint64_t start, std::uint64_t end, bool success) noexcept {
@@ -124,6 +152,8 @@ public:
             return;
         }
         ticket.inputNanoseconds += end - start;
+        if (ticket.inputCalls == 1) ticket.pair.inputStarted = start;
+        ticket.pair.inputEnded = end;
     }
 
     void finish(Ticket &ticket, std::uint64_t ended, int result, Identity identity) noexcept {
@@ -135,7 +165,8 @@ public:
         inputCalls_.fetch_add(ticket.inputCalls);
         inputFailures_.fetch_add(ticket.inputFailures);
         const bool clockValid = !ticket.invalidClock && ended >= ticket.started &&
-            ticket.inputNanoseconds <= ended - ticket.started;
+            ticket.inputNanoseconds <= ended - ticket.started &&
+            ticket.pair.nativeEnded <= ended && ticket.pair.inputEnded <= ended;
         if (!clockValid) invalidClocks_.fetch_add(1);
         else {
             const auto elapsed = ended - ticket.started;
@@ -155,12 +186,28 @@ public:
                            lastIdentity_.revision != identity.revision || lastIdentity_.rate != identity.rate)
                     identityChanges_.fetch_add(1);
                 lastIdentity_ = identity;
+                auto &pair = ticket.pair;
+                pair.started = ticket.started; pair.ended = ended;
+                pair.frames = ticket.frames; pair.status = ticket.status;
+                pair.identity = identity; pair.inputCalls = ticket.inputCalls;
+                const auto consecutiveIndex = consecutiveCount_.load(std::memory_order_relaxed);
+                if (ticket.inputCalls && consecutiveIndex < kPairedCallbackCapacity) {
+                    consecutive_[consecutiveIndex] = pair;
+                    consecutiveCount_.store(consecutiveIndex + 1, std::memory_order_release);
+                }
                 if (identity.rate < minimumRate_.load()) minimumRate_.store(identity.rate);
                 if (identity.rate > maximumRate_.load()) maximumRate_.store(identity.rate);
                 if (ticket.frames < minimumFrames_.load()) minimumFrames_.store(ticket.frames);
                 if (ticket.frames > maximumFrames_.load()) maximumFrames_.store(ticket.frames);
                 const double budgetProduct = static_cast<double>(ticket.frames) * 1000000000.0;
-                if (static_cast<double>(elapsed) * identity.rate > budgetProduct) callbackBudgetExceeded_.fetch_add(1);
+                if (static_cast<double>(elapsed) * identity.rate > budgetProduct) {
+                    callbackBudgetExceeded_.fetch_add(1);
+                    const auto index = pairedCount_.load(std::memory_order_relaxed);
+                    if (index < kPairedCallbackCapacity) {
+                        paired_[index] = pair;
+                        pairedCount_.store(index + 1, std::memory_order_release);
+                    }
+                }
                 if (ticket.inputCalls && static_cast<double>(ticket.inputNanoseconds) * identity.rate > budgetProduct)
                     inputBudgetExceeded_.fetch_add(1);
             }
@@ -192,6 +239,10 @@ public:
             value.minimumRate = minimumRate_.load(); value.maximumRate = maximumRate_.load();
             value.minimumFrames = minimumFrames_.load(); value.maximumFrames = maximumFrames_.load();
             value.callback = callback_.snapshot(); value.inputProcess = input_.snapshot();
+            value.pairedCount = pairedCount_.load(std::memory_order_acquire);
+            for (std::size_t i = 0; i < value.pairedCount; ++i) value.paired[i] = paired_[i];
+            value.consecutiveCount = consecutiveCount_.load(std::memory_order_acquire);
+            for (std::size_t i = 0; i < value.consecutiveCount; ++i) value.consecutive[i] = consecutive_[i];
             value.timeBoundReached = value.enabled && now >= end_;
             value.callbackBoundReached = value.admitted == kCallbackLimit;
             value.coherent = (version & 1) == 0 && version == version_.load();
@@ -225,6 +276,10 @@ private:
     std::uint64_t start_ = 0, end_ = 0;
     Identity lastIdentity_;
     Histogram callback_, input_;
+    std::array<PairedCallback, kPairedCallbackCapacity> paired_{};
+    std::atomic<std::size_t> pairedCount_{0};
+    std::array<PairedCallback, kPairedCallbackCapacity> consecutive_{};
+    std::atomic<std::size_t> consecutiveCount_{0};
     std::atomic<std::uint64_t> version_{0}, admitted_{0}, completed_{0}, overlaps_{0};
     std::atomic<std::uint64_t> firstStarted_{0}, lastEnded_{0}, statusCallbacks_{0}, statusFlags_{0}, resultErrors_{0};
     std::atomic<std::uint64_t> invalidClocks_{0}, unvalidatedBudgets_{0}, validatedBudgets_{0};

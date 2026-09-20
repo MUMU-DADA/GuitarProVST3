@@ -62,6 +62,10 @@ bool boundariesAndPublication() {
                "completion records once with separately timed input")) return false;
     if (!check(value.callback.percentileUpper(95) == 3000 && value.inputProcess.percentileUpper(50) == 2000,
                "histogram percentiles are exclusive upper bounds")) return false;
+    if (!check(value.pairedCount == 0 && value.consecutiveCount == 1 &&
+               value.consecutive[0].sequence == 0 && value.consecutive[0].inputCalls == 1 &&
+               value.consecutive[0].inputEnded - value.consecutive[0].inputStarted == 1000,
+               "consecutive input evidence includes callbacks below budget")) return false;
     if (!check(recorder->begin(ticket, 2300, 64, 0, identity), "callback admitted before stopping")) return false;
     if (!check(!recorder->stop(), "stop detects in-flight writer before snapshot")) return false;
     if (!check(!recorder->begin(overlap, 2400, 64, 0, identity), "stopped recorder rejects new callbacks")) return false;
@@ -144,6 +148,44 @@ bool callbackCapAndNoAllocation() {
                  !value.timeBoundReached && allocations.load() == 0,
                  "million-callback bound and allocation-free recording");
 }
+bool pairedStagesAndCapacity() {
+    auto recorder = std::make_unique<Recorder>();
+    recorder->configure(true, 1);
+    forbidAllocations = true;
+    for (std::size_t i = 0; i < kPairedCallbackCapacity + 10; ++i) {
+        Recorder::Ticket ticket;
+        const auto start = 1 + i * 1000000ULL;
+        if (!recorder->begin(ticket, start, 64, 2, identity)) std::abort();
+        Recorder::nativeProcessed(ticket, start + 10, start + 70000);
+        Recorder::inputProcessed(ticket, start + 80000, start + 380000, true);
+        ticket.pair.monitorToken = 17;
+        recorder->finish(ticket, start + 400000, 0, identity);
+    }
+    forbidAllocations = false;
+    auto value = recorder->snapshot(1000000000);
+    if (!check(value.pairedCount == kPairedCallbackCapacity && value.consecutiveCount == kPairedCallbackCapacity && allocations.load() == 0 &&
+               value.callbackBudgetExceeded == kPairedCallbackCapacity + 10,
+               "paired overrun recording has a fixed capacity without allocating")) return false;
+    for (std::size_t i = 0; i < value.pairedCount; ++i) {
+        const auto &p = value.paired[i];
+        if (!check(p.sequence == i && p.ended - p.started == 400000 &&
+                   p.nativeStarted == p.started + 10 && p.nativeEnded == p.started + 70000 &&
+                   p.inputStarted == p.started + 80000 && p.inputEnded == p.started + 380000 &&
+                   p.frames == 64 && p.identity.rate == 192000 && p.inputCalls == 1 && p.monitorToken == 17 &&
+                   value.consecutive[i].sequence == p.sequence && value.consecutive[i].ended == p.ended,
+                   "paired native/input intervals and identity belong to the same callback")) return false;
+    }
+    auto invalid = std::make_unique<Recorder>();
+    invalid->configure(true, 1);
+    record(*invalid, 1, 500000, 64, {0, 0, 0, false});
+    Recorder::Ticket ticket;
+    invalid->begin(ticket, 1000000, 64, 0, identity);
+    Recorder::nativeProcessed(ticket, 1000001, 1500001);
+    invalid->finish(ticket, 1400000, 0, identity);
+    const auto bad = invalid->snapshot(2000000);
+    return check(bad.pairedCount == 0 && bad.consecutiveCount == 0 && bad.unvalidatedBudgets == 1 && bad.invalidClocks == 1,
+                 "unvalidated or out-of-callback stage timing is never paired deadline evidence");
+}
 bool concurrentSnapshotAndCallbacks() {
     auto recorder = std::make_unique<Recorder>();
     recorder->configure(true, 1);
@@ -156,7 +198,15 @@ bool concurrentSnapshotAndCallbacks() {
             std::uint64_t sum = value.callback.overflow;
             for (auto count : value.callback.buckets) sum += count;
             if (sum != value.callback.count || value.callback.count != value.completed ||
-                value.completed != value.admitted || value.callback.maximum > 999) valid.store(false);
+                value.completed != value.admitted || value.callback.maximum > 499999) valid.store(false);
+            for (std::size_t i = 0; i < value.pairedCount; ++i)
+                if (value.paired[i].ended - value.paired[i].started != 499999 ||
+                    value.paired[i].identity.generation != identity.generation) valid.store(false);
+            for (std::size_t i = 0; i < value.consecutiveCount; ++i)
+                if (value.consecutive[i].ended - value.consecutive[i].started != 499999 ||
+                    value.consecutive[i].inputCalls != 1 ||
+                    value.consecutive[i].inputEnded - value.consecutive[i].inputStarted != 200000)
+                    valid.store(false);
         }
     });
     std::vector<std::thread> writers;
@@ -166,8 +216,9 @@ bool concurrentSnapshotAndCallbacks() {
         for (unsigned index = 0; index < 20000; ++index) {
             Recorder::Ticket ticket;
             const auto sequence = attempted.fetch_add(1) + 1;
-            if (recorder->begin(ticket, sequence * 1000, 64, 0, identity)) {
-                recorder->finish(ticket, sequence * 1000 + 999, 0, identity);
+            if (recorder->begin(ticket, sequence * 1000000, 64, 0, identity)) {
+                Recorder::inputProcessed(ticket, sequence * 1000000 + 100000, sequence * 1000000 + 300000, true);
+                recorder->finish(ticket, sequence * 1000000 + 499999, 0, identity);
                 accepted.fetch_add(1);
             }
         }
@@ -186,7 +237,7 @@ bool concurrentSnapshotAndCallbacks() {
 
 int main() {
     if (!(boundariesAndPublication() && distributionOverflowAndBudgets() && invalidRateAndClock() &&
-          callbackCapAndNoAllocation() && concurrentSnapshotAndCallbacks())) return 1;
+          callbackCapAndNoAllocation() && pairedStagesAndCapacity() && concurrentSnapshotAndCallbacks())) return 1;
     std::cout << "PASS: bounded timing, quantiles, actual-rate budgets, concurrency and allocation guards\n";
     return 0;
 }

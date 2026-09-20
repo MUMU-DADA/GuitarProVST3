@@ -36,7 +36,7 @@ Python 分析器需要 NumPy。各 PowerShell 入口支持独立 `-OutputRoot`�
 ./native/test/test-p13-neural-runtime.ps1 -PluginPath 'C:/Program Files/Common Files/VST3/Neural DSP/Archetype Mateus Asato.vst3' -SampleRate 192000 -Frames 64 -Seconds 8 -OutputRoot .tools/native/p13-neural-runtime-test
 ```
 
-该专项使用合成拨弦输入，不打开设备；比较准备容量与 FTZ 配置，记录有限性、峰值、RMS、P50/P95/P99/max 和超预算块，并验证参数并发发布最终交付。计时范围仅为生产 input router 和 VST3，运行不按实时节奏，不能替代完整 GP/RSE callback 或用户硬件爆音验收。0.10.1 修订的离线对照及仍未完成的真实宿主门禁见 [P13 实现记录](P13_IMPLEMENTATION.md)。
+该专项使用合成拨弦输入，不打开设备；比较准备容量与 FTZ 配置，记录有限性、峰值、RMS、P50/P95/P99/max 和超预算块，并验证参数并发发布最终交付。计时范围仅为生产 input router 和 VST3，运行不按实时节奏，不能替代完整 GP/RSE callback 或用户硬件爆音验收。0.10.1 修订的离线对照、真实宿主证据及 0.10.2 用户安全模式反馈见 [P13 实现记录](P13_IMPLEMENTATION.md)。
 
 ### 普通构建与三链宿主矩阵
 
@@ -48,9 +48,11 @@ Python 分析器需要 NumPy。各 PowerShell 入口支持独立 `-OutputRoot`�
 ./native/test/collect-p13-host.ps1 -ProductionRuntime -PluginPath .tools/native/p13-production/plugins/imageformats/guitarpro_vst3_autoload.dll -InputOverlayFixture '.tools/native/p13-gain-fixture/P7 Gain Fixture.vst3' -EnableNativeListener -DeviceMatrix -CaptureSeconds 5
 ```
 
-`-RseVst3` 检查 input、track、global 均实际处理；`-ScopeMatrix` 使用三个独立 fixture editor 设置不同 gain，检查启停、切谱，以及清空 input 后 `active`、`dry_monitoring=true` 和重新启用恢复。`-DeviceMatrix` 请求 32～8192 帧并保存/恢复设备配置，区分成功切流、宿主拒绝后恢复、未枚举的 `host_choice_unavailable`，以及 Standard→ASIO 恢复；4096/8192 成功时还核对驱动实际 buffer 与 2048 帧处理段。拒绝或未枚举的 buffer 不算运行证据。不要把切流期间的配置拒绝计数误写为稳态插件错误。
+`-RseVst3` 检查 input、track、global 均实际处理；`-ScopeMatrix` 使用三个独立 fixture editor 设置不同 gain，检查启停、切谱，以及清空 input 后 `active`、`dry_monitoring=true` 和重新启用恢复。`-DeviceMatrix` 经 MCP 通用属性请求 32～8192 帧并保存/恢复设备配置，区分成功切流、接口回滚的 `control_request_rolled_back`（旧名 `host_rejected_restored`）、未枚举的 `host_choice_unavailable`，以及 Standard→ASIO 恢复；4096/8192 成功时还核对驱动实际 buffer 与 2048 帧处理段。setter 在立即读回或 running 检查不符时主动恢复旧值，因此回滚不能推断 ASIO 驱动拒绝；这些项不算运行证据，仍需原生驱动面板验证。不要把切流期间的配置拒绝计数误写为稳态插件错误。
 
 真实 Neural 可将 `-InputOverlayFixture` 指向已安装的模块文件，省略依赖 gain fixture 的 `-ScopeMatrix` 和逐样本 unity 对照；`-MonitoringOnly -EnableNativeListener` 用于只监听、不播放曲谱的采集，不能与 `-RseVst3` 合用。冷加载必须先等待插件实际准备完成，再通过原生 action 开启本次测试监听；固定等待时长不能代替准备状态。采集期间原生输入被撤销则该段不能当作持续处理证据。
+
+Neural 计时探针默认仅查询 QPC；`-TimingCycles` 额外采集平台线程 cycle，不能把 cycle 当纳秒。`-PinCallbackExperiment` / `-IdealCallbackExperiment` 互斥，只用于独立实验进程的单 processor group callback 线程，不能与生产或设备矩阵合用。它们需 `-StreamLifecycleProbe -InputOverlayFixture`，不属于发布 DLL 的性能策略。`callback_timing.paired_overruns` 有界保存前 256 条超时同块阶段，`first_input_callbacks` 保存前 256 个有效输入块；比较前应核对序号、实际流身份、监听状态与播放时间范围。离线 Neural 专项另保存单次插件 `process`、包装层残差、连续块、样本 hash 与延迟。解释及验证边界见 [Neural 计时调查](P13_NEURAL_TIMING_DIAGNOSIS.md)。
 
 仍需用上述普通 DLL 运行 `test-p8-track-runtime.ps1 -CheckLifecycle`，覆盖音轨交换/增删/撤销/另存/重开/重启。该入口的 `-Vst3Root` 传完整绝对路径，避免重启子进程后相对路径失效。无 input 的 P8 回归只能证明旧链路，没有同时运行 input 时不能用于三链共存结论。
 
@@ -88,7 +90,7 @@ python native/test/analyze-p13-monitor.py artifacts/<native目录> artifacts/<ov
 
 ```powershell
 ./native/test/test-p6-package.ps1 -PluginPath .tools/native/p13-production/plugins/imageformats/guitarpro_vst3_autoload.dll
-./native/package.ps1 -Version 0.10.1 -PluginPath .tools/native/p13-production/plugins/imageformats/guitarpro_vst3_autoload.dll
+./native/package.ps1 -Version 0.10.2 -PluginPath .tools/native/p13-production/plugins/imageformats/guitarpro_vst3_autoload.dll
 git diff --check
 ```
 

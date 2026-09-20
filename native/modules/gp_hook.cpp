@@ -1242,6 +1242,10 @@ std::array<float, 32768 * 2> g_drainRseSum{};
 std::atomic_flag g_listenerSinkBusy = ATOMIC_FLAG_INIT;
 std::once_flag g_inputProbeOnce;
 std::uint64_t g_inputProbeStart = 0;
+bool g_timingPinCallback = false;
+bool g_timingIdealCallback = false;
+bool g_timingCycles = false;
+std::atomic<unsigned> g_timingPinnedThreads{0}, g_timingPinFailures{0};
 bool g_inputProbeSilence = false;
 bool g_monitorLatencyProbe = false;
 std::atomic<bool> g_monitorLatencyMappingValid{false};
@@ -1252,6 +1256,12 @@ input::timingprobe::Identity timingIdentity() noexcept {
     return {identity.generation, identity.rateRevision, identity.actualRate, identity.rateValidated};
 }
 
+std::uint64_t timingThreadCycles() noexcept {
+    if (!g_timingCycles) return 0;
+    ULONG64 cycles = 0;
+    return QueryThreadCycleTime(GetCurrentThread(), &cycles) ? cycles : 0;
+}
+
 class InputTimingScope final {
 public:
     InputTimingScope(unsigned long frames, unsigned long status) noexcept : previous_(g_inputTimingTicket) {
@@ -1259,11 +1269,32 @@ public:
         if (!g_inputTimingProbe.enabled()) return;
         const auto started = steadyNanoseconds();
         if (started >= g_inputProbeStart && g_inputTimingProbe.begin(ticket_, started, frames, status, timingIdentity()))
+        {
+            // Diagnostic only, in an explicitly created test process. No
+            // process/system policy is changed; the thread ends with it.
+            thread_local bool pinAttempted = false;
+            if ((g_timingPinCallback || g_timingIdealCallback) && !pinAttempted) {
+                pinAttempted = true;
+                const auto cpu = GetCurrentProcessorNumber();
+                if (GetActiveProcessorGroupCount() == 1 && cpu < sizeof(DWORD_PTR) * 8 &&
+                    (g_timingIdealCallback ? SetThreadIdealProcessor(GetCurrentThread(), cpu) != DWORD(-1) :
+                     SetThreadAffinityMask(GetCurrentThread(), DWORD_PTR(1) << cpu) != 0)) ++g_timingPinnedThreads;
+                else ++g_timingPinFailures;
+            }
+            cyclesStarted_ = timingThreadCycles();
+            ticket_.pair.cyclesValid = cyclesStarted_ != 0;
+            ticket_.pair.thread = GetCurrentThreadId();
+            ticket_.pair.firstCpu = GetCurrentProcessorNumber();
             g_inputTimingTicket = &ticket_;
+        }
     }
     ~InputTimingScope() {
         if (ticket_.active) {
             const auto identity = timingIdentity();
+            const auto cyclesEnded = timingThreadCycles();
+            ticket_.pair.cyclesValid = ticket_.pair.cyclesValid && cyclesEnded >= cyclesStarted_;
+            ticket_.pair.callbackCycles = cyclesEnded >= cyclesStarted_ ? cyclesEnded - cyclesStarted_ : 0;
+            ticket_.pair.lastCpu = GetCurrentProcessorNumber();
             g_inputTimingProbe.finish(ticket_, steadyNanoseconds(), result, identity);
         }
         g_inputTimingTicket = previous_;
@@ -1272,6 +1303,7 @@ public:
 private:
     input::timingprobe::Recorder::Ticket ticket_;
     input::timingprobe::Recorder::Ticket *previous_;
+    std::uint64_t cyclesStarted_ = 0;
 };
 
 // One bounded, uninterrupted experiment, serialized without waiting. The
@@ -1334,6 +1366,12 @@ void configureInputProbe() {
             enabled("GPVST3_P13_COPY_SCORE") && enabled("GPVST3_P13_PROBE");
         g_inputProbe.configure({enabled("GPVST3_P13_PROBE"), true});
         g_inputTimingProbe.configure(enabled("GPVST3_P13_PROBE"), g_inputProbeStart);
+        g_timingPinCallback = enabled("GPVST3_P13_PROBE") && enabled("GPVST3_P13_COPY_SCORE") &&
+            enabled("GPVST3_P13_PIN_CALLBACK");
+        g_timingIdealCallback = enabled("GPVST3_P13_PROBE") && enabled("GPVST3_P13_COPY_SCORE") &&
+            enabled("GPVST3_P13_IDEAL_CALLBACK");
+        if (g_timingPinCallback && g_timingIdealCallback) g_timingPinCallback = g_timingIdealCallback = false;
+        g_timingCycles = enabled("GPVST3_P13_PROBE") && enabled("GPVST3_P13_TIMING_CYCLES");
         if (enabled("GPVST3_P13_PROBE")) asioprobe::configureTiming(g_inputProbeStart);
         g_inputPcmProbe.configure({enabled("GPVST3_P13_PROBE") &&
             enabled("GPVST3_P13_PCM_PROBE") && enabled("GPVST3_P13_COPY_SCORE") &&
@@ -4750,12 +4788,23 @@ public:
         }
 #ifdef GPVST3_P13_PROBE_BUILD
         const auto inputProcessStarted = g_inputTimingTicket ? steadyNanoseconds() : 0;
+        const auto inputCyclesStarted = g_inputTimingTicket ? timingThreadCycles() : 0;
 #endif
         const auto processed = slot_->router.processInterleaved({g_monitorAudio.capture.data(), output_,
             std::size_t(frames_), inputChannels_, 2, slot_->rate, std::size_t(frames_), owner_, sequence_});
 #ifdef GPVST3_P13_PROBE_BUILD
-        if (g_inputTimingTicket) input::timingprobe::Recorder::inputProcessed(*g_inputTimingTicket,
-            inputProcessStarted, steadyNanoseconds(), processed.processed && !processed.error);
+        if (g_inputTimingTicket) {
+            const auto inputEnded = steadyNanoseconds();
+            const auto inputCyclesEnded = timingThreadCycles();
+            auto &pair = g_inputTimingTicket->pair;
+            pair.cyclesValid = pair.cyclesValid && inputCyclesStarted && inputCyclesEnded >= inputCyclesStarted;
+            pair.inputCycles = inputCyclesEnded >= inputCyclesStarted ? inputCyclesEnded - inputCyclesStarted : 0;
+            pair.monitorToken = lease_.token();
+            pair.nativeEnabled = true;
+            pair.dry = slot_->selection.count == 0;
+            input::timingprobe::Recorder::inputProcessed(*g_inputTimingTicket,
+                inputProcessStarted, inputEnded, processed.processed && !processed.error);
+        }
 #endif
         if (!processed.processed || processed.error) { failureStage_ = 11; fail(); return; }
 #ifdef GPVST3_P13_PROBE_BUILD
@@ -5168,10 +5217,18 @@ int streamCallbackChunk(const void *input, void *output, unsigned long frames,
     } monitorContext(monitor);
 #ifdef GPVST3_P13_PROBE_BUILD
     DrainProbeScope drainScope(userData, frames, outputSequence, status);
-    if (probeTicket || pcmTicket) probeOriginalStarted = steadyNanoseconds();
+    if (probeTicket || pcmTicket || g_inputTimingTicket) probeOriginalStarted = steadyNanoseconds();
+    const auto nativeCyclesStarted = g_inputTimingTicket ? timingThreadCycles() : 0;
     const auto result = original(probeTicket && probeSilenced ? g_inputProbeZeros.data() : monitorInput,
                                  output, frames, timeInfo, status, userData);
-    if (probeTicket || pcmTicket) probeOriginalEnded = steadyNanoseconds();
+    if (probeTicket || pcmTicket || g_inputTimingTicket) probeOriginalEnded = steadyNanoseconds();
+    if (g_inputTimingTicket) {
+        const auto nativeCyclesEnded = timingThreadCycles();
+        auto &pair = g_inputTimingTicket->pair;
+        pair.cyclesValid = pair.cyclesValid && nativeCyclesStarted && nativeCyclesEnded >= nativeCyclesStarted;
+        pair.nativeCycles = nativeCyclesEnded >= nativeCyclesStarted ? nativeCyclesEnded - nativeCyclesStarted : 0;
+        input::timingprobe::Recorder::nativeProcessed(*g_inputTimingTicket, probeOriginalStarted, probeOriginalEnded);
+    }
     if (probeTicket && probeConfigurationValid && output && result == 0)
         std::copy_n(static_cast<const float *>(output),
             (std::min)(std::size_t(frames), input::probe::kSampleFrames) * probeOutputChannels,
@@ -5338,6 +5395,22 @@ QJsonObject inputStreamProbeSnapshot() { return asioprobe::snapshot(); }
 
 QJsonObject inputTimingProbeSnapshot() {
     const auto value = g_inputTimingProbe.snapshot(steadyNanoseconds());
+    const auto pairJson = [](const input::timingprobe::PairedCallback &p) {
+        return QJsonObject{{"sequence", QString::number(p.sequence)},
+            {"started_ns", QString::number(p.started)}, {"ended_ns", QString::number(p.ended)},
+            {"native_started_ns", QString::number(p.nativeStarted)}, {"native_ended_ns", QString::number(p.nativeEnded)},
+            {"input_started_ns", QString::number(p.inputStarted)}, {"input_ended_ns", QString::number(p.inputEnded)},
+            {"input_calls", qint64(p.inputCalls)}, {"frames", qint64(p.frames)}, {"rate", p.identity.rate},
+            {"generation", QString::number(p.identity.generation)}, {"revision", QString::number(p.identity.revision)},
+            {"status_flags", QString::number(p.status)}, {"monitor_token", QString::number(p.monitorToken)},
+            {"native_enabled_at_input", p.nativeEnabled}, {"dry", p.dry}, {"thread", qint64(p.thread)},
+            {"first_cpu", int(p.firstCpu)}, {"last_cpu", int(p.lastCpu)}, {"cycles_valid", p.cyclesValid},
+            {"callback_cycles", QString::number(p.callbackCycles)}, {"native_cycles", QString::number(p.nativeCycles)},
+            {"input_cycles", QString::number(p.inputCycles)}};
+    };
+    QJsonArray paired, consecutive;
+    for (std::size_t i = 0; i < value.pairedCount; ++i) paired.append(pairJson(value.paired[i]));
+    for (std::size_t i = 0; i < value.consecutiveCount; ++i) consecutive.append(pairJson(value.consecutive[i]));
     const auto histogram = [](const input::timingprobe::HistogramSnapshot &samples) {
         const auto percentile = [&](unsigned percent) {
             const auto upper = samples.percentileUpper(percent);
@@ -5355,6 +5428,11 @@ QJsonObject inputTimingProbeSnapshot() {
     return {{"schema", 1}, {"enabled", value.enabled}, {"stopped", value.stopped}, {"acceptance", "not_evaluated"},
         {"scope", "hook_entry_to_exit_including_experimental_instrumentation; input_process_is_router_only; not_complete_driver_deadline_or_xrun_measurement"},
         {"coherent_snapshot", value.coherent},
+        {"experimental_pin_requested", g_timingPinCallback},
+        {"experimental_ideal_requested", g_timingIdealCallback},
+        {"cycle_collection_enabled", g_timingCycles},
+        {"experimental_pinned_threads", int(g_timingPinnedThreads.load())},
+        {"experimental_pin_failures", int(g_timingPinFailures.load())},
         {"window_start_ns", QString::number(value.windowStart)}, {"window_end_ns", QString::number(value.windowEnd)},
         {"maximum_window_ns", QString::number(input::timingprobe::kWindowNanoseconds)},
         {"maximum_callbacks", QString::number(input::timingprobe::kCallbackLimit)},
@@ -5370,6 +5448,9 @@ QJsonObject inputTimingProbeSnapshot() {
         {"callback_budget_exceedances", QString::number(value.callbackBudgetExceeded)},
         {"input_process_budget_exceedances", QString::number(value.inputBudgetExceeded)},
         {"input_process_calls", QString::number(value.inputCalls)}, {"input_process_failures", QString::number(value.inputFailures)},
+        {"paired_overruns", paired}, {"paired_capacity", int(input::timingprobe::kPairedCallbackCapacity)},
+        {"first_input_callbacks", consecutive},
+        {"cycle_scope", "QueryThreadCycleTime; extra experimental calls; cycles are not elapsed nanoseconds or physical xrun evidence"},
         {"validated_identity_changes", QString::number(value.identityChanges)},
         {"minimum_validated_rate", value.minimumRate}, {"maximum_validated_rate", value.maximumRate},
         {"minimum_validated_frames", qint64(value.minimumFrames)}, {"maximum_validated_frames", qint64(value.maximumFrames)},

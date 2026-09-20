@@ -1,6 +1,6 @@
 param(
     [ValidatePattern('^\d+\.\d+\.\d+([-.][A-Za-z0-9.]+)?$')]
-    [string]$Version = '0.10.1',
+    [string]$Version = '0.10.2',
     [string]$PluginPath = '',
     [string]$OutputDirectory = ''
 )
@@ -29,6 +29,7 @@ Copy-Item -LiteralPath (Join-Path $root 'native/effect-chain.template.json') -De
 # Release packages contain current surface docs; historical records stay in the source archive.
 Copy-Item -LiteralPath (Join-Path $root 'docs/INSTALL.md'), (Join-Path $root 'docs/P8_IMPLEMENTATION.md'), (Join-Path $root 'docs/P8_TRACK_GLOBAL_VST3_PLAN.md'), (Join-Path $root 'docs/P9_IMPLEMENTATION.md'), (Join-Path $root 'docs/P9_AUDIO_SWITCH_UI_PLAN.md'), (Join-Path $root 'docs/P10_EDITOR_AUDIO_ACTIVATION_PLAN.md'), (Join-Path $root 'docs/P10_IMPLEMENTATION.md'), (Join-Path $root 'docs/P11_UI_PERFORMANCE_PLAN.md'), (Join-Path $root 'docs/P11_IMPLEMENTATION.md'), (Join-Path $root 'docs/P12_EVENT_DRIVEN_LAZY_RUNTIME_PLAN.md'), (Join-Path $root 'docs/P12_IMPLEMENTATION.md'), (Join-Path $root 'docs/P13_LOW_LATENCY_ASIO_INPUT_PLAN.md'), (Join-Path $root 'docs/P13_IMPLEMENTATION.md'), (Join-Path $root 'docs/P13_HOST_BOUNDARY.md'), (Join-Path $root 'docs/P13_STREAM_LIFECYCLE.md'), (Join-Path $root 'docs/P13_SRC_DRAIN_ANALYSIS.md'), (Join-Path $root 'docs/REALTIME_IMPLEMENTATION_PLAN.md'), (Join-Path $root 'docs/TESTING.md'), (Join-Path $root 'LICENSE'), (Join-Path $root 'DISCLAIMER.md') -Destination (Join-Path $staging 'docs')
 Copy-Item -LiteralPath (Join-Path $root 'native/third_party/minhook/LICENSE.txt') -Destination (Join-Path $staging 'docs/MinHook-LICENSE.txt')
+Copy-Item -LiteralPath (Join-Path $root 'docs/P13_NEURAL_TIMING_DIAGNOSIS.md') -Destination (Join-Path $staging 'docs')
 Copy-Item -LiteralPath (Join-Path $root 'third_party/vst3sdk/LICENSE.txt') -Destination (Join-Path $staging 'docs/VST3-SDK-LICENSE.txt')
 Copy-Item -LiteralPath (Join-Path $root 'native/install.ps1'), (Join-Path $root 'native/uninstall.ps1'),
     (Join-Path $root 'native/Install.cmd'), (Join-Path $root 'native/Uninstall.cmd') -Destination $staging

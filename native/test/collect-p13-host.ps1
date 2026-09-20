@@ -25,6 +25,9 @@ param(
     [switch]$NativeEffectsMatrix,
     [switch]$NativeListenerSwitches,
     [switch]$MonitoringOnly,
+    [switch]$PinCallbackExperiment,
+    [switch]$IdealCallbackExperiment,
+    [switch]$TimingCycles,
     [string]$InputOverlayFixture = '',
     [ValidateRange(0, 20)][int]$InputOverlaySwitches = 0,
     [ValidateRange(0, 20)][int]$RapidInputSwitches = 0,
@@ -36,6 +39,10 @@ param(
 # The silence experiment additionally requires a DLL built with the test-only
 # experiment define. The production DLL must reject this environment request.
 $ErrorActionPreference = 'Stop'
+if ($PinCallbackExperiment -and $IdealCallbackExperiment) { throw 'Callback pin and ideal processor experiments are mutually exclusive.' }
+if (($PinCallbackExperiment -or $IdealCallbackExperiment -or $TimingCycles) -and ($ProductionRuntime -or -not $StreamLifecycleProbe -or -not $InputOverlayFixture -or $DeviceMatrix)) {
+    throw 'Callback scheduling/cycle experiments require an input timing probe and exclude production/device switching.'
+}
 if ($MonitoringOnly -and (-not $InputOverlayFixture -or -not $EnableNativeListener -or $RseVst3 -or $ScopeMatrix -or $OverlayCoexistenceProbe -or $MonitorLatency)) {
     throw '-MonitoringOnly requires input and native listener without playback-specific matrices.'
 }
@@ -348,7 +355,7 @@ function Invoke-P13DeviceMatrix {
             $entry=[ordered]@{property=$case.property;value=$case.value;expected_state=$case.state;before=$before;confirmed=$false}
             $result.device_matrix.cases += $entry
             if ($case.value -notin $before.choices.($case.property)) {
-                # Record the host's actual menu boundary. Algorithmic support
+                # Record the control API's enumerated boundary. Algorithmic support
                 # does not make a driver-only choice available through GP.
                 $entry.status='host_choice_unavailable'
                 continue
@@ -363,7 +370,10 @@ function Invoke-P13DeviceMatrix {
                     ($before.configuration | ConvertTo-Json -Compress)) { throw 'Rejected device change did not retain the prior running configuration.' }
                 Wait-P13InputStatus '正在监听 · 输入效果器已生效'
                 $entry.confirmed=$true
-                $entry.status='host_rejected_restored'
+                # The MCP setter rolls back on immediate readback/running
+                # mismatch. This is not a native ASIO driver rejection code.
+                $entry.status='control_request_rolled_back'
+                $entry.scope='MCP_property_write_readback_and_running_check; native_driver_rejection_not_proven'
                 continue
             }
             $deadline=[DateTime]::UtcNow.AddSeconds(12)
@@ -736,6 +746,9 @@ $before = Get-Gpvst3HostSnapshot $HostDirectory
 $result = [ordered]@{
     schema=1
     production_runtime=[bool]$ProductionRuntime
+    pin_callback_experiment=[bool]$PinCallbackExperiment
+    ideal_callback_experiment=[bool]$IdealCallbackExperiment
+    timing_cycles=[bool]$TimingCycles
     rse_vst3_requested=[bool]$RseVst3
     status='collecting'
     p13_acceptance='not_evaluated'
@@ -781,6 +794,9 @@ try {
         GPVST3_ENABLE_P2_EFFECT='0'
         GPVST3_ENABLE_P4_INPUT='0'
         GPVST3_P13_PROBE='1'
+        GPVST3_P13_PIN_CALLBACK=$(if ($PinCallbackExperiment) { '1' } else { '0' })
+        GPVST3_P13_IDEAL_CALLBACK=$(if ($IdealCallbackExperiment) { '1' } else { '0' })
+        GPVST3_P13_TIMING_CYCLES=$(if ($TimingCycles) { '1' } else { '0' })
         GPVST3_P13_PCM_PROBE=$(if ($PcmProbe) { '1' } else { '0' })
         GPVST3_P13_MONITOR_LATENCY=$(if ($MonitorLatency) { '1' } else { '0' })
         GPVST3_P13_STREAM_PROBE=$(if ($StreamLifecycleProbe) { '1' } else { '0' })

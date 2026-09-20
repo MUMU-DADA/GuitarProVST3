@@ -1,10 +1,20 @@
 # P13 实现与验证记录
 
-状态：0.10.1 输入修订已完成代码、离线专项以及真实宿主开关、三链和冷启动回归（2026-09-20），并修复编辑器关闭重入导致的 UI 崩溃。Neural DSP 的参数同步开销与输出范围已修正；192000 Hz / 64 帧仍观察到少量超时，尚未完成实际吉他演奏的零爆音验收。0.10.0 的固定配置验收保留为历史证据，不代表本版或其他设备已通过。
+状态：0.10.2 保留完整输入优化，补齐诊断与驱动安全模式说明（2026-09-20）。0.10.1 的输入开关、三链、空链、冷启动及编辑器重入回归已通过；用户随后确认当前 192000 Hz / 64 帧 Neural DSP 吉他演奏在开启声卡驱动安全模式后爆音消失，并要求进入发布。该反馈只覆盖用户当前配置；完整硬件矩阵和安全模式下的物理延迟尚未测量。0.10.0 固定配置记录保留为历史证据。
 
 本记录区分工具实现、真实观测与尚未证明的合同。当前代码支持匹配的 Guitar Pro 8.1.1.17、GP 内部 44100 Hz 与实际 ASIO 44100、48000、88200、96000、176400、192000 Hz 的对应拓扑；运行时仍核对宿主 hash、stream identity、generation、rate revision 和实际 SRC/ring 对象。范围外或合同不满足时为 `host_limited`。PCM、实验路由、逐样本观测和有界计时仅在 `GPVST3_P13_PROBE_BUILD` 中编译。下方历史章节保留各轮采集当时的限制，不能将单项诊断 PASS 解释为本版完成验收。
 
-## 0.10.1 当前修订与离线证据
+## 0.10.2 发布收尾
+
+- 保留 0.10.1 的全部输入、UI、ASIO 分块、参数同步和输出保护修复；生产新增变化仅为版本号更新。
+- 保存同块阶段计时、前 256 个有效输入块、可选线程 cycle 以及离线 Neural 单次 process 验证。CPU affinity / ideal 仅限实验构建，不进入发布 DLL。
+- 用户实测反馈为“把声卡驱动的安全模式打开后，爆音消失了”。按该反馈收尾当前问题；软件不自动启用安全模式，也不把该结果泛化为所有设备与设置零 xrun。
+- 修正通用控制接口回滚的含义：它不能证明原生 ASIO 驱动拒绝或不支持某个 buffer。
+- 发布复验：普通 DLL 构建、计时探针专项、6 rate × 9 buffer × 3 通道映射的 callback 专项、独立输入 runtime 与三档 DPI UI 全部通过，日志为 `artifacts/release-0.10.2-*.log`。安装包清单、安装归属和卸载安全通过，证据为 `artifacts/p6-package-01dc9fdc03d248a8b5d31f313c8de203/`。当前已有用户 Guitar Pro 进程，本轮没有重新操作真实宿主或驱动；已有宿主回归范围见下方 0.10.1 记录。
+- 最终离线 Neural 复验为 `.tools/native/release-0.10.2-neural/timing-192000-64.json`：四组各 24000 块，单块一次 process、非静音且有限、零超满幅样本，输出 hash 均为 `dc836c10a3d2ac13`，延迟均为 159 samples。2048 准备容量 / FTZ 关组观察到一次超预算，其余三组为零；同期有其他构建/用户进程，不作为专属实时性能测试或驱动安全模式延迟测量。
+- 实验 DLL 独立构建通过，打包器在创建 staging 前拒绝实验 DLL；普通 DLL 二进制中未发现实验 marker、pin / ideal / cycle 环境入口。
+
+## 0.10.1 输入修订与离线证据
 
 - **宿主输入开关**：通过 Guitar Pro 的 `actionActivatedLineIn` 获取当前 LINE-IN 状态并响应事件。保存低延迟偏好只恢复模式请求；宿主输入关闭或状态未知时为 `waiting_for_input`，不读取 capture、不处理输入 VST3、不分流原生监听。关闭低延迟模式后遵从用户当前 LINE-IN 选择，不恢复旧开关值。输入接管与输出处理入口均检查宿主开关。
 - **空链监听**：低延迟模式下空 input 链是合法运行配置，经过相同的格式验证与排空后保持 `active`、`dry_monitoring=true`，按监听增益输出原始输入。取消所有效果器仅停止效果处理；准备或 DSP 故障仍按故障合同静音，不隐式转为干声。
@@ -41,15 +51,19 @@
 - 实际崩溃 dump 与失败夹具均定位到 checkbox `setChecked()` 尚未返回时，editor 关闭回调重入 Qt，列表 reload 销毁 checkbox，随后 Qt accessibility 使用悬空控件。勾选事务改为 queued connection，事务期间延后 reload/sync，并对延迟控件与音轨 generation 做检查。global/input editor 重入、立即取消与保存状态不复活、P13/P8/P9 UI 三 DPI 通过；Windows 平台截图也已检查。
 - 最新普通构建纳入 dirty 参数优化，`artifacts/p13-final-runtime.log` 与 `artifacts/p8-runtime-6dbcb3a05cac491d840d23d63d57366b/` 通过独立输入 runtime、异步选择、VST3 采样率/状态/失败路径和真实宿主 editor 生命周期回归。
 - 同一普通 DLL 的最终 Neural 回归为 `artifacts/p13-host-fda1ed08c4b841899fe10dcea14fa69a/collection.json`：192000 Hz / 64 帧、两轮模式 Off→On 后持续 30 秒，累计处理 93689 块，处理错误、配置拒绝、削波、status flags 均为 0，正常退出并恢复设备/LINE-IN。该普通构建不包含计时探针，所以没有据此宣称 deadline 或物理 xrun 为 0。最终三进程重启回归 `artifacts/p13-input-startup-adbaa2eeaba54b86bed2eb547aed568e/verification.json` 为 `pass`。
-- `artifacts/p13-host-d4ee6626a2cb40c2a7a7610266bdc480/collection.json`：原生菜单对 32/128/256/512/1024/2048/4096 的请求拒绝并恢复 64；8192 未枚举，分别记录 `host_rejected_restored` 和 `host_choice_unavailable`，不计为硬件通过。Standard 切换为 `host_limited`，返回 ASIO 后实际 64 帧监听恢复。设备和监听状态恢复，正常退出。
+- `artifacts/p13-host-d4ee6626a2cb40c2a7a7610266bdc480/collection.json`：MCP 通用音频属性接口对 32/128/256/512/1024/2048/4096 的请求回滚并恢复 64；8192 未枚举，旧记录分别为 `host_rejected_restored` 和 `host_choice_unavailable`。复核发现 setter 会因立即读回或 running 检查不符主动回滚，没有驱动拒绝码，不能称声卡或原生 ASIO 设置拒绝这些 buffer，也不计为硬件通过。Standard 切换为 `host_limited`，返回 ASIO 后实际 64 帧监听恢复。设备和监听状态恢复，正常退出。新采集改用 `control_request_rolled_back` 明确边界。
 
 部分初轮冷加载采集在实例就绪前就开启测试 LINE-IN，后续宿主窗口/流变化撤销了该状态，导致等待 active 失败；保留失败记录，不作为有效 A/B。collector 已改为等待插件实际准备完成，再恢复测试窗口并通过原生 action 请求监听，生产代码仍不触发 LINE-IN。勾选/Off/On 的生产语义另由专项验证。
 
-真实 Neural、最新参数实现的两轮有界实验记录为 `artifacts/p13-host-199584bbc33745cca4bf6f4b9fcd561e/`（RSE 播放）与 `artifacts/p13-host-576377818e6948cd9e0c1b74e545199f/`（只监听）。前者 136188 个 hook callback 中 753 个超过约 333.333 µs，输入处理单独超预算 49 次；后者分别为 132811、785 和 84。均无输入处理失败、削波、PortAudio status flags 或观察到的 ASIO overload/resync 通知，正常退出。计时包含探针开销与清理时段，没有全程物理输出或现场吉他演奏，因此零通知不证明零 xrun，也不能宣布全部爆音原因已消除。用户暂时无法演奏，本轮按要求先完成自动验证，保留该听感验收边界。
+真实 Neural、最新参数实现的两轮有界实验记录为 `artifacts/p13-host-199584bbc33745cca4bf6f4b9fcd561e/`（RSE 播放）与 `artifacts/p13-host-576377818e6948cd9e0c1b74e545199f/`（只监听）。前者 136188 个 hook callback 中 753 个超过约 333.333 µs，输入处理单独超预算 49 次；后者分别为 132811、785 和 84。均无输入处理失败、削波、PortAudio status flags 或观察到的 ASIO overload/resync 通知，正常退出。计时包含探针开销与清理时段，没有全程物理输出或现场吉他演奏，因此零通知不证明零 xrun，也不能宣布全部爆音原因已消除。当时用户暂时无法演奏，因此该轮仅作为自动验证；后续安全模式听感反馈见本文 0.10.2 记录。
+
+0.10.1 后续同块计时、去除 cycle 查询的对照及 Neural 内部处理节奏验证见 [Neural 计时调查](P13_NEURAL_TIMING_DIAGNOSIS.md)。这些是实验诊断及其证据边界，不是新增生产线程调度策略。
 
 ## 0.10.0 独立监听实现与专项记录（历史）
 
 本节及其后的 0.10.0 音频记录描述当时行为。其中“清链静音”“LINE-IN 关闭后仍 active”和“保存模式后自动监听”已由 0.10.1 的上述合同替代；原始结果保留，不作为当前预期。
+
+下方历史记录中的“宿主/设备拒绝 buffer”指通用 MCP setter 的请求回滚；未读取 ASIO 拒绝码。它们只能证明旧配置恢复，不能推断驱动不支持这些 buffer，实际驱动控制面板设置仍待验证。
 
 - input 使用自己的 settings、effects、runtime pool、双槽、processor、参数/state 和 editor 归属；不会从 global/track 镜像。gain 更新及同采样率重绑保留实例与实时参数。顶层 `input` 保存 `monitor_mode`、`input_gain` 和 `effects`，不跟随切谱/切轨。
 - `MonitorExchange` 用一个带代际的 token 同时发布 slot、native suppression 和 legacy fallback；callback 使用有界 reader admission。发布失败可在控制线程有界重试，slot 退役等 reader 退出后才改写。状态反馈同样携带 publication version，旧回调不能覆盖新 Off 状态。
@@ -133,7 +147,7 @@ P50/P95 使用 1 µs 桶的严格上界，计时包含实验开销。外层范�
 
 ## 发布范围与设备限制
 
-- 生产范围按宿主 hash、ASIO stream generation/rate 与 SRC 拓扑门控。六种已实现 rate 及九档 buffer 有算法和离线专项证据，范围外或实际拓扑不符仍为 `host_limited`；本版不同声卡、真实 rate/buffer 改变、异常驱动通知和第三方负载尚未完成硬件矩阵，不能扩大为通用 ASIO 兼容声明。历史测试被设备拒绝的 buffer 请求不算成功运行。
+- 生产范围按宿主 hash、ASIO stream generation/rate 与 SRC 拓扑门控。六种已实现 rate 及九档 buffer 有算法和离线专项证据，范围外或实际拓扑不符仍为 `host_limited`；本版不同声卡、真实 rate/buffer 改变、异常驱动通知和第三方负载尚未完成硬件矩阵，不能扩大为通用 ASIO 兼容声明。历史测试经通用接口回滚的 buffer 请求不算成功运行，也不证明设备拒绝。
 - 原生音频录音为宿主不提供／不适用。GP8 官方手册 PDF 第 315 页明确 “There is not any record feature in Guitar Pro 8”；来源与 UI/字段调查见 [宿主边界](P13_HOST_BOUNDARY.md)。输入电平已实测，实验 PCM 不算原生录音。
 - 任意第三方插件的崩溃、死锁及 CPU 过载仍属于进程内风险；本阶段提供整块错误静音、削波/插件延迟诊断及安全退役，不承诺进程隔离或零延迟。
 - 0.10.1 普通 DLL 已通过上述宿主验证；`artifacts/p6-package-e51074864a0944afb92564b5ec00e115/` 通过包清单、ZIP 内容、安装归属、幂等更新、旧 DLL 备份和卸载保护专项。PCM、逐样本 observer、实验路由和长计时入口不能进入发布 DLL；manifest 记录各文件 SHA256，release 附带 ZIP 校验文件。上表旧安装/卸载证据属于 0.10.0。
